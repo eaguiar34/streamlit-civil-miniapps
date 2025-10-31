@@ -1,1 +1,7 @@
-
+Task,Duration,Predecessors,Normal_Cost_per_day,Crash_Cost_per_day,Min_Duration,Overlap_OK
+A – Site Prep,5,,1200,1800,3,True
+B – Foundations,10,A – Site Prep,1600,2600,7,True
+C – Structure,12,B – Foundations,1900,3000,9,True
+D – MEP Rough‑In,8,C – Structure,1500,2400,6,True
+E – Enclosure,9,C – Structure,1400,2300,7,False
+F – Finishes,10,"D – MEP Rough‑In, E – Enclosure",1550,2550,8,False
