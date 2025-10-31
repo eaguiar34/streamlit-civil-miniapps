@@ -1,1 +1,6 @@
-
+PART 1 – GENERAL
+1.02 SUBMITTALS
+A. Product Data: Provide manufacturer's data sheets for all major components.
+B. Shop Drawings: Submit coordinated drawings showing dimensions and interfaces.
+C. Certificates: Provide compliance certifications for specified standards.
+D. Warranty: Minimum one year warranty.
