@@ -163,7 +163,7 @@ if run:
     for i in range(len(sub_lines) - 1):
         sub_chunks.append(sub_lines[i] + " " + sub_lines[i + 1])
 
-    results: list[MatchResult] = []
+results: list[MatchResult] = []
 for r in reqs:
     m, fuzzy_score, concept = best_match(r, sub_chunks)
     # Decision: accept if fuzzy high OR concept coverage high
