@@ -117,6 +117,11 @@ def best_match(requirement: str, submittal_chunks: List[str]) -> Tuple[str, int]
     idx = int(np.argmax(scores))
     return submittal_chunks[idx], int(scores[idx])
 
+class MatchResult(NamedTuple):
+    match: Optional[re.Match]
+    fuzzy_score: float
+    concept: Optional[str]
+
 left, right = st.columns(2, gap="large")
 
 with left:
@@ -164,11 +169,6 @@ if run:
     sub_chunks: List[str] = sub_lines[:]
     for i in range(len(sub_lines) - 1):
         sub_chunks.append(sub_lines[i] + " " + sub_lines[i + 1])
-
-class MatchResult(NamedTuple):
-    match: Optional[re.Match]
-    fuzzy_score: float
-    concept: Optional[str]
 
 results: list[MatchResult] = []
 for r in reqs:
