@@ -1,3 +1,20 @@
+import streamlit as st
+from security import read_text_any, require_passcode
+
+
+require_passcode()
+
+
+# ... later in the UI ...
+spec_upload = st.file_uploader("Upload spec (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="spec_up")
+sub_upload = st.file_uploader("Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="sub_up")
+
+
+spec_text = read_text_any(spec_upload) or st.text_area("Or paste spec text:", height=240, value=spec_text_default)
+submittal_text = read_text_any(sub_upload) or st.text_area("Or paste submittal text:", height=240, value=sub_text_default)
+
+
+
 import re
 else:
 return uploaded_file.read().decode("utf-8", errors="ignore")
