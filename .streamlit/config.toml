@@ -1,1 +1,13 @@
+[browser]
+gatherUsageStats = false
 
+
+[server]
+enableCORS = true
+enableXsrfProtection = true
+maxUploadSize = 25
+headless = true
+
+
+[theme]
+base = "light"
