@@ -1,45 +1,4 @@
-import streamlit as st
-from security import read_text_any, require_passcode
-
-
-require_passcode()
-
-
-# ... later in the UI ...
-spec_upload = st.file_uploader("Upload spec (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="spec_up")
-sub_upload = st.file_uploader("Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="sub_up")
-
-
-spec_text = read_text_any(spec_upload) or st.text_area("Or paste spec text:", height=240, value=spec_text_default)
-submittal_text = read_text_any(sub_upload) or st.text_area("Or paste submittal text:", height=240, value=sub_text_default)
-
-
-
 import re
-else:
-return uploaded_file.read().decode("utf-8", errors="ignore")
-except Exception as e:
-st.error(f"Couldn't read {uploaded_file.name}: {e}")
-return ""
-
-
-# ------------------------------- UI -----------------------------------------
-left, right = st.columns(2, gap="large")
-
-
-with left:
-st.subheader("Spec Source")
-spec_upload = st.file_uploader("Upload spec (PDF/DOCX/TXT/CSV)", type=["pdf", "docx", "txt", "csv"], key="spec_up")
-spec_text_default = (
-"PART 1 – GENERAL\n"
-"1.02 SUBMITTALS\n"
-"A. Product Data: Provide manufacturer's data sheets.\n"
-"B. Shop Drawings: Submit coordinated drawings.\n"
-"C. Certificates: Provide compliance certifications.\n"
-"D. Warranty: Minimum one year warranty.\n"
-)
-spec_text_manual = st.text_area("Or paste spec text:", height=240, value=spec_text_default)
-spec_text = extract_text_from_upload(spec_upload) or spec_text_manual
 if spec_upload is not None:
 with st.expander("Preview extracted spec text", expanded=False):
 st.write(spec_text[:2000] + ("…" if len(spec_text) > 2000 else ""))
@@ -47,19 +6,23 @@ st.write(spec_text[:2000] + ("…" if len(spec_text) > 2000 else ""))
 
 with right:
 st.subheader("Submittal Source")
-sub_upload = st.file_uploader("Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf", "docx", "txt", "csv"], key="sub_up")
+sub_upload = st.file_uploader(
+"Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf", "docx", "txt", "csv"], key="sub_up"
+)
 sub_text_default = (
 "We are submitting product data for review.\n"
 "Included: manufacturer data sheets and a warranty statement.\n"
 )
 sub_text_manual = st.text_area("Or paste submittal text:", height=240, value=sub_text_default)
-submittal_text = extract_text_from_upload(sub_upload) or sub_text_manual
+submittal_text = read_text_any(sub_upload) or sub_text_manual
 if sub_upload is not None:
 with st.expander("Preview extracted submittal text", expanded=False):
 st.write(submittal_text[:2000] + ("…" if len(submittal_text) > 2000 else ""))
 
 
-threshold = st.slider("Match threshold (0‑100)", min_value=50, max_value=100, value=78, help="Lower = more forgiving matches")
+threshold = st.slider(
+"Match threshold (0‑100)", min_value=50, max_value=100, value=78, help="Lower = more forgiving matches"
+)
 run = st.button("Analyze")
 
 
@@ -88,7 +51,12 @@ results.append(MatchResult(r, m, s, status))
 
 
 df = pd.DataFrame([
-{"Requirement": r.requirement, "Best Match In Submittal": r.matched_text, "Score": r.score, "Status": r.status}
+{
+"Requirement": r.requirement,
+"Best Match In Submittal": r.matched_text,
+"Score": r.score,
+"Status": r.status,
+}
 for r in results
 ])
 
@@ -113,4 +81,6 @@ mime="text/csv",
 
 st.info("Heuristic tool only. This is a triage helper, not a final judgment.")
 else:
-st.markdown("Click **Analyze** to run the comparison. Adjust the threshold if matches feel too strict/loose.")
+st.markdown(
+"Click **Analyze** to run the comparison. Adjust the threshold if matches feel too strict/loose."
+)
