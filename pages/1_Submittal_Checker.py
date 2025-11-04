@@ -1,25 +1,23 @@
 # 1_Submittal_Checker.py
-# Rewritten, robust version that avoids the NameError and simplifies matching logic.
-# Drop this file into your Streamlit app. Requires: streamlit, rapidfuzz, pypdf, python-docx, pandas
-#
-# pip install streamlit rapidfuzz pypdf python-docx pandas
+# Rewritten with file preview panes for uploaded Spec/Submittal files.
+# Requirements: streamlit, rapidfuzz, pypdf, python-docx, pandas
 
 from __future__ import annotations
 
 import io
 import re
+import base64
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
 import streamlit as st
+import streamlit.components.v1 as components
 
-# Optional deps: we'll soft-import to give clearer errors if missing
+# Optional deps with clear errors
 try:
     from rapidfuzz import fuzz
 except Exception as e:  # pragma: no cover
-    st.error(
-        "Missing dependency: rapidfuzz. Run `pip install rapidfuzz`.\n" f"Details: {e}"
-    )
+    st.error("Missing dependency: rapidfuzz. Run `pip install rapidfuzz`.\n" f"Details: {e}")
     raise
 
 try:
@@ -52,30 +50,28 @@ class MatchResult:
 SUPPORTED_EXT = (".pdf", ".docx", ".txt", ".csv")
 
 
-def _read_pdf(file: io.BytesIO) -> str:
-    reader = PdfReader(file)
+def _read_pdf(raw: bytes) -> str:
+    reader = PdfReader(io.BytesIO(raw))
     text_parts: List[str] = []
     for page in reader.pages:
         try:
             text_parts.append(page.extract_text() or "")
         except Exception:
-            # Fallback if a page fails; keep going
             pass
     return "\n".join(text_parts)
 
 
-def _read_docx(file: io.BytesIO) -> str:
-    d = docx.Document(file)
+def _read_docx(raw: bytes) -> str:
+    d = docx.Document(io.BytesIO(raw))
     return "\n".join(p.text for p in d.paragraphs)
 
 
-def _read_txt(file: io.BytesIO) -> str:
-    return file.read().decode(errors="ignore")
+def _read_txt(raw: bytes) -> str:
+    return raw.decode(errors="ignore")
 
 
-def _read_csv(file: io.BytesIO) -> str:
-    df = pd.read_csv(file)
-    # Join all textual cells into one blob
+def _read_csv(raw: bytes) -> str:
+    df = pd.read_csv(io.BytesIO(raw))
     strings = []
     for col in df.columns:
         try:
@@ -85,18 +81,17 @@ def _read_csv(file: io.BytesIO) -> str:
     return "\n".join(strings)
 
 
-def read_any(file) -> str:
-    """Read text from an uploaded file of supported type."""
-    name = (getattr(file, "name", "").lower())
-    data = io.BytesIO(file.read())
-    if name.endswith(".pdf"):
-        return _read_pdf(data)
-    if name.endswith(".docx"):
-        return _read_docx(data)
-    if name.endswith(".txt"):
-        return _read_txt(data)
-    if name.endswith(".csv"):
-        return _read_csv(data)
+def read_any(name: str, raw: bytes) -> str:
+    """Read text from an uploaded file of supported type using raw bytes."""
+    lname = name.lower()
+    if lname.endswith(".pdf"):
+        return _read_pdf(raw)
+    if lname.endswith(".docx"):
+        return _read_docx(raw)
+    if lname.endswith(".txt"):
+        return _read_txt(raw)
+    if lname.endswith(".csv"):
+        return _read_csv(raw)
     raise ValueError(
         f"Unsupported file type for '{name}'. Supported: {', '.join(SUPPORTED_EXT)}"
     )
@@ -138,7 +133,6 @@ def split_into_chunks(t: str, *, keep_headers: bool = True) -> List[str]:
             acc.append(ln)
     flush()
 
-    # Dedup small noise
     seen = set()
     deduped: List[str] = []
     for c in chunks:
@@ -149,7 +143,6 @@ def split_into_chunks(t: str, *, keep_headers: bool = True) -> List[str]:
     return deduped
 
 
-# Lightweight heuristics to pull "requirements" from specs
 REQUIREMENT_HINTS = (
     "provide",
     "submit",
@@ -171,14 +164,11 @@ def extract_spec_items(spec_chunks: Iterable[str]) -> List[str]:
         low = ch.lower()
         if any(k in low for k in REQUIREMENT_HINTS):
             items.append(ch)
-    # Fallback: if no items identified, just return the chunks
     return items or list(spec_chunks)
 
 
 def derive_concept(s: str) -> str:
-    # Pull a short noun-phrase-ish concept for display
     s = re.sub(r"\([^)]*\)", "", s)
-    # try to keep up to ~10 words
     words = re.findall(r"[A-Za-z0-9-/]+", s)
     return " ".join(words[:10])
 
@@ -186,13 +176,11 @@ def derive_concept(s: str) -> str:
 # ---------------------------- Matching ---------------------------- #
 
 def best_match(spec_item: str, sub_chunks: List[str]) -> Tuple[Optional[str], float, bool]:
-    """Return (best_chunk, fuzzy_score, exact_phrase) for a spec item against submittal."""
     if not sub_chunks:
         return None, 0.0, False
 
     best_score = -1.0
     best_chunk: Optional[str] = None
-    # Exact phrase check (case-insensitive)
     exact = False
 
     norm_item = spec_item.strip().lower()
@@ -200,7 +188,6 @@ def best_match(spec_item: str, sub_chunks: List[str]) -> Tuple[Optional[str], fl
         ch_norm = ch.lower()
         if not exact and norm_item in ch_norm:
             exact = True
-        # token_set_ratio is robust to ordering/duplication
         score = float(fuzz.token_set_ratio(norm_item, ch_norm))
         if score > best_score:
             best_score = score
@@ -210,6 +197,54 @@ def best_match(spec_item: str, sub_chunks: List[str]) -> Tuple[Optional[str], fl
 
 def judge(fuzzy_score: float, exact: bool, threshold: int) -> str:
     return "PASS" if exact or fuzzy_score >= threshold else "REVIEW"
+
+
+# ---------------------------- Preview Helpers ---------------------------- #
+
+def _embed_pdf(raw: bytes, height: int = 500):
+    b64 = base64.b64encode(raw).decode()
+    src = f"data:application/pdf;base64,{b64}"
+    components.html(
+        f'<iframe src="{src}" style="width:100%;height:{height}px;border:none;" />',
+        height=height,
+        scrolling=True,
+    )
+
+
+def preview_file(name: str, raw: Optional[bytes], extracted_text: str):
+    """Render a preview UI for the uploaded file + extracted text."""
+    if raw is None and not extracted_text:
+        st.info("No file or text to preview.")
+        return
+
+    lname = (name or "").lower()
+    if raw is not None:
+        st.caption(f"Uploaded file: **{name}** · {len(raw):,} bytes")
+
+    # File-type specific preview
+    if raw is not None and lname.endswith(".pdf"):
+        try:
+            _embed_pdf(raw, height=520)
+        except Exception:
+            st.warning("Inline PDF preview failed; showing extracted text instead.")
+    elif raw is not None and lname.endswith(".csv"):
+        try:
+            df_prev = pd.read_csv(io.BytesIO(raw))
+            st.dataframe(df_prev.head(200), use_container_width=True)
+            st.caption(f"Rows: {len(df_prev):,} · Columns: {len(df_prev.columns)}")
+        except Exception as e:
+            st.warning(f"CSV preview failed: {e}")
+    elif raw is not None and lname.endswith(".docx"):
+        st.caption("DOCX preview shows extracted paragraphs (not layout-faithful).")
+
+    # Extracted text preview (common fallback)
+    if extracted_text:
+        show_full = st.toggle("Show full extracted text", value=False)
+        if show_full:
+            st.text_area("Extracted text", extracted_text, height=300)
+        else:
+            snippet = extracted_text[:2000]
+            st.text_area("Extracted text (first 2,000 chars)", snippet, height=220)
 
 
 # ---------------------------- UI ---------------------------- #
@@ -224,10 +259,7 @@ with left:
         "Upload spec (PDF/DOCX/TXT/CSV)", type=["pdf", "docx", "txt", "csv"], key="spec_file"
     )
     spec_text_area = st.text_area(
-        "Or paste spec text:",
-        height=220,
-        placeholder="Paste specification clauses here…",
-        key="spec_text",
+        "Or paste spec text:", height=220, placeholder="Paste specification clauses here…", key="spec_text"
     )
 
 with right:
@@ -236,26 +268,43 @@ with right:
         "Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf", "docx", "txt", "csv"], key="sub_file"
     )
     sub_text_area = st.text_area(
-        "Or paste submittal text:",
-        height=220,
-        placeholder="Paste submittal content or summary…",
-        key="sub_text",
+        "Or paste submittal text:", height=220, placeholder="Paste submittal content or summary…", key="sub_text"
     )
 
 threshold = st.slider("Match threshold (0–100)", min_value=0, max_value=100, value=78)
 
-if st.button("Analyze", type="primary"):
-    # -------- Gather & clean text -------- #
-    try:
-        spec_text = ""
-        if spec_file is not None:
-            spec_text = read_any(spec_file)
-        spec_text = (spec_text + "\n" + spec_text_area).strip() if spec_text_area else spec_text
+# -------- Build preview tabs -------- #
+st.markdown("---")
+prev_spec, prev_sub = st.tabs(["Preview: Spec", "Preview: Submittal"])
 
-        sub_text = ""
-        if sub_file is not None:
-            sub_text = read_any(sub_file)
-        sub_text = (sub_text + "\n" + sub_text_area).strip() if sub_text_area else sub_text
+with prev_spec:
+    spec_bytes = spec_file.getvalue() if spec_file is not None else None
+    spec_text_from_file = ""
+    if spec_bytes is not None and spec_file is not None:
+        try:
+            spec_text_from_file = read_any(spec_file.name, spec_bytes)
+        except Exception as e:
+            st.warning(f"Failed to read spec file: {e}")
+    combined_spec_text = (spec_text_from_file + "\n" + spec_text_area).strip() if spec_text_area else spec_text_from_file
+    preview_file(spec_file.name if spec_file else "(no file)", spec_bytes, combined_spec_text)
+
+with prev_sub:
+    sub_bytes = sub_file.getvalue() if sub_file is not None else None
+    sub_text_from_file = ""
+    if sub_bytes is not None and sub_file is not None:
+        try:
+            sub_text_from_file = read_any(sub_file.name, sub_bytes)
+        except Exception as e:
+            st.warning(f"Failed to read submittal file: {e}")
+    combined_sub_text = (sub_text_from_file + "\n" + sub_text_area).strip() if sub_text_area else sub_text_from_file
+    preview_file(sub_file.name if sub_file else "(no file)", sub_bytes, combined_sub_text)
+
+# -------- Analysis button -------- #
+if st.button("Analyze", type="primary"):
+    try:
+        # Use the combined preview texts for analysis
+        spec_text = combined_spec_text
+        sub_text = combined_sub_text
 
         if not spec_text:
             st.warning("Please provide spec text or upload a spec file.")
@@ -287,7 +336,6 @@ if st.button("Analyze", type="primary"):
                 )
             )
 
-        # -------- Summaries -------- #
         df = pd.DataFrame(
             [
                 {
@@ -314,7 +362,6 @@ if st.button("Analyze", type="primary"):
         st.subheader("Results")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # Unmatched view
         st.markdown("---")
         st.subheader("Items Needing Review")
         needs_review = df[df["Decision"] == "REVIEW"]
@@ -323,7 +370,6 @@ if st.button("Analyze", type="primary"):
         else:
             st.dataframe(needs_review, use_container_width=True, hide_index=True)
 
-        # Download
         csv = df.to_csv(index=False).encode()
         st.download_button(
             "Download CSV",
@@ -334,4 +380,3 @@ if st.button("Analyze", type="primary"):
 
     except Exception as e:
         st.exception(e)
-
