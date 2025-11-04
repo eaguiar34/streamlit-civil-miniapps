@@ -1,3 +1,9 @@
+import streamlit as st
+from security import require_passcode
+
+
+require_passcode()
+
 from __future__ import annotations
 import itertools
 from dataclasses import dataclass
