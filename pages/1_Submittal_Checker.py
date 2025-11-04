@@ -8,6 +8,8 @@ import numpy as np
 import streamlit as st
 from rapidfuzz import fuzz
 from security import read_text_any, require_passcode
+from __future__ import annotations  # optional; see Option C
+from typing import NamedTuple, Optional
 
 st.set_page_config(page_title="Submittal Checker", page_icon="📝", layout="wide")
 require_passcode()
@@ -162,10 +164,6 @@ if run:
     sub_chunks: List[str] = sub_lines[:]
     for i in range(len(sub_lines) - 1):
         sub_chunks.append(sub_lines[i] + " " + sub_lines[i + 1])
-
-from __future__ import annotations  # optional; see Option C
-from typing import NamedTuple, Optional
-import re
 
 class MatchResult(NamedTuple):
     match: Optional[re.Match]
