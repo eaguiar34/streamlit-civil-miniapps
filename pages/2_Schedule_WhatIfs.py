@@ -1,11 +1,4 @@
-import streamlit as st
-from security import require_passcode
-
-
-require_passcode()
-
 from __future__ import annotations
-import itertools
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -16,6 +9,7 @@ import streamlit as st
 st.set_page_config(page_title="Schedule What-Ifs", page_icon="📅", layout="wide")
 st.title("Schedule What-Ifs 📅")
 st.caption("Compute critical path, then explore crash/fast-track scenarios and cost impacts.")
+
 
 # ---------------------- Sample / Starter Data -------------------------------
 SAMPLE = pd.DataFrame([
