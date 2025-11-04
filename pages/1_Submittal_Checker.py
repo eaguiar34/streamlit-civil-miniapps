@@ -163,6 +163,15 @@ if run:
     for i in range(len(sub_lines) - 1):
         sub_chunks.append(sub_lines[i] + " " + sub_lines[i + 1])
 
+from __future__ import annotations  # optional; see Option C
+from typing import NamedTuple, Optional
+import re
+
+class MatchResult(NamedTuple):
+    match: Optional[re.Match]
+    fuzzy_score: float
+    concept: Optional[str]
+
 results: list[MatchResult] = []
 for r in reqs:
     m, fuzzy_score, concept = best_match(r, sub_chunks)
