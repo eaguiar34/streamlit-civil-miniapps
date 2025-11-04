@@ -1,4 +1,27 @@
 import streamlit as st
+from security import secure_mode_banner, require_environment_acknowledgement, require_passcode, purge_button
+
+
+st.set_page_config(page_title="Civil Mini‑Apps", page_icon="🛠️", layout="wide")
+secure_mode_banner()
+require_environment_acknowledgement()
+require_passcode()
+purge_button()
+
+
+st.title("Civil Engineering Mini‑Apps")
+st.caption("Submittal Checker • Schedule What‑Ifs")
+
+
+st.markdown(
+"""
+These are lightweight tools for day‑to‑day checks. Use the sidebar to switch pages.
+No documents are written to disk; uploaded files are read in‑memory and discarded when you purge the session.
+"""
+)
+
+
+import streamlit as st
 
 st.set_page_config(page_title="Civil Mini‑Apps", page_icon="🛠️", layout="wide")
 
