@@ -2,7 +2,7 @@ import re
 return uploaded_file.read().decode("utf-8", errors="ignore")
 except Exception as e:
 st.error(f"Couldn't read {uploaded_file.name}: {e}")
-return 
+return "
 
 
 # ------------------------------- UI -----------------------------------------
