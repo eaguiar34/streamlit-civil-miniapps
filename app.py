@@ -24,7 +24,7 @@ st.markdown("\n".join(intro_lines))
 
 st.divider()
 st.markdown("**Local run**")
-st.code("python -m pip install -r requirements.txt\nstreamlit run App.py", language="bash")
+st.code("python -m pip install -r requirements.txt\nstreamlit run app.py", language="bash")
 
 st.markdown("**Deploy**")
 st.markdown("Run on a local/approved server. For CUI/sensitive docs, do not deploy to public Streamlit Cloud.")
