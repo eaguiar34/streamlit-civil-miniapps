@@ -376,6 +376,7 @@ with right:
 
 c1, c2 = st.columns([1,1])
 clamp_ff = c1.checkbox("Clamp Free Float at ≥ 0", value=True, help="Classic CPM clamps Free Float to zero; uncheck to see negative Free Float under fast‑track overlaps.")
+c1.caption("Tables show both **Free_Float** (affected by the toggle) and **Free_Float_Raw** (always raw) so you can see hidden overlaps.")
 cal_mode = c2.checkbox("Calendar mode (map to dates)", value=True)
 
 if cal_mode:
