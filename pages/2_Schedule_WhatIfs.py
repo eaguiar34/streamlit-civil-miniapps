@@ -221,16 +221,34 @@ def cpm_schedule(df: pd.DataFrame, overlap_frac: float = 0.0, clamp_free_float: 
 # -------------------- Crashing -------------------- #
 
 def crash_once(df: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
+    """
+    Return the name of the cheapest critical task to shorten by 1 day,
+    or None if no further crashing is possible.
+    """
     crit = schedule[schedule["Critical"]]
     if crit.empty:
         return None
-    merged = crit.merge(df[["Task", "Duration", "Min_Duration", "Normal_Cost_per_day", "Crash_Cost_per_day"]], on="Task")
-    merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
-    can = merged[merged["Duration"] > merged["Min_Duration"]]
+
+    # Bring in cost and min-duration from the editable config df.
+    # Use suffixes so we can unambiguously reference the df-sourced columns.
+    merged = crit.merge(
+        df[["Task", "Duration", "Min_Duration", "Normal_Cost_per_day", "Crash_Cost_per_day"]],
+        on="Task",
+        suffixes=("_sched", "_cfg"),
+    )
+
+    # incremental slope (crash − normal) per day from the config df
+    merged["slope"] = (merged["Crash_Cost_per_day_cfg"] - merged["Normal_Cost_per_day_cfg"]).astype(float)
+
+    # only tasks that can still be reduced (config Duration > Min_Duration)
+    can = merged[merged["Duration_cfg"] > merged["Min_Duration_cfg"]]
     if can.empty:
         return None
-    can = can.merge(schedule[["Task", "ES"]], on="Task").sort_values(["slope", "ES"], kind="stable")
-    return can.iloc[0]["Task"]
+
+    # prefer cheapest slope; tie-break by earliest ES from the schedule
+    can = can.sort_values(["slope", "ES"], kind="stable")
+    return str(can.iloc[0]["Task"])
+
 
 
 def apply_crash(df: pd.DataFrame, task: str) -> pd.DataFrame:
