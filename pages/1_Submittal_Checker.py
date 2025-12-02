@@ -4,108 +4,904 @@
 #
 # pip install streamlit rapidfuzz pypdf python-docx pandas
 
-
 from __future__ import annotations
-
 
 import io
 import re
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
-
 import streamlit as st
-
 
 # Optional deps: we'll soft-import to give clearer errors if missing
 try:
-from rapidfuzz import fuzz
-except Exception as e: # pragma: no cover
-st.error(
-"Missing dependency: rapidfuzz. Run `pip install rapidfuzz`.\n" f"Details: {e}"
-)
-raise
-
-
-try:
-from pypdf import PdfReader
-except Exception as e: # pragma: no cover
-st.error("Missing dependency: pypdf. Run `pip install pypdf`.\n" f"Details: {e}")
-raise
-
+    from rapidfuzz import fuzz
+except Exception as e:  # pragma: no cover
+    st.error(
+        "Missing dependency: rapidfuzz. Run `pip install rapidfuzz`.\n" f"Details: {e}"
+    )
+    raise
 
 try:
-import docx # python-docx
-except Exception as e: # pragma: no cover
-st.error("Missing dependency: python-docx. Run `pip install python-docx`.\n" f"Details: {e}")
-raise
+    from pypdf import PdfReader
+except Exception as e:  # pragma: no cover
+    st.error("Missing dependency: pypdf. Run `pip install pypdf`.\n" f"Details: {e}")
+    raise
 
+try:
+    import docx  # python-docx
+except Exception as e:  # pragma: no cover
+    st.error("Missing dependency: python-docx. Run `pip install python-docx`.\n" f"Details: {e}")
+    raise
 
 import pandas as pd
-
-
 
 
 # ---------------------------- Models ---------------------------- #
 @dataclass
 class MatchResult:
-spec_item: str
-best_sub_chunk: Optional[str]
-fuzzy_score: float
-exact_phrase: bool
-concept: Optional[str]
-decision: str # "PASS" | "REVIEW"
-
-
+    spec_item: str
+    best_sub_chunk: Optional[str]
+    fuzzy_score: float
+    exact_phrase: bool
+    concept: Optional[str]
+    decision: str  # "PASS" | "REVIEW"
 
 
 # ---------------------------- File IO ---------------------------- #
 SUPPORTED_EXT = (".pdf", ".docx", ".txt", ".csv")
 
 
-
-
 def _read_pdf(file: io.BytesIO) -> str:
-reader = PdfReader(file)
-text_parts: List[str] = []
-for page in reader.pages:
-try:
-text_parts.append(page.extract_text() or "")
-except Exception:
-# Fallback if a page fails; keep going
-pass
-return "\n".join(text_parts)
-
-
+    reader = PdfReader(file)
+    text_parts: List[str] = []
+    for page in reader.pages:
+        try:
+            text_parts.append(page.extract_text() or "")
+        except Exception:
+            # Fallback if a page fails; keep going
+            pass
+    return "\n".join(text_parts)
 
 
 def _read_docx(file: io.BytesIO) -> str:
-d = docx.Document(file)
-return "\n".join(p.text for p in d.paragraphs)
-
-
+    d = docx.Document(file)
+    return "\n".join(p.text for p in d.paragraphs)
 
 
 def _read_txt(file: io.BytesIO) -> str:
-return file.read().decode(errors="ignore")
-
-
+    return file.read().decode(errors="ignore")
 
 
 def _read_csv(file: io.BytesIO) -> str:
-df = pd.read_csv(file)
-# Join all textual cells into one blob
-strings = []
-for col in df.columns:
-try:
-strings.extend(df[col].astype(str).tolist())
-except Exception:
-pass
-return "\n".join(strings)
-
-
+    df = pd.read_csv(file)
+    # Join all textual cells into one blob
+    strings = []
+    for col in df.columns:
+        try:
+            strings.extend(df[col].astype(str).tolist())
+        except Exception:
+            pass
+    return "\n".join(strings)
 
 
 def read_any(file) -> str:
-"""Read text from an uploaded file of supported type."""
-print("Submittal Checker smoke tests passed.")
+    """Read text from an uploaded file of supported type."""
+    name = (getattr(file, "name", "").lower())
+    data = io.BytesIO(file.read())
+    if name.endswith(".pdf"):
+        return _read_pdf(data)
+    if name.endswith(".docx"):
+        return _read_docx(data)
+    if name.endswith(".txt"):
+        return _read_txt(data)
+    if name.endswith(".csv"):
+        return _read_csv(data)
+    raise ValueError(
+        f"Unsupported file type for '{name}'. Supported: {', '.join(SUPPORTED_EXT)}"
+    )
+
+
+# ---------------------------- Text Processing ---------------------------- #
+BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+[.)]|[A-Z]\.|[A-Z]\))\s+")
+HEADER_RE = re.compile(r"^(?:PART|SECTION|DIVISION)\b", re.I)
+
+
+def clean_text(t: str) -> str:
+    t = re.sub(r"\r", "\n", t)
+    t = re.sub(r"\n{2,}", "\n", t)
+    return t.strip()
+
+
+def split_into_chunks(t: str, *, keep_headers: bool = True) -> List[str]:
+    """Split text into logical lines / bullets. Keeps section headers optionally."""
+    lines = [ln.strip() for ln in t.split("\n")]
+    chunks: List[str] = []
+    acc: List[str] = []
+
+    def flush():
+        if acc:
+            joined = " ".join(acc).strip()
+            if joined:
+                chunks.append(joined)
+            acc.clear()
+
+    for ln in lines:
+        if not ln:
+            flush()
+            continue
+        if BULLET_RE.search(ln) or (keep_headers and HEADER_RE.search(ln)):
+            flush()
+            acc.append(ln)
+            flush()
+        else:
+            acc.append(ln)
+    flush()
+
+    # Dedup small noise
+    seen = set()
+    deduped: List[str] = []
+    for c in chunks:
+        key = c.lower()
+        if key not in seen:
+            deduped.append(c)
+            seen.add(key)
+    return deduped
+
+
+# Lightweight heuristics to pull "requirements" from specs
+REQUIREMENT_HINTS = (
+    "provide",
+    "submit",
+    "include",
+    "certificates",
+    "warranty",
+    "shop drawings",
+    "data sheets",
+    "samples",
+    "tests",
+    "compliance",
+    "standards",
+)
+
+
+def extract_spec_items(spec_chunks: Iterable[str]) -> List[str]:
+    items: List[str] = []
+    for ch in spec_chunks:
+        low = ch.lower()
+        if any(k in low for k in REQUIREMENT_HINTS):
+            items.append(ch)
+    # Fallback: if no items identified, just return the chunks
+    return items or list(spec_chunks)
+
+
+def derive_concept(s: str) -> str:
+    # Pull a short noun-phrase-ish concept for display
+    s = re.sub(r"\([^)]*\)", "", s)
+    # try to keep up to ~10 words
+    words = re.findall(r"[A-Za-z0-9-/]+", s)
+    return " ".join(words[:10])
+
+
+# ---------------------------- Matching ---------------------------- #
+
+def best_match(spec_item: str, sub_chunks: List[str]) -> Tuple[Optional[str], float, bool]:
+    """Return (best_chunk, fuzzy_score, exact_phrase) for a spec item against submittal."""
+    if not sub_chunks:
+        return None, 0.0, False
+
+    best_score = -1.0
+    best_chunk: Optional[str] = None
+    # Exact phrase check (case-insensitive)
+    exact = False
+
+    norm_item = spec_item.strip().lower()
+    for ch in sub_chunks:
+        ch_norm = ch.lower()
+        if not exact and norm_item in ch_norm:
+            exact = True
+        # token_set_ratio is robust to ordering/duplication
+        score = float(fuzz.token_set_ratio(norm_item, ch_norm))
+        if score > best_score:
+            best_score = score
+            best_chunk = ch
+    return best_chunk, best_score, exact
+
+
+def judge(fuzzy_score: float, exact: bool, threshold: int) -> str:
+    return "PASS" if exact or fuzzy_score >= threshold else "REVIEW"
+
+
+# ---------------------------- UI ---------------------------- #
+st.set_page_config(page_title="Submittal Checker", layout="wide")
+st.title("Submittal Checker")
+
+left, right = st.columns(2)
+
+with left:
+    st.subheader("Spec Source")
+    spec_file = st.file_uploader(
+        "Upload spec (PDF/DOCX/TXT/CSV)", type=["pdf", "docx", "txt", "csv"], key="spec_file"
+    )
+    spec_text_area = st.text_area(
+        "Or paste spec text:",
+        height=220,
+        placeholder="Paste specification clauses here…",
+        key="spec_text",
+    )
+
+with right:
+    st.subheader("Submittal Source")
+    sub_file = st.file_uploader(
+        "Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf", "docx", "txt", "csv"], key="sub_file"
+    )
+    sub_text_area = st.text_area(
+        "Or paste submittal text:",
+        height=220,
+        placeholder="Paste submittal content or summary…",
+        key="sub_text",
+    )
+
+threshold = st.slider("Match threshold (0–100)", min_value=0, max_value=100, value=78)
+
+if st.button("Analyze", type="primary"):
+    # -------- Gather & clean text -------- #
+    try:
+        spec_text = ""
+        if spec_file is not None:
+            spec_text = read_any(spec_file)
+        spec_text = (spec_text + "\n" + spec_text_area).strip() if spec_text_area else spec_text
+
+        sub_text = ""
+        if sub_file is not None:
+            sub_text = read_any(sub_file)
+        sub_text = (sub_text + "\n" + sub_text_area).strip() if sub_text_area else sub_text
+
+        if not spec_text:
+            st.warning("Please provide spec text or upload a spec file.")
+            st.stop()
+        if not sub_text:
+            st.warning("Please provide submittal text or upload a submittal file.")
+            st.stop()
+
+        spec_text = clean_text(spec_text)
+        sub_text = clean_text(sub_text)
+
+        spec_chunks = split_into_chunks(spec_text)
+        sub_chunks = split_into_chunks(sub_text, keep_headers=False)
+
+        spec_items = extract_spec_items(spec_chunks)
+
+        results: List[MatchResult] = []
+        for item in spec_items:
+            best, score, exact = best_match(item, sub_chunks)
+            decision = judge(score, exact, threshold)
+            results.append(
+                MatchResult(
+                    spec_item=item,
+                    best_sub_chunk=best,
+                    fuzzy_score=score,
+                    exact_phrase=exact,
+                    concept=derive_concept(item),
+                    decision=decision,
+                )
+            )
+
+        # -------- Summaries -------- #
+        df = pd.DataFrame(
+            [
+                {
+                    "Concept": r.concept,
+                    "Spec Item": r.spec_item,
+                    "Best Submittal Match": r.best_sub_chunk or "",
+                    "Fuzzy Score": round(r.fuzzy_score, 1),
+                    "Exact Phrase?": "Yes" if r.exact_phrase else "No",
+                    "Decision": r.decision,
+                }
+                for r in results
+            ]
+        )
+
+        pass_rate = sum(r.decision == "PASS" for r in results) / max(len(results), 1)
+
+        st.success(f"Analyzed {len(results)} requirement lines.")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Coverage (PASS)", f"{pass_rate:.0%}")
+        m2.metric("Threshold", threshold)
+        m3.metric("Exact phrase hits", sum(r.exact_phrase for r in results))
+
+        st.markdown("---")
+        st.subheader("Results")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # Unmatched view
+        st.markdown("---")
+        st.subheader("Items Needing Review")
+        needs_review = df[df["Decision"] == "REVIEW"]
+        if len(needs_review) == 0:
+            st.info("Nothing to review. All items cleared the threshold or matched exactly.")
+        else:
+            st.dataframe(needs_review, use_container_width=True, hide_index=True)
+
+        # Download
+        csv = df.to_csv(index=False).encode()
+        st.download_button(
+            "Download CSV",
+            data=csv,
+            file_name="submittal_checker_results.csv",
+            mime="text/csv",
+        )
+
+    except Exception as e:
+        st.exception(e)
+
+
+# ----------------------------
+# Optional smoke tests (run outside Streamlit)
+# ----------------------------
+# These tests don't run during normal Streamlit usage. To run them:
+#   RUN_SELF_TESTS=1 python 1_Submittal_Checker.py
+
+if __name__ == "__main__":
+    import os as _os
+    if _os.environ.get("RUN_SELF_TESTS") == "1":
+        # Test clean_text + split_into_chunks
+        raw = """
+SECTION 01 33 00 Submittal Procedures
+  - Provide product data
+  - Submit samples
+
+PART 2
+  Materials shall comply with ASTM standards
+"""
+        ct = clean_text(raw)
+        chunks = split_into_chunks(ct)
+        assert any("Provide product data" in c for c in chunks), "split_into_chunks missed bullet"
+        assert any("Submittal Procedures" in c for c in chunks), "split_into_chunks missed header"
+
+        # Test requirement extraction
+        items = extract_spec_items(chunks)
+        assert len(items) >= 2, "extract_spec_items should find at least two hints"
+
+        # Test matching
+        sub_text = "Samples and product data are included per Section 01 33 00."
+        best, score, exact = best_match(items[0], split_into_chunks(sub_text, keep_headers=False))
+        assert best is not None and score > 50, "best_match score too low"
+
+        print("Submittal Checker smoke tests passed.")
+
+
+
+# 2_Schedule_WhatIfs.py
+# Streamlit "Schedule What‑Ifs" — Floats + Calendar Mode (updated)
+# - Adds width shims + auto-height helpers (no scrollbars)
+# - Safe page_config gating for single multi‑page app
+# - Type coercion after editor to avoid KeyErrors
+# - Full-height dataframes + scaled Gantt charts
+# ==========================================
+
+from __future__ import annotations
+
+import io
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+from datetime import date
+
+import pandas as pd
+import streamlit as st
+import altair as alt
+from pandas.tseries.offsets import CustomBusinessDay
+
+# ---- Width shims (forward-compatible with Streamlit deprecations) ----
+
+def df_fullwidth(df, **kwargs):
+    try:
+        return st.dataframe(df, use_container_width=True, **kwargs)
+    except TypeError:
+        return st.dataframe(df, **kwargs)
+
+def editor_fullwidth(df, **kwargs):
+    try:
+        return st.data_editor(df, use_container_width=True, **kwargs)
+    except TypeError:
+        return st.data_editor(df, **kwargs)
+
+def chart_fullwidth(chart, **kwargs):
+    try:
+        return st.altair_chart(chart, use_container_width=True, **kwargs)
+    except TypeError:
+        return st.altair_chart(chart, **kwargs)
+
+# --- Auto-size helpers so tables/charts show everything without scrollbars ---
+_DEF_ROW = 32
+_DEF_HEADER = 38
+
+def rows_to_height(n_rows: int, row_px: int = _DEF_ROW, header_px: int = _DEF_HEADER, max_height: int = 1200) -> int:
+    n = max(1, int(n_rows))
+    return min(max_height, header_px + row_px * n)
+
+# -------------------- Config -------------------- #
+REQUIRED = [
+    "Task",
+    "Duration",
+    "Predecessors",
+    "Normal_Cost_per_day",
+    "Crash_Cost_per_day",
+]
+# Optional: Min_Duration (defaults to Duration) and Overlap_OK (defaults False)
+
+ALIASES: Dict[str, str] = {
+    # Task
+    "task": "Task", "activity": "Task", "name": "Task",
+    # Duration
+    "duration": "Duration", "duration_days": "Duration", "duration_(days)": "Duration", "dur": "Duration",
+    # Predecessors
+    "predecessors": "Predecessors", "pred": "Predecessors", "predecessor": "Predecessors",
+    # Normal cost/day
+    "normal_cost_per_day": "Normal_Cost_per_day", "normal/day": "Normal_Cost_per_day",
+    "normal_cost/day": "Normal_Cost_per_day", "normal_cost": "Normal_Cost_per_day", "normal_cost_usd": "Normal_Cost_per_day",
+    # Crash cost/day
+    "crash_cost_per_day": "Crash_Cost_per_day", "crash/day": "Crash_Cost_per_day",
+    "crash_cost/day": "Crash_Cost_per_day", "crash_cost": "Crash_Cost_per_day", "crash_cost_usd": "Crash_Cost_per_day",
+    # Min duration (aka crash duration)
+    "min_duration": "Min_Duration", "min_dur": "Min_Duration", "min": "Min_Duration",
+    "crash_duration": "Min_Duration", "crash_duration_days": "Min_Duration", "crash_dur": "Min_Duration",
+    # Overlap flag
+    "overlap_ok": "Overlap_OK", "overlap?": "Overlap_OK", "allow_overlap": "Overlap_OK",
+}
+
+# -------------------- Utilities -------------------- #
+
+def norm_col(s: str) -> str:
+    s = str(s).strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return re.sub(r"_+", "_", s).strip("_")
+
+
+def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    raw_to_norm = {c: norm_col(c) for c in df.columns}
+    rename_map = {}
+    for raw, norm in raw_to_norm.items():
+        if norm in ALIASES:
+            rename_map[raw] = ALIASES[norm]
+    return df.rename(columns=rename_map)
+
+
+def load_csv(uploaded) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+    raw = uploaded.getvalue()
+    df = pd.read_csv(io.BytesIO(raw))
+    df = canonicalize_columns(df)
+
+    if "Min_Duration" not in df.columns and "Duration" in df.columns:
+        df["Min_Duration"] = df["Duration"]
+        warnings.append("Min_Duration not provided; defaulting to Duration.")
+    if "Overlap_OK" not in df.columns:
+        df["Overlap_OK"] = False
+        warnings.append("Overlap_OK not provided; defaulting to False for all tasks.")
+
+    for col in ["Duration", "Min_Duration", "Normal_Cost_per_day", "Crash_Cost_per_day"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "Overlap_OK" in df.columns:
+        df["Overlap_OK"] = (
+            df["Overlap_OK"].astype(str).str.strip().str.lower().map(
+                {"1": True, "0": False, "true": True, "false": False, "yes": True, "no": False, "y": True, "n": False}
+            ).fillna(False)
+        )
+
+    if "Task" in df.columns:
+        df["Task"] = df["Task"].astype(str)
+    if "Predecessors" in df.columns:
+        df["Predecessors"] = df["Predecessors"].fillna("").astype(str)
+
+    if {"Duration", "Min_Duration"} <= set(df.columns):
+        mask = df["Min_Duration"] > df["Duration"]
+        if mask.any():
+            warnings.append("Some rows have Min_Duration > Duration; clamping to Duration.")
+            df.loc[mask, "Min_Duration"] = df.loc[mask, "Duration"]
+
+    return df, warnings
+
+# -------------------- CPM Core -------------------- #
+@dataclass
+class CPMNode:
+    task: str
+    dur: int
+    preds: List[str]
+    es: int = 0
+    ef: int = 0
+    ls: int = 0
+    lf: int = 0
+    tf: int = 0
+
+
+def parse_predecessors(s: str) -> List[str]:
+    if not s or not isinstance(s, str):
+        return []
+    return [p.strip() for p in re.split(r"[,;]", s) if p.strip()]
+
+
+def topological_order(nodes: Dict[str, CPMNode]) -> List[str]:
+    indeg = {k: 0 for k in nodes}
+    for n in nodes.values():
+        for p in n.preds:
+            if p in indeg:
+                indeg[n.task] += 1
+    Q = [k for k, d in indeg.items() if d == 0]
+    order = []
+    while Q:
+        v = Q.pop(0)
+        order.append(v)
+        for w in nodes:
+            if v in nodes[w].preds:
+                indeg[w] -= 1
+                if indeg[w] == 0:
+                    Q.append(w)
+    if len(order) != len(nodes):
+        raise ValueError("Dependency cycle detected. Check Predecessors.")
+    return order
+
+
+def cpm_schedule(df: pd.DataFrame, overlap_frac: float = 0.0, clamp_free_float: bool = True) -> Tuple[pd.DataFrame, int]:
+    # Build nodes
+    nodes: Dict[str, CPMNode] = {}
+    for _, r in df.iterrows():
+        nodes[r["Task"]] = CPMNode(
+            task=r["Task"], dur=int(max(0, r["Duration"])), preds=parse_predecessors(r.get("Predecessors", ""))
+        )
+
+    order = topological_order(nodes)
+
+    # Forward pass with optional fast‑track overlap
+    for name in order:
+        node = nodes[name]
+        if not node.preds:
+            node.es = 0
+        else:
+            starts = []
+            for p in node.preds:
+                if p not in nodes:
+                    raise ValueError(f"Unknown predecessor '{p}' for task '{name}'.")
+                pred = nodes[p]
+                overlap_allow = bool(df.loc[df["Task"] == name, "Overlap_OK"].iloc[0]) if "Overlap_OK" in df.columns else False
+                if overlap_allow and overlap_frac > 0:
+                    starts.append(max(0, pred.ef - int(round(overlap_frac * pred.dur))))
+                else:
+                    starts.append(pred.ef)
+            node.es = max(starts)
+        node.ef = node.es + node.dur
+
+    project_duration = max((n.ef for n in nodes.values()), default=0)
+
+    # Successors map
+    succs: Dict[str, List[str]] = {k: [] for k in nodes}
+    for t, n in nodes.items():
+        for p in n.preds:
+            if p in succs:
+                succs[p].append(t)
+
+    # Backward pass
+    for name in reversed(order):
+        node = nodes[name]
+        succ_ls = [nodes[s].ls for s in succs[name]]
+        node.lf = min(succ_ls) if succ_ls else project_duration
+        node.ls = node.lf - node.dur
+        node.tf = node.ls - node.es  # total float (aka slack)
+
+    # Floats
+    rows = []
+    for name in order:
+        n = nodes[name]
+        succ_es_min = min([nodes[s].es for s in succs[name]], default=project_duration)
+        free_raw = succ_es_min - n.ef
+        free_float = max(0, free_raw) if clamp_free_float else free_raw
+        max_pred_ef = max([nodes[p].ef for p in n.preds], default=0)
+        indep = max(0, succ_es_min - max_pred_ef - n.dur)  # conventional definition clamps at 0
+        interfering = n.tf - free_float
+        rows.append({
+            "Task": n.task,
+            "Duration": n.dur,
+            "ES": n.es,
+            "EF": n.ef,
+            "LS": n.ls,
+            "LF": n.lf,
+            "Total_Float": n.tf,
+            "Slack": n.tf,
+            "Free_Float": free_float,
+            "Free_Float_Raw": free_raw,
+            "Independent_Float": indep,
+            "Interfering_Float": interfering,
+            "Critical": n.tf == 0,
+        })
+
+    out = pd.DataFrame(rows).sort_values("ES", kind="stable")
+    return out, project_duration
+
+# -------------------- Crashing -------------------- #
+
+def crash_once(df: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
+    """
+    Return the name of the cheapest critical task to shorten by 1 day,
+    or None if no further crashing is possible.
+    """
+    crit = schedule[schedule["Critical"]]
+    if crit.empty:
+        return None
+
+    # Bring in cost and min-duration from the editable config df.
+    # Use suffixes so we can unambiguously reference the df-sourced columns.
+    merged = crit.merge(
+        df[["Task", "Duration", "Min_Duration", "Normal_Cost_per_day", "Crash_Cost_per_day"]],
+        on="Task",
+        suffixes=("_sched", "_cfg"),
+    )
+
+    # incremental slope (crash − normal) per day from the config df
+    merged["slope"] = (merged["Crash_Cost_per_day_cfg"] - merged["Normal_Cost_per_day_cfg"]).astype(float)
+
+    # only tasks that can still be reduced (config Duration > Min_Duration)
+    can = merged[merged["Duration_cfg"] > merged["Min_Duration_cfg"]]
+    if can.empty:
+        return None
+
+    # prefer cheapest slope; tie-break by earliest ES from the schedule
+    can = can.sort_values(["slope", "ES"], kind="stable")
+    return str(can.iloc[0]["Task"])
+
+
+def apply_crash(df: pd.DataFrame, task: str) -> pd.DataFrame:
+    new = df.copy()
+    new.loc[new["Task"] == task, "Duration"] = new.loc[new["Task"] == task, "Duration"] - 1
+    return new
+
+
+def total_cost(df: pd.DataFrame) -> float:
+    baseline = (df["Normal_Cost_per_day"] * df["Duration"].round(0)).sum()
+    crashed_days = (df.get("_baseline_duration", df["Duration"]) - df["Duration"]).clip(lower=0)
+    slope = (df["Crash_Cost_per_day"] - df["Normal_Cost_per_day"]).clip(lower=0)
+    return float(baseline + (crashed_days * slope).sum())
+
+
+def crash_to_target(df: pd.DataFrame, target_days: int, overlap_frac: float, clamp_free_float: bool) -> Tuple[pd.DataFrame, List[str], int]:
+    df = df.copy()
+    df["_baseline_duration"] = df["Duration"]
+    log: List[str] = []
+    schedule, cur = cpm_schedule(df, overlap_frac, clamp_free_float)
+    while cur > target_days:
+        pick = crash_once(df, schedule)
+        if pick is None:
+            break
+        df = apply_crash(df, pick)
+        log.append(f"Shortened '{pick}' by 1 day → new durations applied.")
+        schedule, cur = cpm_schedule(df, overlap_frac, clamp_free_float)
+    return df.drop(columns=["_baseline_duration"]), log, cur
+
+# -------------------- Calendar helpers -------------------- #
+
+def make_cbd(workdays: List[str], holidays: List[str]) -> CustomBusinessDay:
+    weekmask = " ".join(workdays)  # e.g., "Mon Tue Wed Thu Fri"
+    hols = [pd.to_datetime(h).date() for h in holidays if h.strip()]
+    return CustomBusinessDay(weekmask=weekmask, holidays=hols)
+
+
+def calendarize(schedule_df: pd.DataFrame, project_start: date, cbd: CustomBusinessDay) -> pd.DataFrame:
+    if schedule_df is None or schedule_df.empty:
+        return schedule_df
+    out = schedule_df.copy()
+    start_ts = pd.to_datetime(project_start)
+    out["ES_date"] = start_ts + out["ES"].astype(int) * cbd
+    out["EF_date_excl"] = start_ts + out["EF"].astype(int) * cbd  # exclusive bound
+    out["Start_Date"] = out["ES_date"]
+    out["Finish_Date"] = out["EF_date_excl"] - 1 * cbd  # inclusive last working day
+    return out
+
+# -------------------- Gantt -------------------- #
+
+def gantt_chart(schedule_df: pd.DataFrame) -> alt.Chart:
+    if schedule_df is None or schedule_df.empty:
+        return alt.Chart(pd.DataFrame({"ES": [0], "EF": [0], "Task": ["No tasks"]})).mark_bar()
+
+    data = schedule_df.copy()
+    data["Task"] = data["Task"].astype(str)
+    # Scale to show all tasks without scrolling
+    height = max(160, min(40 * len(data), 1200))
+
+    if "ES_date" in data.columns and "EF_date_excl" in data.columns:
+        x = alt.X("ES_date:T", title="Start")
+        x2 = "EF_date_excl:T"
+    else:
+        x = alt.X("ES:Q", title="Day (project time)")
+        x2 = "EF:Q"
+
+    return (
+        alt.Chart(data)
+        .mark_bar()
+        .encode(
+            x=x,
+            x2=x2,
+            y=alt.Y("Task:N", sort=alt.SortField("ES", order="ascending")),
+            color=alt.condition("datum.Critical", alt.value("#d62728"), alt.value("#1f77b4")),
+            tooltip=[
+                "Task", "Duration", "ES", "EF", "LS", "LF",
+                "Total_Float", "Free_Float", "Independent_Float", "Interfering_Float",
+                alt.Tooltip("Start_Date:T", title="Start Date", format="%Y-%m-%d"),
+                alt.Tooltip("Finish_Date:T", title="Finish Date", format="%Y-%m-%d"),
+            ],
+        )
+        .properties(height=height)
+    )
+
+# -------------------- UI -------------------- #
+# Respect single-app multipage: set config only once
+try:
+    _PAGE_CONFIG_ALREADY_SET = st.session_state.get("__page_config_set__", False)
+    if not _PAGE_CONFIG_ALREADY_SET:
+        st.set_page_config(page_title="Schedule What‑Ifs", layout="wide")
+        st.session_state["__page_config_set__"] = True
+except Exception:
+    pass
+
+st.title("Schedule What‑Ifs — Floats + Calendar")
+
+st.write("Compute critical path, explore fast‑track/crash scenarios, see floats, and map to real dates.")
+
+st.subheader("Task Table")
+uploaded = st.file_uploader("Upload tasks CSV", type=["csv"], accept_multiple_files=False)
+
+with st.expander("CSV column requirements & example", expanded=False):
+    st.code(
+        "Task,Duration,Predecessors,Normal_Cost_per_day,Crash_Cost_per_day,Min_Duration,Overlap_OK
+"
+        "A - Site Prep,5,,1200,1800,3,TRUE
+"
+        "B - Foundations,10,A - Site Prep,1600,2600,7,TRUE
+",
+        language="csv",
+    )
+    st.caption("Required: Task, Duration, Predecessors, Normal_Cost_per_day, Crash_Cost_per_day · Optional: Min_Duration, Overlap_OK. Aliases like Duration_days, Crash_Cost_USD, Crash_Duration_days are accepted.")
+
+base_df = pd.DataFrame({
+    "Task": ["A - Site Prep", "B - Foundations", "C - Structure", "D - MEP Rough‑In", "E - Enclosure", "F - Finishes"],
+    "Duration": [5, 10, 12, 8, 9, 10],
+    "Predecessors": ["", "A - Site Prep", "B - Foundations", "C - Structure", "C - Structure", "D - MEP Rough‑In, E - Enclosure"],
+    "Normal_Cost_per_day": [1200, 1600, 1900, 1500, 1400, 1550],
+    "Crash_Cost_per_day": [1800, 2600, 3000, 2400, 2300, 2550],
+    "Min_Duration": [3, 7, 9, 6, 7, 8],
+    "Overlap_OK": [True, True, True, True, False, False],
+})
+
+if uploaded:
+    df, warns = load_csv(uploaded)
+else:
+    df, warns = base_df.copy(), ["Using example table — upload your CSV to replace it."]
+
+for w in warns:
+    st.warning(w)
+
+# Size editor to show all rows (up to cap)
+editor_height = rows_to_height(len(df) + 5)
+
+edited_df = editor_fullwidth(
+    df,
+    hide_index=True,
+    num_rows="dynamic",
+    column_config={
+        "Task": st.column_config.TextColumn("Task", required=True),
+        "Duration": st.column_config.NumberColumn("Duration", min_value=0, step=1),
+        "Predecessors": st.column_config.TextColumn("Predecessors", help="Comma‑separated predecessor task names"),
+        "Normal_Cost_per_day": st.column_config.NumberColumn("Normal Cost / day", min_value=0),
+        "Crash_Cost_per_day": st.column_config.NumberColumn("Crash Cost / day", min_value=0),
+        "Min_Duration": st.column_config.NumberColumn("Min Duration", min_value=0, step=1),
+        "Overlap_OK": st.column_config.CheckboxColumn("Overlap OK"),
+    },
+    key="task_table",
+    height=editor_height,
+)
+
+# Coerce types after editor to avoid KeyErrors and NaNs
+edited_df["Task"] = edited_df["Task"].astype(str)
+edited_df["Predecessors"] = edited_df["Predecessors"].fillna("").astype(str)
+for c in ["Duration", "Min_Duration"]:
+    edited_df[c] = pd.to_numeric(edited_df[c], errors="coerce").fillna(0).astype(int)
+    edited_df[c] = edited_df[c].clip(lower=0)
+for c in ["Normal_Cost_per_day", "Crash_Cost_per_day"]:
+    edited_df[c] = pd.to_numeric(edited_df[c], errors="coerce").fillna(0.0)
+if "Overlap_OK" in edited_df.columns:
+    edited_df["Overlap_OK"] = edited_df["Overlap_OK"].fillna(False).astype(bool)
+else:
+    edited_df["Overlap_OK"] = False
+
+st.markdown("---")
+left, right = st.columns([1,1])
+with left:
+    target_days = st.number_input("Target project duration (days)", min_value=1, value=30, step=1)
+with right:
+    overlap_frac = st.number_input("Fast‑track overlap fraction", min_value=0.0, max_value=0.9, value=0.0, step=0.05, help="Portion of predecessor duration you can overlap when successor has Overlap OK.")
+
+c1, c2 = st.columns([1,1])
+clamp_ff = c1.checkbox("Clamp Free Float at ≥ 0", value=True, help="Classic CPM clamps Free Float to zero; uncheck to see negative Free Float under fast‑track overlaps.")
+c1.caption("Tables show both **Free_Float** (affected by the toggle) and **Free_Float_Raw** (always raw) so you can see hidden overlaps.")
+cal_mode = c2.checkbox("Calendar mode (map to dates)", value=True)
+
+if cal_mode:
+    cw1, cw2 = st.columns([1,1])
+    with cw1:
+        proj_start = st.date_input("Project start date", value=date.today())
+    with cw2:
+        workdays = st.multiselect(
+            "Workdays",
+            options=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+            default=["Mon","Tue","Wed","Thu","Fri"],
+            help="Business days used to convert ES/EF into dates."
+        )
+    holidays_text = st.text_area("Holidays (YYYY‑MM‑DD, one per line)", height=80, placeholder="2025-11-27
+2025-12-25")
+    holidays = [ln.strip() for ln in holidays_text.splitlines() if ln.strip()]
+    cbd = make_cbd(workdays, holidays)
+
+cA, cB, cC, cD = st.columns([1,1,1,1])
+compute = cA.button("Compute CPM", type="secondary")
+run_crash = cB.button("Crash to Target", type="primary")
+btn_dl_edited = cC.button("Download Edited CSV")
+
+if btn_dl_edited:
+    st.download_button("Download edited CSV", edited_df.to_csv(index=False).encode(), "tasks_edited.csv", "text/csv")
+
+if compute or run_crash:
+    try:
+        missing = [c for c in REQUIRED if c not in edited_df.columns]
+        if missing:
+            st.error(f"Missing required columns: {missing}")
+            st.stop()
+
+        base_schedule, base_days = cpm_schedule(edited_df, overlap_frac, clamp_ff)
+        if cal_mode:
+            base_schedule = calendarize(base_schedule, proj_start, cbd)
+
+        st.success(f"Baseline project duration: {base_days} days")
+        df_fullwidth(base_schedule, hide_index=True, height=rows_to_height(len(base_schedule)))
+        st.download_button("Download baseline schedule CSV", base_schedule.to_csv(index=False).encode(), "baseline_schedule.csv", "text/csv")
+        st.subheader("Gantt (Baseline)")
+        chart_fullwidth(gantt_chart(base_schedule))
+
+        if run_crash:
+            if target_days >= base_days:
+                st.info("Target ≥ baseline; nothing to crash.")
+            else:
+                crashed_df, log, final_days = crash_to_target(edited_df, target_days, overlap_frac, clamp_ff)
+                crashed_schedule, _ = cpm_schedule(crashed_df, overlap_frac, clamp_ff)
+                if cal_mode:
+                    crashed_schedule = calendarize(crashed_schedule, proj_start, cbd)
+
+                edited_df["_baseline_duration"] = edited_df["Duration"]
+                base_cost = total_cost(edited_df)
+                crashed_df["_baseline_duration"] = edited_df["Duration"]
+                crash_cost = total_cost(crashed_df)
+
+                st.markdown("### Crashed Scenario")
+                st.success(f"New duration: {final_days} days (target: {target_days})")
+                st.metric("Added cost (approx)", f"${crash_cost - base_cost:,.0f}")
+
+                st.subheader("Revised Durations")
+                show_cols = ["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]
+                df_fullwidth(crashed_df[show_cols], hide_index=True, height=rows_to_height(len(crashed_df)))
+                st.download_button("Download crashed durations CSV", crashed_df.to_csv(index=False).encode(), "crashed_durations.csv", "text/csv")
+
+                st.subheader("Crashed Schedule")
+                df_fullwidth(crashed_schedule, hide_index=True, height=rows_to_height(len(crashed_schedule)))
+                st.download_button("Download crashed schedule CSV", crashed_schedule.to_csv(index=False).encode(), "crashed_schedule.csv", "text/csv")
+                st.subheader("Gantt (Crashed)")
+                chart_fullwidth(gantt_chart(crashed_schedule))
+
+                st.subheader("Crash Log")
+                if log:
+                    for line in log:
+                        st.write("• ", line)
+                else:
+                    st.write("No feasible crashes — target may be below theoretical minimum.")
+
+    except Exception as e:
+        st.exception(e)
