@@ -472,8 +472,8 @@ holidays_text = st.text_area(
     placeholder="2025-11-27\n2025-12-25",
 )
 
-    holidays = [ln.strip() for ln in holidays_text.splitlines() if ln.strip()]
-    cbd = make_cbd(workdays, holidays)
+holidays = [ln.strip() for ln in holidays_text.splitlines() if ln.strip()]
+cbd = make_cbd(workdays, holidays)
 
 cA, cB, cC, cD = st.columns([1,1,1,1])
 compute = cA.button("Compute CPM", type="secondary")
