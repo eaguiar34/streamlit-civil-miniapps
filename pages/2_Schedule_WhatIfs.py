@@ -459,11 +459,11 @@ if cal_mode:
     with cw1:
         proj_start = st.date_input("Project start date", value=date.today())
     with cw2:
-    workdays = st.multiselect(
-        "Workdays",
-        options=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
-        default=["Mon","Tue","Wed","Thu","Fri"],
-        help="Business days used to convert ES/EF into dates.",
+        workdays = st.multiselect(
+            "Workdays",
+            options=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+            default=["Mon","Tue","Wed","Thu","Fri"],
+            help="Business days used to convert ES/EF into dates.",
     )
 
 holidays_text = st.text_area(
