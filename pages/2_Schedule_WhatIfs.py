@@ -370,7 +370,7 @@ for w in warns:
 
 edited_df = st.data_editor(
     df,
-    use_container_width=True,
+    width=True,
     hide_index=True,
     num_rows="dynamic",
     column_config={
@@ -432,10 +432,10 @@ if compute or run_crash:
             base_schedule = calendarize(base_schedule, proj_start, cbd)
 
         st.success(f"Baseline project duration: {base_days} days")
-        st.dataframe(base_schedule, use_container_width=True, hide_index=True)
+        st.dataframe(base_schedule, width='stretch', hide_index=True)
         st.download_button("Download baseline schedule CSV", base_schedule.to_csv(index=False).encode(), "baseline_schedule.csv", "text/csv")
         st.subheader("Gantt (Baseline)")
-        st.altair_chart(gantt_chart(base_schedule), use_container_width=True)
+        st.altair_chart(gantt_chart(base_schedule), width=True)
 
         if run_crash:
             if target_days >= base_days:
@@ -457,14 +457,14 @@ if compute or run_crash:
 
                 st.subheader("Revised Durations")
                 show_cols = ["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]
-                st.dataframe(crashed_df[show_cols], use_container_width=True, hide_index=True)
+                st.dataframe(crashed_df[show_cols], width='stretch', hide_index=True)
                 st.download_button("Download crashed durations CSV", crashed_df.to_csv(index=False).encode(), "crashed_durations.csv", "text/csv")
 
                 st.subheader("Crashed Schedule")
-                st.dataframe(crashed_schedule, use_container_width=True, hide_index=True)
+                st.dataframe(crashed_schedule, width='stretch', hide_index=True)
                 st.download_button("Download crashed schedule CSV", crashed_schedule.to_csv(index=False).encode(), "crashed_schedule.csv", "text/csv")
                 st.subheader("Gantt (Crashed)")
-                st.altair_chart(gantt_chart(crashed_schedule), use_container_width=True)
+                st.altair_chart(gantt_chart(crashed_schedule), width='stretch')
 
                 st.subheader("Crash Log")
                 if log:
