@@ -305,7 +305,7 @@ def gantt_chart(schedule_df: pd.DataFrame) -> alt.Chart:
 
     data = schedule_df.copy()
     data["Task"] = data["Task"].astype(str)
-    height = max(140, min(32 * len(data), 640))
+    height = max(160, min(40 * len(data), 1200))
 
     if "ES_date" in data.columns and "EF_date_excl" in data.columns:
         x = alt.X("ES_date:T", title="Start")
@@ -368,6 +368,8 @@ else:
 for w in warns:
     st.warning(w)
 
+editor_height = rows_to_height(len(df) + 5)
+
 edited_df = st.data_editor(
     df,
     width=True,
@@ -383,6 +385,7 @@ edited_df = st.data_editor(
         "Overlap_OK": st.column_config.CheckboxColumn("Overlap OK"),
     },
     key="task_table",
+    height=editor_height
 )
 
 st.markdown("---")
