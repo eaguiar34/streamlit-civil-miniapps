@@ -257,25 +257,47 @@ def crash_once(df: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
     if crit.empty:
         return None
 
-    # Bring in cost and min-duration from the editable config df.
-    # Use suffixes so we can unambiguously reference the df-sourced columns.
     merged = crit.merge(
         df[["Task", "Duration", "Min_Duration", "Normal_Cost_per_day", "Crash_Cost_per_day"]],
         on="Task",
+        how="left",
         suffixes=("_sched", "_cfg"),
     )
 
-    # incremental slope (crash − normal) per day from the config df
-    merged["slope"] = (merged["Crash_Cost_per_day_cfg"] - merged["Normal_Cost_per_day_cfg"]).astype(float)
+    # pick whichever version of a column exists post-merge
+    def pick(col: str, prefer_cfg: bool = True) -> str:
+        cfg, sched = f"{col}_cfg", f"{col}_sched"
+        if prefer_cfg and cfg in merged.columns:
+            return cfg
+        if col in merged.columns:
+            return col
+        if sched in merged.columns:
+            return sched
+        raise KeyError(col)
 
-    # only tasks that can still be reduced (config Duration > Min_Duration)
-    can = merged[merged["Duration_cfg"] > merged["Min_Duration_cfg"]]
+    normal_col = pick("Normal_Cost_per_day")            # usually unsuffixed
+    crash_col  = pick("Crash_Cost_per_day")             # usually unsuffixed
+    dur_col    = pick("Duration", prefer_cfg=True)      # usually Duration_cfg
+    min_col    = pick("Min_Duration", prefer_cfg=True)  # usually unsuffixed
+
+    # slope = (crash − normal) per day
+    merged["slope"] = (
+        pd.to_numeric(merged[crash_col], errors="coerce")
+        - pd.to_numeric(merged[normal_col], errors="coerce")
+    ).astype(float)
+
+    # only tasks that can still be reduced
+    can = merged[
+        pd.to_numeric(merged[dur_col], errors="coerce")
+        > pd.to_numeric(merged[min_col], errors="coerce")
+    ]
     if can.empty:
         return None
 
-    # prefer cheapest slope; tie-break by earliest ES from the schedule
+    # pick cheapest; tie-break by earliest ES
     can = can.sort_values(["slope", "ES"], kind="stable")
     return str(can.iloc[0]["Task"])
+
 
 
 def apply_crash(df: pd.DataFrame, task: str) -> pd.DataFrame:
