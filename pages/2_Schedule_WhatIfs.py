@@ -377,17 +377,19 @@ st.write("Compute critical path, explore fast‑track/crash scenarios, see float
 st.subheader("Task Table")
 uploaded = st.file_uploader("Upload tasks CSV", type=["csv"], accept_multiple_files=False)
 
+
 with st.expander("CSV column requirements & example", expanded=False):
-    st.code(
-        "Task,Duration,Predecessors,Normal_Cost_per_day,Crash_Cost_per_day,Min_Duration,Overlap_OK
-"
-        "A - Site Prep,5,,1200,1800,3,TRUE
-"
-        "B - Foundations,10,A - Site Prep,1600,2600,7,TRUE
-",
-        language="csv",
+    example_csv = """\
+Task,Duration,Predecessors,Normal_Cost_per_day,Crash_Cost_per_day,Min_Duration,Overlap_OK
+A - Site Prep,5,,1200,1800,3,TRUE
+B - Foundations,10,"A - Site Prep",1600,2600,7,TRUE
+"""
+    st.code(example_csv, language="csv")
+    st.caption(
+        "Required: Task, Duration, Predecessors, Normal_Cost_per_day, Crash_Cost_per_day · "
+        "Optional: Min_Duration, Overlap_OK. Aliases like Duration_days, Crash_Cost_USD, "
+        "Crash_Duration_days are accepted."
     )
-    st.caption("Required: Task, Duration, Predecessors, Normal_Cost_per_day, Crash_Cost_per_day · Optional: Min_Duration, Overlap_OK. Aliases like Duration_days, Crash_Cost_USD, Crash_Duration_days are accepted.")
 
 base_df = pd.DataFrame({
     "Task": ["A - Site Prep", "B - Foundations", "C - Structure", "D - MEP Rough‑In", "E - Enclosure", "F - Finishes"],
