@@ -136,7 +136,8 @@ def load_csv(uploaded) -> Tuple[pd.DataFrame, List[str]]:
 class CPMNode:
     task: str
     dur: int
-    preds: List[str]
+    # list of (pred_task, lag_days) — FS only
+    preds: List[Tuple[str, int]]
     es: int = 0
     ef: int = 0
     ls: int = 0
@@ -144,17 +145,38 @@ class CPMNode:
     tf: int = 0
 
 
-def parse_predecessors(s: str) -> List[str]:
+def parse_predecessors(s: str) -> List[Tuple[str, int]]:
+    """
+    Parse 'Predecessors' cell (comma/semicolon separated) with optional FS lag:
+      "A", "A+3", "A -2", "A+0, B-1"
+    Returns: [(pred_name, lag_int), ...]
+    """
     if not s or not isinstance(s, str):
         return []
-    return [p.strip() for p in re.split(r"[,;]", s) if p.strip()]
+    out: List[Tuple[str, int]] = []
+    for raw in re.split(r"[;,]", s):
+        t = raw.strip()
+        if not t:
+            continue
+        # split name and +/-lag (if any)
+        m = re.match(r"^(?P<name>.+?)(?P<lag>[+-]\s*\d+)?\s*$", t)
+        if not m:
+            out.append((t, 0))
+            continue
+        name = m.group("name").strip()
+        lag = 0
+        if m.group("lag"):
+            lag = int(m.group("lag").replace(" ", ""))
+        out.append((name, lag))
+    return out
+
 
 
 def topological_order(nodes: Dict[str, CPMNode]) -> List[str]:
     indeg = {k: 0 for k in nodes}
     for n in nodes.values():
-        for p in n.preds:
-            if p in indeg:
+        for (pname, _) in n.preds:
+            if pname in indeg:
                 indeg[n.task] += 1
     Q = [k for k, d in indeg.items() if d == 0]
     order = []
@@ -162,7 +184,7 @@ def topological_order(nodes: Dict[str, CPMNode]) -> List[str]:
         v = Q.pop(0)
         order.append(v)
         for w in nodes:
-            if v in nodes[w].preds:
+            if any(pname == v for (pname, _) in nodes[w].preds):
                 indeg[w] -= 1
                 if indeg[w] == 0:
                     Q.append(w)
@@ -176,57 +198,71 @@ def cpm_schedule(df: pd.DataFrame, overlap_frac: float = 0.0, clamp_free_float: 
     nodes: Dict[str, CPMNode] = {}
     for _, r in df.iterrows():
         nodes[r["Task"]] = CPMNode(
-            task=r["Task"], dur=int(max(0, r["Duration"])), preds=parse_predecessors(r.get("Predecessors", ""))
+            task=r["Task"],
+            dur=int(max(0, r["Duration"])),
+            preds=parse_predecessors(r.get("Predecessors", "")),
         )
 
-    order = topological_order(nodes)
+    order = topological_order({k: CPMNode(k, v.dur, [(p, 0) for (p, _) in v.preds]) for k, v in nodes.items()})
 
-    # Forward pass with optional fast‑track overlap
+    # Forward pass with FS + lag and optional fast-track overlap
     for name in order:
         node = nodes[name]
         if not node.preds:
             node.es = 0
         else:
             starts = []
-            for p in node.preds:
-                if p not in nodes:
-                    raise ValueError(f"Unknown predecessor '{p}' for task '{name}'.")
-                pred = nodes[p]
+            for (pname, lag) in node.preds:
+                if pname not in nodes:
+                    raise ValueError(f"Unknown predecessor '{pname}' for task '{name}'.")
+                pred = nodes[pname]
+                eff_lag = lag
+                # Treat fast-track overlap as extra negative lag for FS if Overlap_OK
                 overlap_allow = bool(df.loc[df["Task"] == name, "Overlap_OK"].iloc[0]) if "Overlap_OK" in df.columns else False
-                if overlap_allow and overlap_frac > 0:
-                    starts.append(max(0, pred.ef - int(round(overlap_frac * pred.dur))))
-                else:
-                    starts.append(pred.ef)
+                if overlap_allow and overlap_frac > 0 and lag == 0:
+                    eff_lag -= int(round(overlap_frac * pred.dur))
+                starts.append(pred.ef + eff_lag)
             node.es = max(starts)
         node.ef = node.es + node.dur
 
     project_duration = max((n.ef for n in nodes.values()), default=0)
 
-    # Successors map
-    succs: Dict[str, List[str]] = {k: [] for k in nodes}
-    for t, n in nodes.items():
-        for p in n.preds:
-            if p in succs:
-                succs[p].append(t)
+    # Successors map (carry lag per edge)
+    succs: Dict[str, List[Tuple[str, int]]] = {k: [] for k in nodes}
+    for succ, n in nodes.items():
+        for (pname, lag) in n.preds:
+            if pname in succs:
+                succs[pname].append((succ, lag))
 
-    # Backward pass
+    # Backward pass (FS with lag): LF_pred <= LS_succ - lag
     for name in reversed(order):
         node = nodes[name]
-        succ_ls = [nodes[s].ls for s in succs[name]]
-        node.lf = min(succ_ls) if succ_ls else project_duration
+        if succs[name]:
+            lf_cands = [nodes[s].ls - lag for (s, lag) in succs[name]]
+            node.lf = min(lf_cands)
+        else:
+            node.lf = project_duration
         node.ls = node.lf - node.dur
         node.tf = node.ls - node.es  # total float (aka slack)
 
-    # Floats
+    # Floats (Free, Independent, Interfering) with FS + lag
     rows = []
     for name in order:
         n = nodes[name]
-        succ_es_min = min([nodes[s].es for s in succs[name]], default=project_duration)
-        free_raw = succ_es_min - n.ef
+        # Free Float (raw): min over successors of [ES_succ - lag] - EF_this
+        if succs[name]:
+            succ_es_lag = min(nodes[s].es - lag for (s, lag) in succs[name])
+        else:
+            succ_es_lag = project_duration
+        free_raw = succ_es_lag - n.ef
         free_float = max(0, free_raw) if clamp_free_float else free_raw
-        max_pred_ef = max([nodes[p].ef for p in n.preds], default=0)
-        indep = max(0, succ_es_min - max_pred_ef - n.dur)  # conventional definition clamps at 0
+
+        # Independent Float (clamped ≥0 by definition): min_succ(ES_succ - lag) - max_pred(EF_pred) - Dur
+        max_pred_ef = max([nodes[p].ef for (p, _) in n.preds], default=0)
+        indep = max(0, succ_es_lag - max_pred_ef - n.dur)
+
         interfering = n.tf - free_float
+
         rows.append({
             "Task": n.task,
             "Duration": n.dur,
@@ -245,6 +281,7 @@ def cpm_schedule(df: pd.DataFrame, overlap_frac: float = 0.0, clamp_free_float: 
 
     out = pd.DataFrame(rows).sort_values("ES", kind="stable")
     return out, project_duration
+
 
 # -------------------- Crashing -------------------- #
 
@@ -411,6 +448,7 @@ B - Foundations,10,"A - Site Prep",1600,2600,7,TRUE
         "Required: Task, Duration, Predecessors, Normal_Cost_per_day, Crash_Cost_per_day · "
         "Optional: Min_Duration, Overlap_OK. Aliases like Duration_days, Crash_Cost_USD, "
         "Crash_Duration_days are accepted."
+        "Add FS lag inline in Predecessors, e.g., 'A+3' or 'B-1'. Multiple predecessors: 'A+2, B'."
     )
 
 base_df = pd.DataFrame({
