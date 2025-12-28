@@ -1,13 +1,24 @@
-streamlit>=1.30
-pandas>=2.0.0
-altair>=5.0.0
-rapidfuzz>=3.6.1
-pypdf>=4.0.0
-python-docx>=1.0.0
-sentence-transformers>=2.2.2
-scikit-learn>=1.4.0
-gspread>=6.0.0
-google-auth>=2.20.0
-google-auth-oauthlib>=1.1.0
-msal>=1.28.0
-requests>=2.32.0
+# core
+streamlit==1.39.0
+pandas==2.2.3
+numpy==1.26.4
+altair==5.3.0
+requests==2.32.3
+
+# submittal checker (text parsing & similarity)
+rapidfuzz==3.9.7
+pypdf==5.0.1
+python-docx==1.1.2
+
+# optional semantic similarity (used if installed)
+sentence-transformers==3.2.1
+scikit-learn==1.5.2
+torch>=2.2.0; platform_system!="Darwin" or platform_machine!="arm64"
+# (Apple Silicon users can skip torch or install a local build)
+
+# google sheets backends
+gspread==6.1.4
+google-auth==2.36.0
+google-auth-oauthlib==1.2.1
+
+# microsoft graph minimal (used by requests + manual calls)
