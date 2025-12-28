@@ -21,6 +21,90 @@ import streamlit as st
 import altair as alt
 import requests
 
+# ==== Robust PDF/OCR/Table extraction helpers (add after imports) ====
+import hashlib
+
+def _hash_list(xs: list[str]) -> str:
+    h = hashlib.sha256()
+    for s in xs:
+        h.update((s or "").encode("utf-8"))
+    return h.hexdigest()
+
+def _try_import(modname):
+    try:
+        return __import__(modname)
+    except Exception:
+        return None
+
+_pytesseract = _try_import("pytesseract")
+_pdf2image  = _try_import("pdf2image")
+_PIL        = _try_import("PIL")
+_tabula     = _try_import("tabula")  # tabula-py
+
+def ocr_pdf_to_text(uploaded_file) -> str:
+    """Fallback: rasterize pages and OCR."""
+    if not (_pytesseract and _pdf2image and _PIL):
+        return ""
+    try:
+        # pdf2image convert_from_bytes
+        pages = _pdf2image.convert_from_bytes(uploaded_file.getvalue(), dpi=200)
+        texts = []
+        for im in pages:
+            texts.append(_pytesseract.image_to_string(im))
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+def tabula_tables_to_text(uploaded_file) -> str:
+    """Extract tables via tabula and linearize as text."""
+    if not _tabula:
+        return ""
+    try:
+        dfs = _tabula.read_pdf(uploaded_file, pages="all", multiple_tables=True, lattice=True)
+        parts = []
+        for df in dfs:
+            parts.append("\n".join([" ".join(map(str, row)) for row in df.fillna("").values.tolist()]))
+        return "\n\n".join(parts)
+    except Exception:
+        return ""
+
+@st.cache_resource
+def get_embedder():
+    try:
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False)
+def cached_embeddings(chunks: list[str]):
+    model = get_embedder()
+    if not model:
+        return None
+    # normalize embeddings so cosine is a dot product
+    emb = model.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
+    return emb
+
+def bm25_scores(query: str, docs: list[str]) -> list[float]:
+    try:
+        from rank_bm25 import BM25Okapi
+    except Exception:
+        return [0.0]*len(docs)
+    # simple tokenization
+    def tok(s): return re.findall(r"[a-z0-9]+", s.lower())
+    corpus = [tok(d) for d in docs]
+    bm = BM25Okapi(corpus)
+    q = tok(query)
+    scores = bm.get_scores(q)
+    if not scores.size:
+        return [0.0]*len(docs)
+    # min-max normalize to [0,1]
+    mn, mx = float(scores.min()), float(scores.max())
+    if mx <= mn:
+        return [0.0]*len(docs)
+    return [(float(s)-mn)/(mx-mn) for s in scores]
+
+
 # =========================
 # App bootstrap
 # =========================
@@ -99,6 +183,11 @@ class StorageBackend:
     def delete_submittal(self, id_: int) -> None: ...
     def open_url_hint(self, rec: dict) -> str | None: ...
 
+    # NEW
+    def save_feedback(self, row: dict) -> None: ...
+    def list_feedback(self, limit: int = 50) -> pd.DataFrame: ...
+
+
 # ---- SQLite Backend
 class SQLiteBackend(StorageBackend):
     def __init__(self, db_path: str):
@@ -121,6 +210,17 @@ class SQLiteBackend(StorageBackend):
             pass_count INT, review_count INT, pass_rate REAL,
             result_csv BLOB, spec_excerpt TEXT, submittal_excerpt TEXT,
             created_at TEXT NOT NULL
+        )""")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            user_id TEXT,
+            page TEXT,
+            rating INT,
+            categories TEXT,
+            email TEXT,
+            message TEXT
         )""")
         con.commit()
         self.con = con
@@ -178,6 +278,28 @@ class SQLiteBackend(StorageBackend):
         self.con.execute("DELETE FROM submittals WHERE id=?", (id_,))
         self.con.commit()
 
+    def save_feedback(self, row: dict) -> None:
+        self.con.execute(
+            "INSERT INTO feedback(created_at,user_id,page,rating,categories,email,message) VALUES(?,?,?,?,?,?,?)",
+            (
+                row.get("created_at"),
+                row.get("user_id"),
+                row.get("page"),
+                int(row.get("rating") or 0),
+                ",".join(row.get("categories") or []),
+                row.get("email"),
+                row.get("message"),
+            ),
+        )
+        self.con.commit()
+
+    def list_feedback(self, limit: int = 50) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT * FROM feedback ORDER BY id DESC LIMIT ?",
+            self.con,
+            params=(int(limit),),
+        )
+
     def open_url_hint(self, rec: dict) -> str | None:
         return None
 
@@ -232,6 +354,8 @@ class GoogleSheetsSA(StorageBackend):
             "pass_count","review_count","pass_rate",
             "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"
         ])
+        self._ensure_ws("feedback", ["created_at","user_id","page","rating","categories","email","message"])
+
 
     def load_presets(self) -> dict:
         rows = self.ss.worksheet("presets").get_all_records()
@@ -326,6 +450,26 @@ class GoogleSheetsSA(StorageBackend):
                         except: pass
                     ws.delete_rows(i); return
             except: continue
+
+    def save_feedback(self, row: dict) -> None:
+        ws = self.ss.worksheet("feedback")
+        ws.append_row([
+            row.get("created_at"),
+            row.get("user_id"),
+            row.get("page"),
+            int(row.get("rating") or 0),
+            ",".join(row.get("categories") or []),
+            row.get("email"),
+            row.get("message"),
+        ], value_input_option="RAW")
+
+    def list_feedback(self, limit: int = 50) -> pd.DataFrame:
+        rows = self.ss.worksheet("feedback").get_all_records()
+        if not rows:
+            return pd.DataFrame(columns=["created_at","user_id","page","rating","categories","email","message"])
+        df = pd.DataFrame(rows)
+        df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
+        return df.sort_values("created_at", ascending=False).head(limit)
 
     def open_url_hint(self, rec: dict) -> str | None:
         try: return self.ss.url
@@ -429,6 +573,7 @@ class GoogleSheetsOAuth(StorageBackend):
             "pass_count","review_count","pass_rate",
             "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"
         ])
+        self._ensure_ws("feedback", ["created_at","user_id","page","rating","categories","email","message"])
 
     def load_presets(self) -> dict:
         rows = self.ss.worksheet("presets").get_all_records()
@@ -514,6 +659,26 @@ class GoogleSheetsOAuth(StorageBackend):
             if r.get("id")==id_:
                 ws.delete_rows(i); return
 
+    def save_feedback(self, row: dict) -> None:
+        ws = self.ss.worksheet("feedback")
+        ws.append_row([
+            row.get("created_at"),
+            row.get("user_id"),
+            row.get("page"),
+            int(row.get("rating") or 0),
+            ",".join(row.get("categories") or []),
+            row.get("email"),
+            row.get("message"),
+        ], value_input_option="RAW")
+
+    def list_feedback(self, limit: int = 50) -> pd.DataFrame:
+        rows = self.ss.worksheet("feedback").get_all_records()
+        if not rows:
+            return pd.DataFrame(columns=["created_at","user_id","page","rating","categories","email","message"])
+        df = pd.DataFrame(rows)
+        df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
+        return df.sort_values("created_at", ascending=False).head(limit)
+
     def open_url_hint(self, rec): 
         try: return self.ss.url
         except: return None
@@ -596,6 +761,9 @@ class MSExcelOAuth(StorageBackend):
         if name not in names:
             _ = requests.post(url_ws + "/add", headers=self._hed(), data=json.dumps({"name": name})).json()
             self._update_range(name, "A1", [headers])
+        # ensure feedback sheet exists for feedback operations
+        if name != "feedback":
+            self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"])
 
     def _update_range(self, ws_name: str, start_cell: str, values_2d: list[list]):
         url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws_name)}/range(address='{start_cell}')"
@@ -607,6 +775,29 @@ class MSExcelOAuth(StorageBackend):
         row_count = r.get("rowCount", 0) or 0
         start_cell = f"A{row_count+1}" if row_count>0 else "A1"
         self._update_range(ws_name, start_cell, values_2d)
+
+    def save_feedback(self, row: dict) -> None:
+        self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"])
+        self._append_rows("feedback", [[
+            row.get("created_at"),
+            row.get("user_id"),
+            row.get("page"),
+            int(row.get("rating") or 0),
+            ",".join(row.get("categories") or []),
+            row.get("email"),
+            row.get("message"),
+        ]])
+
+    def list_feedback(self, limit: int = 50) -> pd.DataFrame:
+        self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"])
+        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote('feedback')}/usedRange(valuesOnly=true)"
+        r = requests.get(url, headers=self._hed()).json()
+        vals = r.get("values", [])
+        if len(vals) <= 1:
+            return pd.DataFrame(columns=["created_at","user_id","page","rating","categories","email","message"])
+        df = pd.DataFrame(vals[1:], columns=vals[0])
+        df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
+        return df.sort_values("created_at", ascending=False).head(limit)
 
     # Presets
     def load_presets(self) -> dict:
@@ -718,6 +909,138 @@ def db_get_submittal(b: StorageBackend, id_: int) -> dict: return b.get_submitta
 def db_delete_submittal(b: StorageBackend, id_: int): return b.delete_submittal(id_)
 def db_open_url_hint(b: StorageBackend, rec: dict) -> str | None: return b.open_url_hint(rec)
 
+# -------------------------
+# Tiny settings helper (piggyback on presets table)
+# -------------------------
+_APP_SETTINGS_KEY = "__app_settings__"
+
+def settings_load(backend: StorageBackend) -> dict:
+    try:
+        presets = db_load_presets(backend)
+        return presets.get(_APP_SETTINGS_KEY, {})
+    except Exception:
+        return {}
+
+def settings_save(backend: StorageBackend, s: dict) -> None:
+    try:
+        db_save_preset(backend, _APP_SETTINGS_KEY, s)
+    except Exception as e:
+        st.warning(f"Could not persist settings: {e}")
+
+# -------------------------
+# Email senders: SendGrid (preferred) or SMTP
+# Configure one of:
+#   st.secrets["sendgrid"]["api_key"]
+#   st.secrets["smtp"] = {"host": "...", "port": 587, "user": "...", "password": "...", "from": "App <app@domain>"}
+# -------------------------
+def send_email(recipients: list[str], subject: str, html_body: str, attachments: list[tuple[str, bytes]] | None = None) -> tuple[bool,str]:
+    # Try SendGrid
+    sg = st.secrets.get("sendgrid")
+    if sg and sg.get("api_key"):
+        try:
+            import base64, requests
+            data = {
+                "personalizations": [{"to": [{"email": r} for r in recipients]}],
+                "from": {"email": sg.get("from_email", "no-reply@example.com"), "name": sg.get("from_name", "Civil Mini-Apps")},
+                "subject": subject,
+                "content": [{"type": "text/html", "value": html_body}],
+            }
+            if attachments:
+                data["attachments"] = [
+                    {"content": base64.b64encode(b).decode("ascii"), "type": "text/csv", "filename": fn}
+                    for (fn, b) in attachments
+                ]
+            r = requests.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={"Authorization": f"Bearer {sg['api_key']}", "Content-Type": "application/json"},
+                data=json.dumps(data),
+                timeout=20,
+            )
+            if r.status_code in (200, 202):
+                return True, "sent via SendGrid"
+            return False, f"SendGrid HTTP {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            return False, f"SendGrid error: {e}"
+
+    # Fallback SMTP
+    smtp = st.secrets.get("smtp")
+    if smtp:
+        try:
+            import smtplib
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.text import MIMEText
+            from email.mime.base import MIMEBase
+            from email import encoders
+
+            msg = MIMEMultipart()
+            msg["From"] = smtp.get("from", smtp.get("user", "no-reply@example.com"))
+            msg["To"] = ", ".join(recipients)
+            msg["Subject"] = subject
+            msg.attach(MIMEText(html_body, "html"))
+
+            for (filename, bytes_) in attachments or []:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(bytes_)
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+                msg.attach(part)
+
+            server = smtplib.SMTP(smtp["host"], int(smtp.get("port", 587)))
+            server.starttls()
+            server.login(smtp["user"], smtp["password"])
+            server.sendmail(smtp.get("from", smtp["user"]), recipients, msg.as_string())
+            server.quit()
+            return True, "sent via SMTP"
+        except Exception as e:
+            return False, f"SMTP error: {e}"
+
+    return False, "No email provider configured (set sendgrid.api_key or smtp.* in st.secrets)"
+
+# -------------------------
+# Feedback digest (pull, filter, summarize)
+# -------------------------
+def make_feedback_digest_df(backend: StorageBackend, period: str = "last_30_days") -> pd.DataFrame:
+    # Grab a lot, then filter locally (keeps backend API simple)
+    df = backend.list_feedback(limit=10000) if hasattr(backend, "list_feedback") else pd.DataFrame()
+    if df.empty:
+        return df
+    # Normalize
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    else:
+        df["created_at"] = pd.Timestamp.utcnow()
+
+    now = pd.Timestamp.utcnow()
+    if period == "this_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif period == "last_month":
+        start = (now.replace(day=1) - pd.offsets.MonthBegin(1))
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return df[(df["created_at"] >= start) & (df["created_at"] < end)].copy()
+    else:  # last_30_days
+        start = now - pd.Timedelta(days=30)
+    return df[df["created_at"] >= start].copy()
+
+def summarize_feedback(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {"count": 0, "avg_rating": None, "by_page": {}, "top_words": []}
+    count = len(df)
+    avg = float(pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).mean())
+    by_page = df.groupby("page")["rating"].mean().round(2).to_dict()
+
+    # naive “top words” from message
+    all_text = " ".join(df.get("message", "").astype(str).tolist()).lower()
+    tokens = re.findall(r"[a-z]{3,}", all_text)
+    stop = set("the and for with this that you your are was were have has but not into from out too very more some much they them can like just get make".split())
+    freq = {}
+    for t in tokens:
+        if t in stop: continue
+        freq[t] = freq.get(t, 0) + 1
+    top_words = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:15]
+    return {"count": count, "avg_rating": avg, "by_page": by_page, "top_words": top_words}
+
+
 # =========================
 # Sidebar: storage + auth
 # =========================
@@ -774,6 +1097,144 @@ except Exception as e:
     st.sidebar.error(f"Backend error: {e}")
     backend = get_backend(BACKEND_SQLITE)
 
+
+# =========================
+# Sidebar: About + Feedback
+# =========================
+
+def _current_user_label() -> str:
+    if "__google_user__" in st.session_state:
+        return st.session_state["__google_user__"]
+    if "__ms_user__" in st.session_state:
+        return st.session_state["__ms_user__"]
+    return "anonymous"
+
+with st.sidebar.expander("About", expanded=False):
+    st.markdown(
+        """
+**Civil Mini-Apps** helps speed up common civil/CM workflows:
+
+- **Submittal Checker** — hybrid scoring of submittals vs. specs (lexical + semantic + reviewer keyword coverage), with a memory bank for runs.
+- **Schedule What-Ifs** — CPM with FS/SS/FF lags, optional fast-track overlap, floats breakdown, calendar mode, crash-to-target.
+
+Built by a civil engineering student for practical use in the field.
+"""
+    )
+    st.markdown("Made by Emiliano A. Aguiar — [LinkedIn](https://www.linkedin.com/in/emiliano-aguiar)")
+
+with st.sidebar.expander("Leave feedback", expanded=False):
+    _cur_page = st.session_state.get("__page__", "Submittal Checker")
+    fb_page = st.selectbox("Which page?", ["Submittal Checker", "Schedule What-Ifs"], index=(0 if _cur_page=="Submittal Checker" else 1))
+    fb_rating = st.slider("Overall rating", 1, 5, 5, help="5 = great; 1 = needs work")
+    fb_cats = st.multiselect(
+        "What applies?",
+        ["UI/UX", "Speed", "Accuracy", "Docs/Help", "Integrations", "Other"]
+    )
+    fb_msg = st.text_area("Share details (what you liked, what to improve)", height=120)
+    fb_email = st.text_input("Your email (optional)")
+    if st.button("Send feedback"):
+        if not fb_msg.strip():
+            st.warning("Please add a short note so I know what to improve.")
+        else:
+            try:
+                backend.save_feedback({
+                    "created_at": datetime.utcnow().isoformat(),
+                    "user_id": _current_user_label(),
+                    "page": fb_page,
+                    "rating": fb_rating,
+                    "categories": fb_cats,
+                    "email": fb_email.strip() or None,
+                    "message": fb_msg.strip(),
+                })
+                st.success("Thanks! Your feedback was saved.")
+            except Exception as e:
+                st.error(f"Could not save feedback: {e}")
+
+# (Optional) quick glance for you — last 5 feedback items
+with st.sidebar.expander("Recent feedback (owner view)", expanded=False):
+    try:
+        _fb = backend.list_feedback(limit=5)
+        if _fb.empty:
+            st.caption("No feedback yet.")
+        else:
+            st.dataframe(_fb[["created_at","user_id","page","rating","message"]], use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.caption(f"(Feedback listing unavailable: {e})")
+
+# =========================
+# Sidebar: Notifications & Digest
+# =========================
+with st.sidebar.expander("Notifications & Monthly Digest", expanded=False):
+    s = settings_load(backend)
+    default_emails = s.get("notify_emails", "")
+    notify_emails = st.text_input("Notification recipients (comma-separated emails)", value=default_emails)
+    default_period = s.get("digest_period", "last_30_days")
+    digest_period = st.selectbox("Digest period", ["last_30_days", "this_month", "last_month"], index=["last_30_days","this_month","last_month"].index(default_period))
+    st.caption("The digest pulls recent feedback from the selected storage backend.")
+
+    c1, c2 = st.columns(2)
+    if c1.button("Save notification settings"):
+        s["notify_emails"] = notify_emails.strip()
+        s["digest_period"] = digest_period
+        settings_save(backend, s)
+        st.success("Notification settings saved.")
+
+    if c2.button("Send test email"):
+        recips = [e.strip() for e in (notify_emails or "").split(",") if e.strip()]
+        if not recips:
+            st.warning("Add at least one recipient first.")
+        else:
+            ok, msg = send_email(recips, "Civil Mini-Apps — test email", "<p>This is a test from your app.</p>")
+            st.success(msg) if ok else st.error(msg)
+
+    st.markdown("---")
+    if st.button("Generate digest now"):
+        df = make_feedback_digest_df(backend, period=digest_period)
+        summary = summarize_feedback(df)
+        if df.empty:
+            st.info("No feedback in the selected period.")
+        else:
+            # CSV for download
+            csv_bytes = df.to_csv(index=False).encode()
+            st.download_button("Download digest CSV", csv_bytes, file_name=f"feedback_digest_{digest_period}.csv", mime="text/csv")
+
+            # Push to workspace tabs if available
+            pushed = False
+            try:
+                if hasattr(backend, "_ensure_ws"):  # Google Sheets backends
+                    title = f"digest_{pd.Timestamp.utcnow():%Y_%m_%d_%H%M}"
+                    wsname = "feedback_" + title
+                    backend._ensure_ws(wsname, list(df.columns))
+                    # Write header + body
+                    values = [list(df.columns)] + df.astype(object).where(pd.notna(df), "").values.tolist()
+                    backend.ss.worksheet(wsname).update("A1", values)
+                    st.success(f"Pushed digest to Google Sheet tab '{wsname}'.")
+                    pushed = True
+                elif isinstance(backend, MSExcelOAuth):
+                    wsname = f"feedback_{pd.Timestamp.utcnow():%Y_%m_%d_%H%M}"
+                    backend._ensure_worksheet(wsname, list(df.columns))
+                    values = [list(df.columns)] + df.astype(object).where(pd.notna(df), "").values.tolist()
+                    backend._update_range(wsname, "A1", values)
+                    st.success(f"Pushed digest to Excel workbook tab '{wsname}'.")
+                    pushed = True
+            except Exception as e:
+                st.warning(f"Could not push to workspace: {e}")
+
+            # Email digest
+            recips = [e.strip() for e in (notify_emails or "").split(",") if e.strip()]
+            if recips:
+                html = f"""
+                <h3>Civil Mini-Apps — Feedback Digest ({digest_period.replace('_',' ')})</h3>
+                <p><b>Count:</b> {summary['count']} &nbsp; <b>Avg rating:</b> {summary['avg_rating'] if summary['avg_rating'] is not None else '—'}</p>
+                <p><b>By page:</b> {summary['by_page']}</p>
+                <p><b>Top words:</b> {', '.join([w for w,_ in summary['top_words']])}</p>
+                <p>This message was generated by your app. Attachments: CSV digest.</p>
+                """
+                ok, msg = send_email(recips, "Civil Mini-Apps — feedback digest", html_body=html, attachments=[(f"feedback_digest_{digest_period}.csv", csv_bytes)])
+                st.success(f"Emailed digest: {msg}") if ok else st.error(msg)
+            else:
+                st.info("Add recipients to email the digest.")
+
 # =========================
 # Submittal Checker (page)
 # =========================
@@ -822,8 +1283,18 @@ def submittal_checker_page():
 
     def read_any(uploaded) -> str:
         name = (getattr(uploaded, "name","") or "").lower()
-        data = io.BytesIO(uploaded.read())
-        if name.endswith(".pdf"):  return _read_pdf(data)
+        raw_bytes = uploaded.read()
+        data = io.BytesIO(raw_bytes)
+
+        # primary text extraction
+        if name.endswith(".pdf"):
+            base = _read_pdf(data)
+            # OCR fallback
+            if use_ocr and (not base or len(base.strip()) < 40):
+                base = ocr_pdf_to_text(io.BytesIO(raw_bytes)) or base
+            # tables
+            tabtxt = tabula_tables_to_text(io.BytesIO(raw_bytes)) if use_table else ""
+            return (base + "\n\n" + tabtxt).strip()
         if name.endswith(".docx"): return _read_docx(data)
         if name.endswith(".txt"):  return _read_txt(data)
         if name.endswith(".csv"):  return _read_csv(data)
@@ -956,6 +1427,17 @@ def submittal_checker_page():
     threshold = st.slider("Hybrid PASS threshold", 0, 100,
                           st.session_state.get("hybrid_threshold", 85),
                           help="Final decision threshold on the 0–100 hybrid score.")
+    st.markdown("---")
+    t1, t2, t3, t4 = st.columns(4)
+    use_ocr   = t1.checkbox("OCR if PDF text is empty", value=True,
+                            help="Try Tesseract when PDFs are scans.")
+    use_table = t2.checkbox("Extract tables", value=True,
+                            help="Use tabula to read embedded tables and index them.")
+    use_bm25  = t3.checkbox("BM25 boost", value=True,
+                            help="Lexical retriever for long clauses.")
+    use_sem   = t4.checkbox("Semantic embeddings", value=True,
+                            help="Use sentence-transformer embeddings if available")
+
     run_btn = st.button("Analyze", type="primary")
 
     if run_btn:
@@ -1123,7 +1605,7 @@ def submittal_checker_page():
                 view = bank.copy()
                 if f_company!="All": view = view[view["company"]==f_company]
                 if f_project!="All": view = view[view["project"]==f_project]
-                if f_client!="All":  view = view[view["client"]==f_client]
+                if f_client!="All":  view = view[view]["client"]==f_client
                 if sort_by.startswith("pass_rate"): view = view.sort_values("pass_rate", ascending=False)
                 elif sort_by.startswith("date_submitted"): view = view.sort_values("date_submitted", ascending=False)
                 else: view = view.sort_values("created_at", ascending=False)
@@ -1528,6 +2010,7 @@ def schedule_whatifs_page():
 # App Navigation
 # =========================
 page = st.sidebar.radio("Pages", ["Submittal Checker", "Schedule What-Ifs"], index=0)
+st.session_state["__page__"] = page
 if page == "Submittal Checker":
     submittal_checker_page()
 else:
@@ -1552,10 +2035,10 @@ else:
 # client_email="svc@proj.iam.gserviceaccount.com"
 # token_uri="https://oauth2.googleapis.com/token"
 # [microsoft_oauth]
-# client_id="YOUR_APP_ID"
-# client_secret="YOUR_APP_SECRET"
-# tenant_id="common"
-# redirect_uri="http://localhost:8501"
+# client_id = "YOUR_APP_ID"
+# client_secret = "YOUR_APP_SECRET"
+# tenant_id = "common"
+# redirect_uri = "http://localhost:8501"
 #
 # 2) pip install -r requirements.txt
 # 3) streamlit run app.py
