@@ -1,12 +1,14 @@
-# Streamlit Civil Engineering Mini‑Apps (Uploads + CUI Guardrails)
+# Civil Mini-Apps: Submittal Checker + Schedule What-Ifs
 
+Fast, practical tools for civil/CM workflows:
+- **Submittal Checker**: compares a submittal to specs using a **hybrid score** (lexical + semantic + keyword coverage + penalties + section boost). Reviewer “must/nice/forbidden” lists, presets, and a **Memory Bank** to track runs (company, project, pass rate, quotes).
+- **Schedule What-Ifs**: CPM with **FS/SS/FF lags**, optional **fast-track overlap**, full float breakdown (Total/Free/Independent/Interfering), **calendar mapping** (workweek + holidays), and a simple **crash-to-target** optimizer.
 
-Two tiny tools that run anywhere:
-- **Submittal Checker** — Paste a spec section and a submittal or upload PDF/DOCX/CSV. The app flags likely missing items with simple fuzzy matching.
-- **Schedule What‑Ifs** — Enter tasks/dependencies (or upload CSV); compute critical path; try fast‑track (overlap) and crash plans with rough cost impacts.
+## Quick start
 
+```bash
+git clone https://github.com/yourname/civil-miniapps.git
+cd civil-miniapps
+cp .streamlit/secrets.example.toml .streamlit/secrets.toml   # edit with your values
+./scripts/run_local.sh
 
-## Local Run
-bash
-python -m pip install -r requirements.txt
-streamlit run app.py
