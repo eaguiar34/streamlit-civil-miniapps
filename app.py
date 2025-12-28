@@ -51,6 +51,71 @@ BACKEND_GS_OAUTH = "Google Sheets (OAuth)"
 BACKEND_MS_OAUTH = "Microsoft 365 Excel (OAuth)"
 BACKEND_CHOICES = [BACKEND_SQLITE, BACKEND_GS_SERVICE, BACKEND_GS_OAUTH, BACKEND_MS_OAUTH]
 
+# ------------------- Backend sanity helpers (no-crash) -------------------
+
+def _has_secret(key: str) -> bool:
+    try:
+        _ = st.secrets[key]
+        return True
+    except Exception:
+        return False
+
+def google_oauth_configured() -> bool:
+    try:
+        cfg = st.secrets["google_oauth"]
+        return all(k in cfg for k in ("client_id", "client_secret", "redirect_uri"))
+    except Exception:
+        return False
+
+def ms_oauth_configured() -> bool:
+    try:
+        cfg = st.secrets["microsoft_oauth"]
+        return all(k in cfg for k in ("client_id", "client_secret", "redirect_uri", "tenant"))
+    except Exception:
+        return False
+
+def gcp_sa_configured() -> bool:
+    return _has_secret("gcp_service_account")
+
+def _missing_secret_msg(name: str, hint: str) -> str:
+    return (
+        f"`st.secrets` has no key `{name}`.\n\n"
+        f"Add it in **Settings → Secrets** (Streamlit Cloud) or a local `secrets.toml`.\n{hint}"
+    )
+
+def get_backend_safe(choice: str):
+    """Return (backend_instance, active_choice). Falls back to Local on misconfig."""
+    ready, warn = True, None
+    if choice == BACKEND_GS_SERVICE and not gcp_sa_configured():
+        ready = False
+        warn = _missing_secret_msg(
+            "gcp_service_account",
+            "Expected a Google Service Account JSON. Docs: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management"
+        )
+    elif choice == BACKEND_GS_OAUTH and not google_oauth_configured():
+        ready = False
+        warn = _missing_secret_msg("google_oauth", "Expected keys: client_id, client_secret, redirect_uri.")
+    elif choice == BACKEND_MS_OAUTH and not ms_oauth_configured():
+        ready = False
+        warn = _missing_secret_msg("microsoft_oauth", "Expected keys: client_id, client_secret, redirect_uri, tenant.")
+
+    if ready:
+        try:
+            b = get_backend(choice)
+            st.session_state["__backend_choice__"] = choice
+            return b, choice
+        except Exception as e:
+            warn = f"{choice} failed to init: {e}"
+
+    # Fallback to local
+    with st.sidebar:
+        if warn: st.error(warn)
+        st.info("Using **Local (SQLite)** this session.")
+    b = get_backend(BACKEND_SQLITE)
+    st.session_state["__backend_choice__"] = BACKEND_SQLITE
+    return b, BACKEND_SQLITE
+
+
 def _ensure_ss(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -707,42 +772,63 @@ backend_choice = st.sidebar.selectbox(
     "Save presets & memory bank to",
     BACKEND_CHOICES,
     index=BACKEND_CHOICES.index(_ensure_ss("__backend_choice__", BACKEND_SQLITE)),
+    help=(
+        "• Local (SQLite): stores on the app server.\n"
+        "• Google Sheets (Service Account): server-managed SA; share a Sheet with the SA email.\n"
+        "• Google Sheets (OAuth): each user signs in; their Drive is used.\n"
+        "• Microsoft 365 Excel (OAuth): each user signs in; OneDrive Excel file is used."
+    ),
 )
-st.session_state["__backend_choice__"] = backend_choice
+backend, active_backend = get_backend_safe(backend_choice)
 
 def _badge(ok): return "🟢 signed in" if ok else "⚪ not signed in"
 
-if backend_choice == BACKEND_GS_OAUTH:
-    st.sidebar.write("Google: " + _badge("__google_user__" in st.session_state))
-    if st.sidebar.button("Sign in with Google"):
-        st.session_state["__do_google_oauth__"] = True
-        st.rerun()
-    if st.sidebar.button("Sign out Google"):
-        for k in ["__google_token__","__google_user__","__google_flow__","__google_state__"]:
-            st.session_state.pop(k, None)
-        st.success("Signed out of Google.")
+with st.sidebar:
+    if active_backend == BACKEND_GS_OAUTH:
+        st.write("Google: " + _badge("__google_user__" in st.session_state))
+        st.button(
+            "Sign in with Google",
+            on_click=lambda: st.session_state.__setitem__("__do_google_oauth__", True),
+            disabled=not google_oauth_configured(),
+            help=None if google_oauth_configured() else "Add google_oauth secrets to enable."
+        )
+        if st.button("Sign out Google"):
+            for k in ["__google_token__","__google_user__","__google_flow__","__google_state__"]:
+                st.session_state.pop(k, None)
+            st.success("Signed out of Google.")
+    elif active_backend == BACKEND_MS_OAUTH:
+        st.write("Microsoft: " + _badge("__ms_user__" in st.session_state))
+        st.button(
+            "Sign in with Microsoft",
+            on_click=lambda: st.session_state.__setitem__("__do_ms_oauth__", True),
+            disabled=not ms_oauth_configured(),
+            help=None if ms_oauth_configured() else "Add microsoft_oauth secrets to enable."
+        )
+        if st.button("Sign out Microsoft"):
+            for k in ["__ms_token__","__ms_user__","__ms_state__"]:
+                st.session_state.pop(k, None)
+            st.success("Signed out of Microsoft.")
 
-elif backend_choice == BACKEND_MS_OAUTH:
-    st.sidebar.write("Microsoft: " + _badge("__ms_user__" in st.session_state))
-    if st.sidebar.button("Sign in with Microsoft"):
-        st.session_state["__do_ms_oauth__"] = True
-        st.rerun()
-    if st.sidebar.button("Sign out Microsoft"):
-        for k in ["__ms_token__","__ms_user__","__ms_state__"]:
-            st.session_state.pop(k, None)
-        st.success("Signed out of Microsoft.")
 
-# Handle OAuth start/callback
+# Handle OAuth start/callback safely (no exceptions if secrets missing)
 if st.session_state.get("__do_google_oauth__"):
     st.session_state.pop("__do_google_oauth__", None)
-    google_oauth_start()
+    if google_oauth_configured():
+        google_oauth_start()
+    else:
+        st.sidebar.error("Google OAuth not configured (missing secrets).")
 elif st.session_state.get("__do_ms_oauth__"):
     st.session_state.pop("__do_ms_oauth__", None)
-    ms_oauth_start()
+    if ms_oauth_configured():
+        ms_oauth_start()
+    else:
+        st.sidebar.error("Microsoft OAuth not configured (missing secrets).")
 else:
     if "code" in st.query_params and "state" in st.query_params:
+        # try both; only one will succeed
         google_oauth_callback()
         ms_oauth_callback()
+
 
 # Instantiate backend
 try:
@@ -1482,17 +1568,40 @@ def schedule_whatifs_page():
 
             # Simple crash loop (greedy, cost slope)
             def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
-                crit = schedule[schedule["Critical"]]
-                if crit.empty: return None
-                merged = crit.merge(
-                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
-                    on="Task", how="left", suffixes=("_sched","_cfg")
-                )
-                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
-                can = merged[merged["Duration"] > merged["Min_Duration"]]
-                if can.empty: return None
-                can = can.sort_values(["slope","ES"], kind="stable")
-                return str(can.iloc[0]["Task"])
+    crit = schedule[schedule["Critical"]]
+    if crit.empty:
+        return None
+
+    merged = crit.merge(
+        df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
+        on="Task", how="left", suffixes=("_sched","_cfg")
+    )
+
+    # columns present after merge:
+    #  - Duration_sched (from schedule)
+    #  - Duration_cfg (from df_cfg)
+    #  - Min_Duration (if only in df_cfg; else Min_Duration_cfg)
+    #  - Normal_Cost_per_day (only in df_cfg)
+    #  - Crash_Cost_per_day (only in df_cfg)
+
+    dur_col = "Duration_cfg" if "Duration_cfg" in merged.columns else "Duration"
+    min_col = "Min_Duration_cfg" if "Min_Duration_cfg" in merged.columns else "Min_Duration"
+
+    merged["slope"] = (
+        pd.to_numeric(merged["Crash_Cost_per_day"], errors="coerce") -
+        pd.to_numeric(merged["Normal_Cost_per_day"], errors="coerce")
+    ).astype(float)
+
+    can = merged[
+        pd.to_numeric(merged[dur_col], errors="coerce") >
+        pd.to_numeric(merged[min_col], errors="coerce")
+    ]
+    if can.empty:
+        return None
+
+    can = can.sort_values(["slope","ES"], kind="stable")
+    return str(can.iloc[0]["Task"])
+
 
             def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
                 new = df_cfg.copy()
