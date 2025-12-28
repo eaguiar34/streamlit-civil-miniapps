@@ -1,7 +1,16 @@
-# from __future__ import annotations  # (Optional on Py3.11+, safe to keep)
+# app.py
+# Civil Mini-Apps: Submittal Checker + Schedule What-Ifs
+# - Sidebar pages
+# - Hybrid submittal scoring (lexical + semantic + coverage + penalties + section boost)
+# - Reviewer keyword presets + memory bank
+# - Storage backends: SQLite (local), Google Sheets (Service/OAuth), Microsoft Excel (OAuth)
+# - Schedule What-Ifs: CPM with FS/SS/FF lags, overlap, floats, calendar mode, crash-to-target
+# - Width shims + auto-heights; safe secrets loader; OAuth helpers
+# - Make sure you set secrets (see README snippet at end of this file)
+
 from __future__ import annotations
 
-import os, io, re, json, time, base64, urllib.parse, sqlite3
+import os, io, re, json, time, urllib.parse, sqlite3
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, date
@@ -10,13 +19,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+import requests
 
 # =========================
-# UI / Streamlit helpers
+# App bootstrap
 # =========================
-
 st.set_page_config(page_title="Civil Mini-Apps", layout="wide")
 
+# ---------- Width shims (handles Streamlit deprecations gracefully)
 def df_fullwidth(df, **kwargs):
     try:
         return st.dataframe(df, use_container_width=True, **kwargs)
@@ -41,80 +51,38 @@ def rows_to_height(n_rows: int, row_px: int=_DEF_ROW, header_px: int=_DEF_HEADER
     n = max(1, int(n_rows))
     return min(max_height, header_px + row_px * n)
 
+# ---------- Secrets loader (works with st.secrets or env vars)
+def get_secret(path: str, default=None):
+    # Streamlit secrets
+    try:
+        node = st.secrets
+        for key in path.split("."):
+            if key in node:
+                node = node[key]
+            else:
+                node = None; break
+        if node is not None:
+            return node
+    except Exception:
+        pass
+    # Env fallback (supports JSON or plain)
+    env_key = path.upper().replace(".", "__")
+    val = os.getenv(env_key)
+    if not val:
+        return default
+    try:
+        return json.loads(val)
+    except Exception:
+        return val
+
 # =========================
 # Pluggable Storage Backends
 # =========================
-
 BACKEND_SQLITE = "Local (SQLite)"
 BACKEND_GS_SERVICE = "Google Sheets (Service Account)"
 BACKEND_GS_OAUTH = "Google Sheets (OAuth)"
 BACKEND_MS_OAUTH = "Microsoft 365 Excel (OAuth)"
 BACKEND_CHOICES = [BACKEND_SQLITE, BACKEND_GS_SERVICE, BACKEND_GS_OAUTH, BACKEND_MS_OAUTH]
-
-# ------------------- Backend sanity helpers (no-crash) -------------------
-
-def _has_secret(key: str) -> bool:
-    try:
-        _ = st.secrets[key]
-        return True
-    except Exception:
-        return False
-
-def google_oauth_configured() -> bool:
-    try:
-        cfg = st.secrets["google_oauth"]
-        return all(k in cfg for k in ("client_id", "client_secret", "redirect_uri"))
-    except Exception:
-        return False
-
-def ms_oauth_configured() -> bool:
-    try:
-        cfg = st.secrets["microsoft_oauth"]
-        return all(k in cfg for k in ("client_id", "client_secret", "redirect_uri", "tenant"))
-    except Exception:
-        return False
-
-def gcp_sa_configured() -> bool:
-    return _has_secret("gcp_service_account")
-
-def _missing_secret_msg(name: str, hint: str) -> str:
-    return (
-        f"`st.secrets` has no key `{name}`.\n\n"
-        f"Add it in **Settings → Secrets** (Streamlit Cloud) or a local `secrets.toml`.\n{hint}"
-    )
-
-def get_backend_safe(choice: str):
-    """Return (backend_instance, active_choice). Falls back to Local on misconfig."""
-    ready, warn = True, None
-    if choice == BACKEND_GS_SERVICE and not gcp_sa_configured():
-        ready = False
-        warn = _missing_secret_msg(
-            "gcp_service_account",
-            "Expected a Google Service Account JSON. Docs: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management"
-        )
-    elif choice == BACKEND_GS_OAUTH and not google_oauth_configured():
-        ready = False
-        warn = _missing_secret_msg("google_oauth", "Expected keys: client_id, client_secret, redirect_uri.")
-    elif choice == BACKEND_MS_OAUTH and not ms_oauth_configured():
-        ready = False
-        warn = _missing_secret_msg("microsoft_oauth", "Expected keys: client_id, client_secret, redirect_uri, tenant.")
-
-    if ready:
-        try:
-            b = get_backend(choice)
-            st.session_state["__backend_choice__"] = choice
-            return b, choice
-        except Exception as e:
-            warn = f"{choice} failed to init: {e}"
-
-    # Fallback to local
-    with st.sidebar:
-        if warn: st.error(warn)
-        st.info("Using **Local (SQLite)** this session.")
-    b = get_backend(BACKEND_SQLITE)
-    st.session_state["__backend_choice__"] = BACKEND_SQLITE
-    return b, BACKEND_SQLITE
-
 
 def _ensure_ss(key, default):
     if key not in st.session_state:
@@ -134,9 +102,8 @@ class StorageBackend:
 # ---- SQLite Backend
 class SQLiteBackend(StorageBackend):
     def __init__(self, db_path: str):
-        self.db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        con = sqlite3.connect(self.db_path, check_same_thread=False)
+        con = sqlite3.connect(db_path, check_same_thread=False)
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("""
         CREATE TABLE IF NOT EXISTS presets (
@@ -221,32 +188,29 @@ class GoogleSheetsSA(StorageBackend):
             import gspread
             from google.oauth2.service_account import Credentials
         except Exception:
-            st.error("Missing Google Sheets deps. Add: gspread, google-auth")
+            st.error("Missing Google Sheets deps. Install: gspread, google-auth")
             raise
         self.gspread = gspread
         self.Credentials = Credentials
         self.title = title
-        self.scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
+        self.scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         self.client = self._client()
         self.ss = self._open_or_create_spreadsheet(self.client)
         self._ensure_tabs()
 
     @st.cache_resource
     def _client(_self=None):
-        creds = _self.Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], scopes=_self.scopes
-        )
+        creds_info = get_secret("gcp_service_account")
+        if not creds_info:
+            raise RuntimeError("No service account in secrets.")
+        creds = _self.Credentials.from_service_account_info(creds_info, scopes=_self.scopes)
         return _self.gspread.authorize(creds)
 
     def _open_or_create_spreadsheet(self, client):
         try:
             return client.open(self.title)
         except self.gspread.SpreadsheetNotFound:
-            ss = client.create(self.title)
-            return ss
+            return client.create(self.title)
 
     def _ensure_ws(self, title, headers):
         try:
@@ -307,8 +271,7 @@ class GoogleSheetsSA(StorageBackend):
     def save_submittal(self, meta: dict, result_csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
         ws = self.ss.worksheet("submittals")
         run_id = self._next_id()
-
-        # Create results tab
+        # results in new tab
         try:
             df = pd.read_csv(pd.io.common.BytesIO(result_csv_bytes))
             tab = self._sanitize_tab(f"run_{run_id}_{meta.get('company','')}_{meta.get('project','')}")
@@ -320,7 +283,6 @@ class GoogleSheetsSA(StorageBackend):
             w.update("A1", values)
         except Exception:
             tab = ""
-
         now = datetime.utcnow().isoformat()
         row = [
             run_id, meta.get("company"), meta.get("client"), meta.get("project"),
@@ -369,11 +331,12 @@ class GoogleSheetsSA(StorageBackend):
         try: return self.ss.url
         except: return None
 
-# ---- Google OAuth Helpers
-import requests
+# ---- Google OAuth helpers + Sheets backend
 def google_oauth_start():
     from google_auth_oauthlib.flow import Flow
-    cfg = st.secrets["google_oauth"]
+    cfg = get_secret("google_oauth", {})
+    if not cfg:
+        st.error("Google OAuth not configured in secrets."); return
     flow = Flow.from_client_config(
         {
             "web": {
@@ -400,7 +363,7 @@ def google_oauth_start():
 
 def google_oauth_callback():
     from google_auth_oauthlib.flow import Flow
-    cfg = st.secrets.get("google_oauth", {})
+    cfg = get_secret("google_oauth", {})
     params = st.query_params
     if "code" not in params or "state" not in params: return False
     if params.get("state") != st.session_state.get("__google_state__"): return False
@@ -411,13 +374,12 @@ def google_oauth_callback():
     creds = flow.credentials
     st.session_state["__google_token__"] = {
         "token": creds.token,
-        "refresh_token": creds.refresh_token,
+        "refresh_token": getattr(creds, "refresh_token", None),
         "token_uri": creds.token_uri,
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": creds.scopes,
     }
-    # whoami
     ui = requests.get("https://www.googleapis.com/oauth2/v3/userinfo",
                       headers={"Authorization": f"Bearer {creds.token}"}).json()
     st.session_state["__google_user__"] = ui.get("email","google-user")
@@ -430,7 +392,6 @@ def google_credentials():
     if not tok: return None
     return Credentials(**tok)
 
-# ---- Google Sheets (OAuth) Backend
 class GoogleSheetsOAuth(StorageBackend):
     def __init__(self, title: str):
         import gspread
@@ -550,22 +511,18 @@ class GoogleSheetsOAuth(StorageBackend):
         ws = self.ss.worksheet("submittals")
         rows = ws.get_all_records()
         for i, r in enumerate(rows, start=2):
-            try:
-                if int(r.get("id",0) or 0)==int(id_):
-                    tab = r.get("result_sheet_name") or ""
-                    if tab:
-                        try: self.ss.del_worksheet(self.ss.worksheet(tab))
-                        except: pass
-                    ws.delete_rows(i); return
-            except: continue
+            if r.get("id")==id_:
+                ws.delete_rows(i); return
 
     def open_url_hint(self, rec): 
         try: return self.ss.url
         except: return None
 
-# ---- Microsoft OAuth Helpers / Backend (minimal viable)
+# ---- Microsoft OAuth helpers + Excel backend
 def ms_oauth_start():
-    cfg = st.secrets["microsoft_oauth"]
+    cfg = get_secret("microsoft_oauth", {})
+    if not cfg:
+        st.error("Microsoft OAuth not configured in secrets."); return
     params = {
         "client_id": cfg["client_id"],
         "response_type": "code",
@@ -581,7 +538,7 @@ def ms_oauth_start():
     st.markdown(f"[Continue to Microsoft]({auth_url})")
 
 def ms_oauth_callback():
-    cfg = st.secrets.get("microsoft_oauth", {})
+    cfg = get_secret("microsoft_oauth", {})
     params = st.query_params
     if "code" not in params or "state" not in params: return False
     if params.get("state") != st.session_state.get("__ms_state__"): return False
@@ -607,7 +564,6 @@ def ms_oauth_callback():
 def ms_access_token():
     tok = st.session_state.get("__ms_token__")
     if not tok: return None
-    # naive refresh handler omitted for brevity
     return tok["access_token"]
 
 class MSExcelOAuth(StorageBackend):
@@ -672,7 +628,7 @@ class MSExcelOAuth(StorageBackend):
         self._append_rows(ws, [[name, json.dumps(payload), datetime.utcnow().isoformat()]])
 
     def delete_preset(self, name: str) -> None:
-        pass  # (range delete omitted to keep this concise)
+        pass  # minimal viable; range delete omitted
 
     # Submittals
     def save_submittal(self, meta: dict, result_csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
@@ -683,15 +639,15 @@ class MSExcelOAuth(StorageBackend):
         self._ensure_worksheet(ws, headers)
         url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
         r = requests.get(url, headers=self._hed()).json()
-        cur = r.get("values", [])
-        run_id = max(1, len(cur))  # naive id
+        vals = r.get("values", [])
+        run_id = max(1, len(vals))  # naive id
 
         tab = f"run_{run_id}_{(meta.get('company') or '')[:30]}_{(meta.get('project') or '')[:30]}"
         self._ensure_worksheet(tab, ["Results"])
         try:
             df = pd.read_csv(pd.io.common.BytesIO(result_csv_bytes))
-            vals = [list(df.columns)] + df.astype(object).where(pd.notna(df), "").values.tolist()
-            self._update_range(tab, "A1", vals)
+            vals2 = [list(df.columns)] + df.astype(object).where(pd.notna(df), "").values.tolist()
+            self._update_range(tab, "A1", vals2)
         except Exception:
             tab = ""
 
@@ -740,7 +696,7 @@ class MSExcelOAuth(StorageBackend):
 
 @st.cache_resource
 def get_backend(kind: str) -> StorageBackend:
-    title = st.secrets.get("sheets", {}).get("title", "SubmittalCheckerData")
+    title = get_secret("sheets.title", "SubmittalCheckerData")
     if kind == BACKEND_GS_SERVICE:
         return GoogleSheetsSA(title)
     if kind == BACKEND_GS_OAUTH:
@@ -748,23 +704,23 @@ def get_backend(kind: str) -> StorageBackend:
     if kind == BACKEND_MS_OAUTH:
         return MSExcelOAuth(title)
     data_dir = os.path.join(os.path.dirname(__file__), "data")
+    os.makedirs(data_dir, exist_ok=True)
     return SQLiteBackend(os.path.join(data_dir, "checker.db"))
 
-# Thin wrappers so the rest of the app uses db_* names
-def db_save_preset(backend: StorageBackend, name: str, payload: dict): return backend.save_preset(name, payload)
-def db_load_presets(backend: StorageBackend) -> dict: return backend.load_presets()
-def db_delete_preset(backend: StorageBackend, name: str): return backend.delete_preset(name)
-def db_save_submittal(backend: StorageBackend, meta: dict, result_csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
-    return backend.save_submittal(meta, result_csv_bytes, spec_excerpt, sub_excerpt)
-def db_list_submittals(backend: StorageBackend) -> pd.DataFrame: return backend.list_submittals()
-def db_get_submittal(backend: StorageBackend, id_: int) -> dict: return backend.get_submittal(id_)
-def db_delete_submittal(backend: StorageBackend, id_: int): return backend.delete_submittal(id_)
-def db_open_url_hint(backend: StorageBackend, rec: dict) -> str | None: return backend.open_url_hint(rec)
+# Thin wrappers
+def db_save_preset(b: StorageBackend, name: str, payload: dict): return b.save_preset(name, payload)
+def db_load_presets(b: StorageBackend) -> dict: return b.load_presets()
+def db_delete_preset(b: StorageBackend, name: str): return b.delete_preset(name)
+def db_save_submittal(b: StorageBackend, meta: dict, csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
+    return b.save_submittal(meta, csv_bytes, spec_excerpt, sub_excerpt)
+def db_list_submittals(b: StorageBackend) -> pd.DataFrame: return b.list_submittals()
+def db_get_submittal(b: StorageBackend, id_: int) -> dict: return b.get_submittal(id_)
+def db_delete_submittal(b: StorageBackend, id_: int): return b.delete_submittal(id_)
+def db_open_url_hint(b: StorageBackend, rec: dict) -> str | None: return b.open_url_hint(rec)
 
 # =========================
 # Sidebar: storage + auth
 # =========================
-
 st.sidebar.title("Civil Mini-Apps")
 st.sidebar.subheader("Storage")
 
@@ -772,65 +728,46 @@ backend_choice = st.sidebar.selectbox(
     "Save presets & memory bank to",
     BACKEND_CHOICES,
     index=BACKEND_CHOICES.index(_ensure_ss("__backend_choice__", BACKEND_SQLITE)),
-    help=(
-        "• Local (SQLite): stores on the app server.\n"
-        "• Google Sheets (Service Account): server-managed SA; share a Sheet with the SA email.\n"
-        "• Google Sheets (OAuth): each user signs in; their Drive is used.\n"
-        "• Microsoft 365 Excel (OAuth): each user signs in; OneDrive Excel file is used."
-    ),
 )
-backend, active_backend = get_backend_safe(backend_choice)
+st.session_state["__backend_choice__"] = backend_choice
 
 def _badge(ok): return "🟢 signed in" if ok else "⚪ not signed in"
 
-with st.sidebar:
-    if active_backend == BACKEND_GS_OAUTH:
-        st.write("Google: " + _badge("__google_user__" in st.session_state))
-        st.button(
-            "Sign in with Google",
-            on_click=lambda: st.session_state.__setitem__("__do_google_oauth__", True),
-            disabled=not google_oauth_configured(),
-            help=None if google_oauth_configured() else "Add google_oauth secrets to enable."
-        )
-        if st.button("Sign out Google"):
-            for k in ["__google_token__","__google_user__","__google_flow__","__google_state__"]:
-                st.session_state.pop(k, None)
-            st.success("Signed out of Google.")
-    elif active_backend == BACKEND_MS_OAUTH:
-        st.write("Microsoft: " + _badge("__ms_user__" in st.session_state))
-        st.button(
-            "Sign in with Microsoft",
-            on_click=lambda: st.session_state.__setitem__("__do_ms_oauth__", True),
-            disabled=not ms_oauth_configured(),
-            help=None if ms_oauth_configured() else "Add microsoft_oauth secrets to enable."
-        )
-        if st.button("Sign out Microsoft"):
-            for k in ["__ms_token__","__ms_user__","__ms_state__"]:
-                st.session_state.pop(k, None)
-            st.success("Signed out of Microsoft.")
+if backend_choice == BACKEND_GS_OAUTH:
+    st.sidebar.write("Google: " + _badge("__google_user__" in st.session_state))
+    colA, colB = st.sidebar.columns(2)
+    if colA.button("Sign in"):
+        st.session_state["__do_google_oauth__"] = True
+        st.rerun()
+    if colB.button("Sign out"):
+        for k in ["__google_token__","__google_user__","__google_flow__","__google_state__"]:
+            st.session_state.pop(k, None)
+        st.success("Signed out of Google.")
+elif backend_choice == BACKEND_MS_OAUTH:
+    st.sidebar.write("Microsoft: " + _badge("__ms_user__" in st.session_state))
+    colA, colB = st.sidebar.columns(2)
+    if colA.button("Sign in"):
+        st.session_state["__do_ms_oauth__"] = True
+        st.rerun()
+    if colB.button("Sign out"):
+        for k in ["__ms_token__","__ms_user__","__ms_state__"]:
+            st.session_state.pop(k, None)
+        st.success("Signed out of Microsoft.")
 
-
-# Handle OAuth start/callback safely (no exceptions if secrets missing)
+# Handle OAuth flows
 if st.session_state.get("__do_google_oauth__"):
     st.session_state.pop("__do_google_oauth__", None)
-    if google_oauth_configured():
-        google_oauth_start()
-    else:
-        st.sidebar.error("Google OAuth not configured (missing secrets).")
+    google_oauth_start()
 elif st.session_state.get("__do_ms_oauth__"):
     st.session_state.pop("__do_ms_oauth__", None)
-    if ms_oauth_configured():
-        ms_oauth_start()
-    else:
-        st.sidebar.error("Microsoft OAuth not configured (missing secrets).")
+    ms_oauth_start()
 else:
     if "code" in st.query_params and "state" in st.query_params:
         # try both; only one will succeed
         google_oauth_callback()
         ms_oauth_callback()
 
-
-# Instantiate backend
+# Instantiate backend (fallback to SQLite on error)
 try:
     backend = get_backend(backend_choice)
 except Exception as e:
@@ -840,17 +777,14 @@ except Exception as e:
 # =========================
 # Submittal Checker (page)
 # =========================
-
 def submittal_checker_page():
     st.header("Submittal Checker")
 
-    # --- Spec/Submittal file readers
-    SUPPORTED_EXT = (".pdf",".docx",".txt",".csv")
-
+    # Readers
     try:
         from rapidfuzz import fuzz
-    except Exception as e:
-        st.error("Install dependency: `pip install rapidfuzz`")
+    except Exception:
+        st.error("Missing dependency `rapidfuzz`. pip install rapidfuzz")
         return
     try:
         from pypdf import PdfReader
@@ -866,10 +800,8 @@ def submittal_checker_page():
         reader = PdfReader(file)
         parts = []
         for p in reader.pages:
-            try:
-                parts.append(p.extract_text() or "")
-            except Exception:
-                pass
+            try: parts.append(p.extract_text() or "")
+            except Exception: pass
         return "\n".join(parts)
 
     def _read_docx(file: io.BytesIO) -> str:
@@ -897,7 +829,6 @@ def submittal_checker_page():
         if name.endswith(".csv"):  return _read_csv(data)
         raise ValueError(f"Unsupported file: {name}")
 
-    # --- Parsing / chunking
     BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+[.)]|[A-Z]\.|[A-Z]\))\s+")
     HEADER_RE = re.compile(r"^(?:PART|SECTION|DIVISION|SUBMITTALS?|WARRANTY|SHOP DRAWINGS)\b", re.I)
     def clean_text(t: str) -> str:
@@ -919,7 +850,6 @@ def submittal_checker_page():
                 flush(); chunks.append(ln); continue
             acc.append(ln)
         flush()
-        # dedupe
         seen, out = set(), []
         for c in chunks:
             k = c.lower()
@@ -927,7 +857,7 @@ def submittal_checker_page():
                 out.append(c); seen.add(k)
         return out
 
-    # --- Reviewer policy panel (with presets & help)
+    # Presets + defaults
     DEFAULTS = {
         "must": "data sheet,warranty,certificate",
         "nice": "shop drawing,test report,O&M manual",
@@ -935,7 +865,6 @@ def submittal_checker_page():
         "weights": {"alpha":0.45,"beta":0.35,"gamma":0.20,"delta":0.20,"epsilon":0.05},
         "threshold": 85,
     }
-
     def _apply_preset(p):
         st.session_state["kw_must"] = p.get("must", DEFAULTS["must"])
         st.session_state["kw_nice"] = p.get("nice", DEFAULTS["nice"])
@@ -948,88 +877,68 @@ def submittal_checker_page():
         st.session_state["w_epsilon"] = float(w.get("epsilon", DEFAULTS["weights"]["epsilon"]))
         st.session_state["hybrid_threshold"] = int(p.get("threshold", DEFAULTS["threshold"]))
         st.rerun()
-
     if "kw_must" not in st.session_state:
         _apply_preset(DEFAULTS)
 
-    left, right = st.columns([1,1])
-    with left:
+    # Sources
+    cL, cR = st.columns(2)
+    with cL:
         st.subheader("Spec Source")
         spec_file = st.file_uploader("Upload spec (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="spec_file")
         spec_text_area = st.text_area("Or paste spec text", height=220, placeholder="Paste specification clauses…", key="spec_text")
-    with right:
+    with cR:
         st.subheader("Submittal Source")
         sub_file = st.file_uploader("Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="sub_file")
         sub_text_area = st.text_area("Or paste submittal text", height=220, placeholder="Paste submittal content…", key="sub_text")
 
     st.markdown("---")
-    with st.expander("Reviewer policy & keywords", expanded=False):
-        # Help
-        hc1, hc2 = st.columns([0.12, 0.88])
-        try:
-            with hc1.popover("❓"):
-                st.markdown(
-                    """
-**Keywords**
-- **Must-have**: all must appear in best match or PASS blocked.
-- **Nice-to-have**: boost coverage score.
-- **Forbidden**: any hit blocks PASS and penalizes.
-
-**Hybrid Score**  
-`score = α·Lexical + β·Semantic + γ·Coverage + ε·Section − δ·ForbiddenHits`
-
-**PASS** if exact-like or score ≥ Threshold, **and** all musts present, **and** no forbidden.
-"""
-                )
-        except Exception:
-            with st.expander("❓ What do these mean?"):
-                st.markdown("Score blends literal match, meaning, keyword coverage, and penalties.")
-
+    with st.expander("Reviewer policy, keywords & weights", expanded=False):
         # Presets
-        pcol1, pcol2, pcol3, pcol4 = st.columns([0.35,0.25,0.2,0.2])
+        row1 = st.columns([0.35,0.2,0.2,0.25])
         presets = db_load_presets(backend)
-        with pcol1:
+        with row1[0]:
             sel = st.selectbox("Load preset", ["—"] + sorted(presets.keys()))
-        with pcol2:
+        with row1[1]:
             if st.button("Load"):
                 if sel != "—":
                     _apply_preset(presets[sel])
-        with pcol3:
-            if st.button("Reset to recommended"):
+        with row1[2]:
+            if st.button("Reset"):
                 _apply_preset(DEFAULTS)
-        with pcol4:
-            if sel != "—" and st.button("Delete"):
+        with row1[3]:
+            if sel != "—" and st.button("Delete preset"):
                 db_delete_preset(backend, sel); st.success(f"Deleted {sel}"); st.rerun()
 
-        # Keywords
         cA, cB = st.columns(2)
         with cA:
-            must_text = st.text_area("Must-have terms (comma-separated)", st.session_state["kw_must"], key="kw_must",
-                                     help="All must be present in best match for PASS.")
-            nice_text = st.text_area("Nice-to-have terms", st.session_state["kw_nice"], key="kw_nice",
-                                     help="Boost the coverage part of the score.")
+            must_text = st.text_area("Must-have terms (comma-separated)",
+                                     st.session_state["kw_must"], key="kw_must",
+                                     help="All must appear in the best-matching submittal excerpt; otherwise PASS is blocked.")
+            nice_text = st.text_area("Nice-to-have terms",
+                                     st.session_state["kw_nice"], key="kw_nice",
+                                     help="Improves the coverage portion of the hybrid score.")
         with cB:
-            forbid_text = st.text_area("Forbidden phrases", st.session_state["kw_forbid"], key="kw_forbid",
-                                       help="If any appear in best match, PASS is blocked and penalized.")
-            st.caption("Forbidden terms block PASS even if score is high.")
+            forbid_text = st.text_area("Forbidden phrases",
+                                       st.session_state["kw_forbid"], key="kw_forbid",
+                                       help="Any hit blocks PASS and applies a penalty.")
+            st.caption("Forbidden always blocks PASS regardless of score.")
 
         st.markdown("**Scoring weights**")
         α = st.slider("Lexical weight", 0.0, 1.0, st.session_state["w_alpha"], 0.05, key="w_alpha",
-                      help="RapidFuzz + TF-IDF similarity")
+                      help="RapidFuzz token-set similarity of spec vs. submittal text (literal match strength).")
         β = st.slider("Semantic weight", 0.0, 1.0, st.session_state["w_beta"], 0.05, key="w_beta",
-                      help="Embedding cosine similarity (if available)")
+                      help="Embedding cosine similarity (meaning match). Uses sentence-transformers if available.")
         γ = st.slider("Coverage weight", 0.0, 1.0, st.session_state["w_gamma"], 0.05, key="w_gamma",
-                      help="70% must + 30% nice coverage")
+                      help="Coverage: 70% must + 30% nice. Encourages presence of reviewer keywords.")
         δ = st.slider("Forbidden penalty per hit", 0.0, 1.0, st.session_state["w_delta"], 0.05, key="w_delta",
-                      help="Penalty per forbidden phrase hit")
+                      help="Subtract this per forbidden phrase hit in the best match.")
         ε = st.slider("Section boost (match)", 0.0, 0.5, st.session_state["w_epsilon"], 0.01, key="w_epsilon",
-                      help="Small bonus when sections align (Warranty/Shop Drawings/etc.)")
+                      help="Small bonus when headings align (e.g., Warranty vs. Warranty).")
 
-        # Save preset
-        s1, s2 = st.columns([0.8,0.2])
-        with s1:
+        row2 = st.columns([0.8,0.2])
+        with row2[0]:
             pname = st.text_input("Preset name", placeholder="e.g., Div03_Concrete_ReviewerA")
-        with s2:
+        with row2[1]:
             if st.button("Save preset"):
                 payload = {
                     "must": st.session_state["kw_must"],
@@ -1044,9 +953,9 @@ def submittal_checker_page():
                     db_save_preset(backend, pname.strip(), payload)
                     st.success(f"Saved preset: {pname.strip()}"); st.rerun()
 
-    threshold = st.slider("Hybrid PASS threshold (0–100)", 0, 100,
-                          st.session_state.get("hybrid_threshold", 85), key="hybrid_threshold")
-
+    threshold = st.slider("Hybrid PASS threshold", 0, 100,
+                          st.session_state.get("hybrid_threshold", 85),
+                          help="Final decision threshold on the 0–100 hybrid score.")
     run_btn = st.button("Analyze", type="primary")
 
     if run_btn:
@@ -1066,12 +975,9 @@ def submittal_checker_page():
             spec_chunks = split_into_chunks(spec_text)
             sub_chunks = split_into_chunks(sub_text)
 
-            # TF-IDF (lexical) + RapidFuzz + semantic (optional)
-            from rapidfuzz import fuzz
+            # lexical + semantic(optional)
             try:
-                # Optional semantic
                 from sentence_transformers import SentenceTransformer
-                from sklearn.metrics.pairwise import cosine_similarity
                 model = SentenceTransformer("all-MiniLM-L6-v2")
                 emb_spec = model.encode(spec_chunks, show_progress_bar=False, normalize_embeddings=True)
                 emb_sub  = model.encode(sub_chunks, show_progress_bar=False, normalize_embeddings=True)
@@ -1079,7 +985,6 @@ def submittal_checker_page():
             except Exception:
                 use_sem = False
 
-            # Helper: section tag
             def section_of(s: str) -> str:
                 m = re.search(r"(WARRANTY|SUBMITTALS?|SHOP DRAWINGS|PRODUCT DATA|TESTS?)", s, re.I)
                 return (m.group(1).upper() if m else "")
@@ -1092,21 +997,19 @@ def submittal_checker_page():
             for i, s in enumerate(spec_chunks):
                 s_norm = s.lower()
                 sec_s = section_of(s)
-                # best match across sub chunks
-                best_j, best_rf, best_sec_bonus, best_sem = -1, -1.0, 0.0, 0.0
+                best_rf = -1.0; best_sem = 0.0; best_sec = 0.0
                 best_chunk = ""
                 for j, t in enumerate(sub_chunks):
                     t_norm = t.lower()
                     rf = float(fuzz.token_set_ratio(s_norm, t_norm)) / 100.0
-                    sem = 0.0
-                    if use_sem:
-                        sem = float(np.dot(emb_spec[i], emb_sub[j]))  # since normalized
+                    sem = float(np.dot(emb_spec[i], emb_sub[j])) if use_sem else 0.0
                     sec_bonus = ε if (sec_s and sec_s == section_of(t)) else 0.0
-                    score = 0.45*rf + 0.35*sem + sec_bonus  # provisional
-                    if score > (0.45*best_rf + 0.35*best_sem + best_sec_bonus):
-                        best_j, best_rf, best_sem, best_sec_bonus, best_chunk = j, rf, sem, sec_bonus, t
+                    score = α*rf + β*sem + sec_bonus
+                    ref = α*best_rf + β*best_sem + best_sec
+                    if score > ref:
+                        best_rf, best_sem, best_sec, best_chunk = rf, sem, sec_bonus, t
 
-                # coverage / forbidden on best chunk
+                # coverage / forbid
                 t_use = best_chunk.lower()
                 must_hits = sum(1 for w in must if w.lower() in t_use)
                 nice_hits = sum(1 for w in nice if w.lower() in t_use)
@@ -1115,15 +1018,12 @@ def submittal_checker_page():
                 nice_cov = (nice_hits / max(1, len(nice))) if nice else 0.0
                 coverage = 0.7*must_cov + 0.3*nice_cov
 
-                alpha, beta, gamma, delta = α, β, γ, δ
-                # Final score
-                hybrid = alpha*best_rf + beta*(best_sem if use_sem else 0.0) + gamma*coverage + best_sec_bonus - delta*forb_hits
+                hybrid = α*best_rf + β*(best_sem if use_sem else 0.0) + γ*coverage + best_sec - δ*forb_hits
                 hybrid = max(0.0, min(1.0, hybrid))
                 exact_like = (s_norm in t_use) or (best_rf >= 0.97)
                 pass_logic = (exact_like or (hybrid*100 >= threshold)) and (must_hits == len(must)) and (forb_hits == 0)
                 decision = "PASS" if pass_logic else "REVIEW"
 
-                # simple HTML highlight
                 def hl(text: str, words: List[str], color: str) -> str:
                     out = text
                     for w in sorted(words, key=len, reverse=True):
@@ -1146,7 +1046,7 @@ def submittal_checker_page():
                     "Must_hits": must_hits,
                     "Nice_hits": nice_hits,
                     "Forbidden_hits": forb_hits,
-                    "Section_bonus": round(best_sec_bonus, 3),
+                    "Section_bonus": round(best_sec, 3),
                     "Exact_like": exact_like,
                     "Decision": decision,
                     "_best_chunk_html": best_chunk_html,
@@ -1174,7 +1074,7 @@ def submittal_checker_page():
             csv_bytes = df_show.to_csv(index=False).encode()
             st.download_button("Download results CSV", csv_bytes, "submittal_checker_results.csv", "text/csv")
 
-            # ----- Memory Bank -----
+            # Memory Bank save
             st.markdown("---")
             st.subheader("Save to Memory Bank")
             pass_count = int((df["Decision"]=="PASS").sum())
@@ -1204,9 +1104,9 @@ def submittal_checker_page():
                                 "must":",".join(must),"nice":",".join(nice),"forbid":",".join(forbid),
                                 "pass_count":pass_count,"review_count":review_count,"pass_rate":float(pass_rate),
                             },
-                            result_csv_bytes=csv_bytes,
-                            spec_excerpt=spec_text[:2000],
-                            sub_excerpt=sub_text[:2000],
+                            csv_bytes,
+                            spec_text[:2000],
+                            sub_text[:2000],
                         )
                         st.success(f"Saved run #{run_id} ({company} – {project})")
 
@@ -1242,7 +1142,7 @@ def submittal_checker_page():
                         if "result_csv" in rec:  # SQLite path
                             st.download_button("Download results CSV", rec["result_csv"], f"submittal_run_{rec['id']}.csv", "text/csv")
                         else:
-                            st.caption("Download from the workspace tab for Google/Microsoft backends.")
+                            st.caption("For Google/Microsoft backends, open the workspace to fetch results.")
                         url = db_open_url_hint(backend, rec)
                         if url: st.markdown(f"[Open in workspace]({url})")
                 if b.button("Delete"):
@@ -1254,11 +1154,9 @@ def submittal_checker_page():
 # =========================
 # Schedule What-Ifs (page)
 # =========================
-
 def schedule_whatifs_page():
     st.header("Schedule What-Ifs — Floats + Calendar")
 
-    # Config + aliases
     REQUIRED = ["Task","Duration","Predecessors","Normal_Cost_per_day","Crash_Cost_per_day"]
     ALIASES: Dict[str,str] = {
         "task":"Task","activity":"Task","name":"Task",
@@ -1271,9 +1169,6 @@ def schedule_whatifs_page():
         "min_duration":"Min_Duration","min_dur":"Min_Duration","min":"Min_Duration",
         "crash_duration":"Min_Duration","crash_duration_days":"Min_Duration","crash_dur":"Min_Duration",
         "overlap_ok":"Overlap_OK","overlap?":"Overlap_OK","allow_overlap":"Overlap_OK",
-        # Lags (SS/FF with lag): e.g. "A SS+2, B FS+3"
-        # We'll parse lags from the Predecessors string; aliases here for table friendliness
-        "lag":"Lag"
     }
 
     def norm_col(s: str) -> str:
@@ -1313,21 +1208,18 @@ def schedule_whatifs_page():
                 df.loc[mask,"Min_Duration"] = df.loc[mask,"Duration"]
         return df, warnings
 
-    # ---- CPM with Lags (FS, SS, FF) like "A FS+0, B SS+2, C FF-1"
+    # CPM with lags: FS/SS/FF + integer lag (±)
     @dataclass
     class CPMNode:
         task: str
         dur: int
-        preds: List[str]
+        preds: List[Tuple[str,str,int]]  # (pred, rel, lag)
         es: int=0; ef: int=0; ls: int=0; lf: int=0; tf: int=0
 
     def parse_predecessors(s: str) -> List[Tuple[str,str,int]]:
         """
-        Parse predecessor string like: "A, B FS+2, C SS-1, D FF+0"
-        Return list of (pred_task, rel_type, lag_days)
-          - rel_type in {"FS","SS","FF"}
-          - lag_days int (can be negative)
-        Default when not provided: FS+0
+        Accepts: "A", "A FS+0", "B SS+2; C FF-1"
+        Returns list of (pred_task, REL, lag_days)
         """
         if not s: return []
         out = []
@@ -1336,8 +1228,8 @@ def schedule_whatifs_page():
             m = re.match(r"^(.+?)\s*(FS|SS|FF)?\s*([+\-]\d+)?$", p, re.I)
             if m:
                 pred = m.group(1).strip()
-                rel = (m.group(2) or "FS").upper()
-                lag = int(m.group(3)) if m.group(3) else 0
+                rel  = (m.group(2) or "FS").upper()
+                lag  = int(m.group(3)) if m.group(3) else 0
                 out.append((pred, rel, lag))
             else:
                 out.append((p, "FS", 0))
@@ -1369,7 +1261,7 @@ def schedule_whatifs_page():
 
         order = topological_order(nodes)
 
-        # Forward pass (support lags + fast-track overlap on FS relationships when Overlap_OK)
+        # Forward pass
         for name in order:
             node = nodes[name]
             if not node.preds:
@@ -1379,10 +1271,8 @@ def schedule_whatifs_page():
                 for (p, rel, lag) in node.preds:
                     if p not in nodes: raise ValueError(f"Unknown predecessor '{p}' for task '{name}'.")
                     pred = nodes[p]
-                    # baseline
                     if rel == "FS":
                         base = pred.ef
-                        # fast-track overlap allowed
                         allow = bool(df.loc[df["Task"]==name, "Overlap_OK"].iloc[0]) if "Overlap_OK" in df.columns else False
                         if allow and overlap_frac>0:
                             base = max(0, pred.ef - int(round(overlap_frac*pred.dur)))
@@ -1390,8 +1280,6 @@ def schedule_whatifs_page():
                     elif rel == "SS":
                         starts.append(pred.es + lag)
                     elif rel == "FF":
-                        # Finish-to-Finish: successor finish >= pred.finish + lag
-                        # So start >= (pred.ef + lag) - dur
                         starts.append((pred.ef + lag) - node.dur)
                     else:
                         starts.append(pred.ef + lag)
@@ -1473,7 +1361,7 @@ def schedule_whatifs_page():
                      alt.Tooltip("Finish_Date:T", title="Finish Date", format="%Y-%m-%d")],
         ).properties(height=height))
 
-    # ---- UI
+    # UI
     st.subheader("Task Table")
     uploaded = st.file_uploader("Upload tasks CSV", type=["csv"], accept_multiple_files=False)
     with st.expander("CSV columns & example", expanded=False):
@@ -1485,7 +1373,7 @@ def schedule_whatifs_page():
             "D - Enclosure,9,\"C - Structure FF+0\",1400,2300,7,FALSE\n",
             language="csv"
         )
-        st.caption("Predecessors accept lags like `FS+2`, `SS-1`, `FF+0`. Multiple predecessors separated by comma/semicolon.")
+        st.caption("Predecessors accept lags like FS+2, SS-1, FF+0. Separate multiple predecessors by comma/semicolon.")
 
     base_df = pd.DataFrame({
         "Task":["A - Site Prep","B - Foundations","C - Structure","D - MEP Rough-In","E - Enclosure","F - Finishes"],
@@ -1508,15 +1396,20 @@ def schedule_whatifs_page():
         column_config={
             "Task": st.column_config.TextColumn("Task", required=True),
             "Duration": st.column_config.NumberColumn("Duration", min_value=0, step=1),
-            "Predecessors": st.column_config.TextColumn("Predecessors", help="Use FS/SS/FF with optional ±lag. e.g., A FS+0; B SS+2; C FF-1"),
+            "Predecessors": st.column_config.TextColumn(
+                "Predecessors",
+                help="Use FS/SS/FF with optional ±lag. e.g., A FS+0; B SS+2; C FF-1"
+            ),
             "Normal_Cost_per_day": st.column_config.NumberColumn("Normal Cost / day", min_value=0),
             "Crash_Cost_per_day": st.column_config.NumberColumn("Crash Cost / day", min_value=0),
             "Min_Duration": st.column_config.NumberColumn("Min Duration", min_value=0, step=1),
-            "Overlap_OK": st.column_config.CheckboxColumn("Overlap OK"),
+            "Overlap_OK": st.column_config.CheckboxColumn(
+                "Overlap OK", help="If enabled, FS successors may start earlier by a fraction of predecessor duration (see overlap control)."
+            ),
         },
         key="task_table", height=editor_height
     )
-    # Sanity coercions
+    # Coercions
     edited_df["Task"] = edited_df["Task"].astype(str)
     edited_df["Predecessors"] = edited_df["Predecessors"].fillna("").astype(str)
     for c in ["Duration","Min_Duration"]: edited_df[c] = pd.to_numeric(edited_df[c], errors="coerce").fillna(0).astype(int).clip(lower=0)
@@ -1527,15 +1420,17 @@ def schedule_whatifs_page():
     st.markdown("---")
     left, right = st.columns([1,1])
     with left:
-        target_days = st.number_input("Target project duration (days)", min_value=1, value=30, step=1)
+        target_days = st.number_input("Target project duration (days)", min_value=1, value=30, step=1,
+                                      help="Desired total project duration for crash analysis.")
     with right:
         overlap_frac = st.number_input("Fast-track overlap fraction", min_value=0.0, max_value=0.9, value=0.0, step=0.05,
-            help="Portion of predecessor duration successor can overlap (when Overlap_OK).")
+            help="When Overlap OK is true, FS successors may start earlier by this fraction of predecessor duration.")
 
     c1, c2 = st.columns(2)
     clamp_ff = c1.checkbox("Clamp Free Float at ≥ 0", value=True,
-                           help="Classic CPM clamps Free Float to zero. Uncheck to display negative FF under overlaps.")
-    cal_mode = c2.checkbox("Calendar mode (map to dates)", value=True)
+                           help="Classic CPM reports Free Float as zero when negative. Uncheck to reveal negative FF caused by overlaps.")
+    cal_mode = c2.checkbox("Calendar mode (map to dates)", value=True,
+                           help="Convert ES/EF to working dates using your workweek and holidays.")
     if cal_mode:
         cw1, cw2 = st.columns([1,1])
         with cw1:
@@ -1543,12 +1438,13 @@ def schedule_whatifs_page():
         with cw2:
             workdays = st.multiselect("Workdays", options=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
                                       default=["Mon","Tue","Wed","Thu","Fri"],
-                                      help="Business days to convert ES/EF into dates.")
-        holidays_text = st.text_area("Holidays (YYYY-MM-DD, one per line)", height=80, placeholder="2025-11-27\n2025-12-25")
+                                      help="Working days for date conversion.")
+        holidays_text = st.text_area("Holidays (YYYY-MM-DD, one per line)", height=80, placeholder="2025-11-27\n2025-12-25",
+                                     help="Non-working dates to exclude.")
         holidays = [ln.strip() for ln in holidays_text.splitlines() if ln.strip()]
         cbd = make_cbd(workdays, holidays)
 
-    cA, cB, cC = st.columns([1,1,1])
+    cA, cB = st.columns([1,1])
     compute = cA.button("Compute CPM", type="secondary")
     run_crash = cB.button("Crash to Target", type="primary")
 
@@ -1566,42 +1462,19 @@ def schedule_whatifs_page():
             st.subheader("Gantt (Baseline)")
             chart_fullwidth(gantt_chart(base_schedule))
 
-            # Simple crash loop (greedy, cost slope)
+            # Simple greedy crash loop
             def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
-    crit = schedule[schedule["Critical"]]
-    if crit.empty:
-        return None
-
-    merged = crit.merge(
-        df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
-        on="Task", how="left", suffixes=("_sched","_cfg")
-    )
-
-    # columns present after merge:
-    #  - Duration_sched (from schedule)
-    #  - Duration_cfg (from df_cfg)
-    #  - Min_Duration (if only in df_cfg; else Min_Duration_cfg)
-    #  - Normal_Cost_per_day (only in df_cfg)
-    #  - Crash_Cost_per_day (only in df_cfg)
-
-    dur_col = "Duration_cfg" if "Duration_cfg" in merged.columns else "Duration"
-    min_col = "Min_Duration_cfg" if "Min_Duration_cfg" in merged.columns else "Min_Duration"
-
-    merged["slope"] = (
-        pd.to_numeric(merged["Crash_Cost_per_day"], errors="coerce") -
-        pd.to_numeric(merged["Normal_Cost_per_day"], errors="coerce")
-    ).astype(float)
-
-    can = merged[
-        pd.to_numeric(merged[dur_col], errors="coerce") >
-        pd.to_numeric(merged[min_col], errors="coerce")
-    ]
-    if can.empty:
-        return None
-
-    can = can.sort_values(["slope","ES"], kind="stable")
-    return str(can.iloc[0]["Task"])
-
+                crit = schedule[schedule["Critical"]]
+                if crit.empty: return None
+                merged = crit.merge(
+                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
+                    on="Task", how="left"
+                )
+                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
+                can = merged[merged["Duration"] > merged["Min_Duration"]]
+                if can.empty: return None
+                can = can.sort_values(["slope","ES"], kind="stable")
+                return str(can.iloc[0]["Task"])
 
             def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
                 new = df_cfg.copy()
@@ -1654,9 +1527,35 @@ def schedule_whatifs_page():
 # =========================
 # App Navigation
 # =========================
-
 page = st.sidebar.radio("Pages", ["Submittal Checker", "Schedule What-Ifs"], index=0)
 if page == "Submittal Checker":
     submittal_checker_page()
 else:
     schedule_whatifs_page()
+
+# =========================
+# README (quick)
+# =========================
+# For local dev:
+# 1) Put a .streamlit/secrets.toml like:
+# [sheets]
+# title = "SubmittalCheckerData"
+# [google_oauth]
+# client_id = "YOUR_ID"
+# client_secret = "YOUR_SECRET"
+# redirect_uri = "http://localhost:8501"
+# [gcp_service_account]  # only if you use service-account mode
+# type="service_account"
+# project_id="..."
+# private_key_id="..."
+# private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# client_email="svc@proj.iam.gserviceaccount.com"
+# token_uri="https://oauth2.googleapis.com/token"
+# [microsoft_oauth]
+# client_id="YOUR_APP_ID"
+# client_secret="YOUR_APP_SECRET"
+# tenant_id="common"
+# redirect_uri="http://localhost:8501"
+#
+# 2) pip install -r requirements.txt
+# 3) streamlit run app.py
