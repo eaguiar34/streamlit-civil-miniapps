@@ -1947,65 +1947,65 @@ def schedule_whatifs_page():
             # Simple greedy crash loop
             # --- replace these three functions in Schedule What-Ifs section ---
 
-def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
-    """
-    Pick the next task to crash:
-      - only tasks currently on the critical path
-      - only tasks whose current Duration > Min_Duration
-      - choose lowest cost slope, then earliest ES as tie-breaker
-    """
-    crit = schedule[schedule["Critical"]].copy()
-    if crit.empty:
-        return None
-
-    # Bring in cfg columns; keep schedule columns un-suffixed
-    merged = crit.merge(
-        df_cfg[["Task", "Duration", "Min_Duration", "Normal_Cost_per_day", "Crash_Cost_per_day"]],
-        on="Task",
-        how="left",
-        suffixes=("", "_cfg")
-    )
-
-    # We want the **cfg** durations (editable table) for crash decisions
-    if "Duration_cfg" not in merged or "Min_Duration" not in merged:
-        return None  # safety
-
-    merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
-
-    can = merged[merged["Duration_cfg"] > merged["Min_Duration"]]
-    if can.empty:
-        return None
-
-    can = can.sort_values(["slope", "ES"], kind="stable")
-    return str(can.iloc[0]["Task"])
-
-
-def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
-    """Reduce chosen task’s duration by 1 day, respecting Min_Duration."""
-    new = df_cfg.copy()
-    mask = new["Task"] == task
-    # clamp at Min_Duration so it never goes below
-    new.loc[mask, "Duration"] = np.maximum(
-        (new.loc[mask, "Duration"] - 1).astype(int),
-        new.loc[mask, "Min_Duration"].astype(int)
-    )
-    return new
-
-
-def total_cost(df_cfg: pd.DataFrame) -> float:
-    """
-    Approximate total daily cost:
-      baseline = sum(Normal/day * baseline_duration)
-      added cost = (crashed_days * (Crash/day - Normal/day))
-    """
-    base_dur = df_cfg.get("_baseline_duration", df_cfg["Duration"]).astype(float)
-    normal = df_cfg["Normal_Cost_per_day"].astype(float)
-    crash  = df_cfg["Crash_Cost_per_day"].astype(float)
-
-    baseline_cost = float((normal * base_dur).sum())
-    crashed_days  = (base_dur - df_cfg["Duration"].astype(float)).clip(lower=0.0)
-    added_cost    = (crashed_days * (crash - normal).clip(lower=0.0)).sum()
-    return float(baseline_cost + added_cost)
+    def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
+        """
+        Pick the next task to crash:
+          - only tasks currently on the critical path
+          - only tasks whose current Duration > Min_Duration
+          - choose lowest cost slope, then earliest ES as tie-breaker
+        """
+        crit = schedule[schedule["Critical"]].copy()
+        if crit.empty:
+            return None
+    
+        # Bring in cfg columns; keep schedule columns un-suffixed
+        merged = crit.merge(
+            df_cfg[["Task", "Duration", "Min_Duration", "Normal_Cost_per_day", "Crash_Cost_per_day"]],
+            on="Task",
+            how="left",
+            suffixes=("", "_cfg")
+        )
+    
+        # We want the **cfg** durations (editable table) for crash decisions
+        if "Duration_cfg" not in merged or "Min_Duration" not in merged:
+            return None  # safety
+    
+        merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
+    
+        can = merged[merged["Duration_cfg"] > merged["Min_Duration"]]
+        if can.empty:
+            return None
+    
+        can = can.sort_values(["slope", "ES"], kind="stable")
+        return str(can.iloc[0]["Task"])
+    
+    
+    def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
+        """Reduce chosen task’s duration by 1 day, respecting Min_Duration."""
+        new = df_cfg.copy()
+        mask = new["Task"] == task
+        # clamp at Min_Duration so it never goes below
+        new.loc[mask, "Duration"] = np.maximum(
+            (new.loc[mask, "Duration"] - 1).astype(int),
+            new.loc[mask, "Min_Duration"].astype(int)
+        )
+        return new
+    
+    
+    def total_cost(df_cfg: pd.DataFrame) -> float:
+        """
+        Approximate total daily cost:
+          baseline = sum(Normal/day * baseline_duration)
+          added cost = (crashed_days * (Crash/day - Normal/day))
+        """
+        base_dur = df_cfg.get("_baseline_duration", df_cfg["Duration"]).astype(float)
+        normal = df_cfg["Normal_Cost_per_day"].astype(float)
+        crash  = df_cfg["Crash_Cost_per_day"].astype(float)
+    
+        baseline_cost = float((normal * base_dur).sum())
+        crashed_days  = (base_dur - df_cfg["Duration"].astype(float)).clip(lower=0.0)
+        added_cost    = (crashed_days * (crash - normal).clip(lower=0.0)).sum()
+        return float(baseline_cost + added_cost)
 
 
             if run_crash:
