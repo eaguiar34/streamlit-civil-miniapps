@@ -108,7 +108,14 @@ def bm25_scores(query: str, docs: list[str]) -> list[float]:
 # =========================
 # App bootstrap
 # =========================
-st.set_page_config(page_title="Civil Mini-Apps", layout="wide")
+st.set_page_config(page_title="FieldFlow", layout="wide")
+# Sidebar layout helper: keep "footer" sections at the bottom
+st.markdown("""
+<style>
+[data-testid="stSidebar"] > div:first-child {display: flex; flex-direction: column; height: 100vh;}
+.sidebar-spacer {flex: 1 1 auto;}
+</style>
+""", unsafe_allow_html=True)
 
 # ---------- Width shims (handles Streamlit deprecations gracefully)
 def df_fullwidth(df, **kwargs):
@@ -1605,7 +1612,7 @@ def summarize_feedback(df: pd.DataFrame) -> dict:
 # =========================
 # Sidebar: storage + auth
 # =========================
-st.sidebar.title("Civil Mini-Apps")
+st.sidebar.title("FieldFlow")
 st.sidebar.subheader("Storage")
 
 backend_choice = st.sidebar.selectbox(
@@ -1658,6 +1665,16 @@ except Exception as e:
     st.sidebar.error(f"Backend error: {e}")
     backend = get_backend(BACKEND_SQLITE)
 
+=========================
+# Sidebar: Pages
+# =========================
+PAGES = ["Submittal Checker", "Schedule What-Ifs", "RFI Manager", "Aging Dashboard"]
+if "__page__" not in st.session_state:
+    st.session_state["__page__"] = PAGES[0]
+page = st.sidebar.radio("Pages", PAGES, key="__page__")
+
+# Spacer pushes the sections below toward the bottom
+st.sidebar.markdown("<div class='sidebar-spacer'></div>", unsafe_allow_html=True)
 
 # =========================
 # Sidebar: About + Feedback
@@ -2930,17 +2947,18 @@ def aging_dashboard_page():
 # =========================
 # App Navigation
 # =========================
-PAGES = ["Submittal Checker", "Schedule What-Ifs", "RFI Manager", "Aging Dashboard"]
-page = st.sidebar.radio("Pages", PAGES, index=0)
-st.session_state["__page__"] = page
+page = st.session_state.get("__page__", "Submittal Checker")
+
 if page == "Submittal Checker":
     submittal_checker_page()
 elif page == "Schedule What-Ifs":
     schedule_whatifs_page()
 elif page == "RFI Manager":
     rfi_manager_page()
-else:
+elif page == "Aging Dashboard":
     aging_dashboard_page()
+else:
+    submittal_checker_page()
 
 # =========================
 # README (quick)
