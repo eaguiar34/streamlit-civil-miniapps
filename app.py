@@ -188,6 +188,13 @@ class StorageBackend:
     def list_feedback(self, limit: int = 50) -> pd.DataFrame: ...
 
 
+    # RFI Manager
+    def upsert_rfi(self, row: dict) -> int: ...
+    def list_rfis(self, limit: int = 5000) -> 'pd.DataFrame': ...
+    def get_rfi(self, id_: int) -> dict: ...
+    def delete_rfi(self, id_: int) -> None: ...
+
+
 # ---- SQLite Backend
 class SQLiteBackend(StorageBackend):
     def __init__(self, db_path: str):
@@ -221,6 +228,32 @@ class SQLiteBackend(StorageBackend):
             categories TEXT,
             email TEXT,
             message TEXT
+        )""")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS rfis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            user_id TEXT,
+            project TEXT,
+            subject TEXT,
+            question TEXT,
+            discipline TEXT,
+            spec_section TEXT,
+            priority TEXT,
+            status TEXT,
+            due_date TEXT,
+            assignee_email TEXT,
+            recipient_emails TEXT,
+            cc_emails TEXT,
+            related_tasks TEXT,
+            schedule_impact_days INT,
+            cost_impact REAL,
+            last_sent_at TEXT,
+            last_reminded_at TEXT,
+            last_response_at TEXT,
+            response_text TEXT,
+            notes TEXT
         )""")
         con.commit()
         self.con = con
@@ -300,6 +333,66 @@ class SQLiteBackend(StorageBackend):
             params=(int(limit),),
         )
 
+    # ---- RFIs
+    def upsert_rfi(self, row: dict) -> int:
+        """Insert or update an RFI. Returns the RFI id."""
+        now = row.get("updated_at") or __import__("datetime").datetime.utcnow().isoformat()
+        rid = row.get("id")
+        fields = [
+            "user_id","project","subject","question","discipline","spec_section","priority",
+            "status","due_date","assignee_email","to_emails","cc_emails",
+            "related_tasks","schedule_impact_days","cost_impact",
+            "last_sent_at","last_reminded_at","last_response_at","thread_notes",
+        ]
+        vals = [row.get(f) for f in fields]
+        if rid:
+            self.con.execute(
+                """UPDATE rfis SET
+                    updated_at=?,
+                    user_id=?, project=?, subject=?, question=?, discipline=?, spec_section=?, priority=?,
+                    status=?, due_date=?, assignee_email=?, to_emails=?, cc_emails=?,
+                    related_tasks=?, schedule_impact_days=?, cost_impact=?,
+                    last_sent_at=?, last_reminded_at=?, last_response_at=?, thread_notes=?
+                WHERE id=?""",
+                [now] + vals + [int(rid)],
+            )
+            self.con.commit()
+            return int(rid)
+
+        cur = self.con.cursor()
+        cur.execute(
+            """INSERT INTO rfis(
+                created_at, updated_at,
+                user_id, project, subject, question, discipline, spec_section, priority,
+                status, due_date, assignee_email, to_emails, cc_emails,
+                related_tasks, schedule_impact_days, cost_impact,
+                last_sent_at, last_reminded_at, last_response_at, thread_notes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [row.get("created_at") or __import__("datetime").datetime.utcnow().isoformat(), now] + vals,
+        )
+        self.con.commit()
+        return int(cur.lastrowid)
+
+    def list_rfis(self, limit: int = 5000) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT * FROM rfis ORDER BY id DESC LIMIT ?",
+            self.con,
+            params=(int(limit),),
+        )
+
+    def get_rfi(self, id_: int) -> dict:
+        cur = self.con.execute("SELECT * FROM rfis WHERE id=?", (int(id_),))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        cols = [d[1] for d in self.con.execute("PRAGMA table_info(rfis)")]
+        return dict(zip(cols, row))
+
+    def delete_rfi(self, id_: int) -> None:
+        self.con.execute("DELETE FROM rfis WHERE id=?", (int(id_),))
+        self.con.commit()
+
+
     def open_url_hint(self, rec: dict) -> str | None:
         return None
 
@@ -355,6 +448,7 @@ class GoogleSheetsSA(StorageBackend):
             "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"
         ])
         self._ensure_ws("feedback", ["created_at","user_id","page","rating","categories","email","message"])
+        self._ensure_ws("rfis", ["id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"])
 
 
     def load_presets(self) -> dict:
@@ -471,6 +565,92 @@ class GoogleSheetsSA(StorageBackend):
         df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
         return df.sort_values("created_at", ascending=False).head(limit)
 
+    # ---- RFIs
+    def _next_rfi_id(self) -> int:
+        rows = self.ss.worksheet("rfis").get_all_records()
+        if not rows:
+            return 1
+        try:
+            return max(int(r.get("id", 0) or 0) for r in rows) + 1
+        except Exception:
+            return len(rows) + 1
+
+    def upsert_rfi(self, row: dict) -> int:
+        ws = self.ss.worksheet("rfis")
+        headers = ws.row_values(1)
+        # Ensure header shape
+        expected = ["id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"]
+        if headers != expected:
+            ws.resize(rows=1)
+            ws.update([expected])
+
+        rows = ws.get_all_records()
+        rid = row.get("id")
+        if not rid:
+            rid = self._next_rfi_id()
+            row["id"] = rid
+            row.setdefault("created_at", datetime.utcnow().isoformat())
+
+        row.setdefault("updated_at", datetime.utcnow().isoformat())
+
+        out = [
+            row.get("id"), row.get("created_at"), row.get("updated_at"), row.get("user_id"),
+            row.get("project"), row.get("subject"), row.get("question"), row.get("discipline"),
+            row.get("spec_section"), row.get("priority"), row.get("status"), row.get("due_date"),
+            row.get("assignee_email"), row.get("to_emails"), row.get("cc_emails"),
+            row.get("related_tasks"), row.get("schedule_impact_days"), row.get("cost_impact"),
+            row.get("last_sent_at"), row.get("last_reminded_at"), row.get("last_response_at"), row.get("thread_notes"),
+        ]
+
+        # Update if exists
+        ids = []
+        for r in rows:
+            try:
+                ids.append(int(r.get("id", 0) or 0))
+            except Exception:
+                ids.append(0)
+        if int(rid) in ids:
+            idx = ids.index(int(rid)) + 2
+            ws.update(f"A{idx}:V{idx}", [out], value_input_option="RAW")
+        else:
+            ws.append_row(out, value_input_option="RAW")
+        return int(rid)
+
+    def list_rfis(self, limit: int = 5000) -> pd.DataFrame:
+        rows = self.ss.worksheet("rfis").get_all_records()
+        if not rows:
+            return pd.DataFrame(columns=["id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"])
+        df = pd.DataFrame(rows)
+        for c in ["id","schedule_impact_days"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+        for c in ["cost_impact"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        return df.sort_values("id", ascending=False).head(int(limit))
+
+    def get_rfi(self, id_: int) -> dict:
+        rows = self.ss.worksheet("rfis").get_all_records()
+        for r in rows:
+            try:
+                if int(r.get("id", 0) or 0) == int(id_):
+                    return r
+            except Exception:
+                continue
+        return {}
+
+    def delete_rfi(self, id_: int) -> None:
+        ws = self.ss.worksheet("rfis")
+        rows = ws.get_all_records()
+        for i, r in enumerate(rows, start=2):
+            try:
+                if int(r.get("id", 0) or 0) == int(id_):
+                    ws.delete_rows(i)
+                    return
+            except Exception:
+                continue
+
+
     def open_url_hint(self, rec: dict) -> str | None:
         try: return self.ss.url
         except: return None
@@ -574,6 +754,11 @@ class GoogleSheetsOAuth(StorageBackend):
             "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"
         ])
         self._ensure_ws("feedback", ["created_at","user_id","page","rating","categories","email","message"])
+        self._ensure_ws("rfis", [
+            "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
+            "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
+            "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
+        ])
 
     def load_presets(self) -> dict:
         rows = self.ss.worksheet("presets").get_all_records()
@@ -679,6 +864,81 @@ class GoogleSheetsOAuth(StorageBackend):
         df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
         return df.sort_values("created_at", ascending=False).head(limit)
 
+
+    # ---- RFIs
+    def _next_rfi_id(self) -> int:
+        rows = self.ss.worksheet("rfis").get_all_records()
+        if not rows:
+            return 1
+        try:
+            return max(int(r.get("id", 0) or 0) for r in rows) + 1
+        except Exception:
+            return len(rows) + 1
+
+    def upsert_rfi(self, row: dict) -> int:
+        ws = self.ss.worksheet("rfis")
+        rows = ws.get_all_records()
+        headers = ws.row_values(1)
+        rid = int(row.get("id") or 0)
+        if rid <= 0:
+            rid = self._next_rfi_id()
+            row["id"] = rid
+            row.setdefault("created_at", datetime.utcnow().isoformat())
+        row.setdefault("updated_at", datetime.utcnow().isoformat())
+
+        def as_cells(hs: list[str]):
+            out = []
+            for h in hs:
+                v = row.get(h)
+                if isinstance(v, list):
+                    v = ",".join(map(str, v))
+                out.append("" if v is None else v)
+            return out
+
+        ids = [int(r.get("id", 0) or 0) for r in rows]
+        if rid in ids:
+            idx = ids.index(rid) + 2
+            ws.update(f"A{idx}:{chr(64+len(headers))}{idx}", [as_cells(headers)])
+        else:
+            ws.append_row(as_cells(headers), value_input_option="RAW")
+        return rid
+
+    def list_rfis(self, limit: int = 5000) -> pd.DataFrame:
+        rows = self.ss.worksheet("rfis").get_all_records()
+        if not rows:
+            return pd.DataFrame(columns=[
+                "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
+                "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
+                "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
+            ])
+        df = pd.DataFrame(rows)
+        for c in ["id","schedule_impact_days"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+        if "cost_impact" in df.columns:
+            df["cost_impact"] = pd.to_numeric(df["cost_impact"], errors="coerce").fillna(0.0)
+        return df.sort_values("id", ascending=False).head(int(limit))
+
+    def get_rfi(self, id_: int) -> dict:
+        for r in self.ss.worksheet("rfis").get_all_records():
+            try:
+                if int(r.get("id", 0) or 0) == int(id_):
+                    return r
+            except Exception:
+                continue
+        return {}
+
+    def delete_rfi(self, id_: int) -> None:
+        ws = self.ss.worksheet("rfis")
+        rows = ws.get_all_records()
+        for i, r in enumerate(rows, start=2):
+            try:
+                if int(r.get("id", 0) or 0) == int(id_):
+                    ws.delete_rows(i)
+                    return
+            except Exception:
+                continue
+
     def open_url_hint(self, rec): 
         try: return self.ss.url
         except: return None
@@ -765,8 +1025,35 @@ class MSExcelOAuth(StorageBackend):
         if name != "feedback":
             self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"])
 
+
+    @staticmethod
+    def _col_name(n: int) -> str:
+        """1 -> A, 2 -> B, 27 -> AA"""
+        name = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            name = chr(65 + r) + name
+        return name
+
     def _update_range(self, ws_name: str, start_cell: str, values_2d: list[list]):
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws_name)}/range(address='{start_cell}')"
+        """Patch a 2D array into a worksheet starting at start_cell (e.g., A1)."""
+        m2 = re.match(r"^([A-Z]+)(\d+)$", str(start_cell).upper().strip())
+        if not m2:
+            raise ValueError(f"Bad start_cell: {start_cell}")
+        col_letters, row_str = m2.group(1), m2.group(2)
+        start_row = int(row_str)
+
+        nrows = max(1, len(values_2d))
+        ncols = max(1, max((len(r) for r in values_2d), default=1))
+        start_col_num = 0
+        for ch in col_letters:
+            start_col_num = start_col_num * 26 + (ord(ch) - 64)
+        end_col_num = start_col_num + ncols - 1
+        end_row = start_row + nrows - 1
+        end_cell = f"{self._col_name(end_col_num)}{end_row}"
+        address = f"{col_letters}{start_row}:{end_cell}"
+
+        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws_name)}/range(address='{address}')"
         requests.patch(url, headers=self._hed(), data=json.dumps({"values": values_2d}))
 
     def _append_rows(self, ws_name: str, values_2d: list[list]):
@@ -798,6 +1085,102 @@ class MSExcelOAuth(StorageBackend):
         df = pd.DataFrame(vals[1:], columns=vals[0])
         df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
         return df.sort_values("created_at", ascending=False).head(limit)
+
+
+    # ---- RFIs
+    def upsert_rfi(self, row: dict) -> int:
+        ws = "rfis"
+        headers = [
+            "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
+            "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
+            "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
+        ]
+        self._ensure_worksheet(ws, headers)
+        # Load current
+        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        r = requests.get(url, headers=self._hed()).json()
+        vals = r.get("values", [])
+        existing = vals[1:] if len(vals) > 1 else []
+        id_idx = 0
+        rid = row.get("id")
+        if rid is not None:
+            try:
+                rid = int(rid)
+            except Exception:
+                rid = None
+        if rid is None:
+            # next id
+            mx = 0
+            for rr in existing:
+                try:
+                    mx = max(mx, int(rr[id_idx]))
+                except Exception:
+                    pass
+            rid = mx + 1
+            row["id"] = rid
+        # Build output row values in header order
+        def _get(k):
+            v = row.get(k)
+            if v is None:
+                return ""
+            if isinstance(v, (list, tuple)):
+                return ",".join(str(x) for x in v)
+            return str(v)
+        out_row = [_get(h) for h in headers]
+        # Update if exists
+        found_idx = None
+        for i, rr in enumerate(existing, start=2):
+            try:
+                if int(rr[id_idx]) == int(rid):
+                    found_idx = i
+                    break
+            except Exception:
+                continue
+        if found_idx is None:
+            self._append_rows(ws, [out_row])
+        else:
+            # Update entire row
+            self._update_range(ws, f"A{found_idx}", [out_row])
+        return int(rid)
+
+    def list_rfis(self, limit: int = 5000) -> pd.DataFrame:
+        ws = "rfis"
+        headers = [
+            "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
+            "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
+            "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
+        ]
+        self._ensure_worksheet(ws, headers)
+        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        r = requests.get(url, headers=self._hed()).json()
+        vals = r.get("values", [])
+        if len(vals) <= 1:
+            return pd.DataFrame(columns=headers)
+        df = pd.DataFrame(vals[1:], columns=vals[0])
+        if "id" in df.columns:
+            df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
+        if "schedule_impact_days" in df.columns:
+            df["schedule_impact_days"] = pd.to_numeric(df["schedule_impact_days"], errors="coerce").fillna(0).astype(int)
+        if "cost_impact" in df.columns:
+            df["cost_impact"] = pd.to_numeric(df["cost_impact"], errors="coerce").fillna(0.0)
+        df = df.sort_values(["status","due_date","created_at"], ascending=[True, True, False], kind="stable")
+        return df.head(int(limit))
+
+    def get_rfi(self, id_: int) -> dict:
+        df = self.list_rfis(limit=10000)
+        try:
+            return df[df["id"] == int(id_)].iloc[0].to_dict()
+        except Exception:
+            return {}
+
+    def delete_rfi(self, id_: int) -> None:
+        # Minimal viable (Excel row delete via Graph is non-trivial). Mark as Closed instead.
+        rec = self.get_rfi(id_)
+        if not rec:
+            return
+        rec["status"] = "Closed"
+        rec["updated_at"] = __import__("datetime").datetime.utcnow().isoformat()
+        self.upsert_rfi(rec)
 
     # Presets
     def load_presets(self) -> dict:
@@ -909,6 +1292,21 @@ def db_get_submittal(b: StorageBackend, id_: int) -> dict: return b.get_submitta
 def db_delete_submittal(b: StorageBackend, id_: int): return b.delete_submittal(id_)
 def db_open_url_hint(b: StorageBackend, rec: dict) -> str | None: return b.open_url_hint(rec)
 
+
+# RFI wrappers
+
+def db_upsert_rfi(b: StorageBackend, row: dict) -> int:
+    return b.upsert_rfi(row)
+
+def db_list_rfis(b: StorageBackend, limit: int = 5000) -> pd.DataFrame:
+    return b.list_rfis(limit=limit)
+
+def db_get_rfi(b: StorageBackend, id_: int) -> dict:
+    return b.get_rfi(id_)
+
+def db_delete_rfi(b: StorageBackend, id_: int) -> None:
+    return b.delete_rfi(id_)
+
 # -------------------------
 # Tiny settings helper (piggyback on presets table)
 # -------------------------
@@ -995,6 +1393,169 @@ def send_email(recipients: list[str], subject: str, html_body: str, attachments:
             return False, f"SMTP error: {e}"
 
     return False, "No email provider configured (set sendgrid.api_key or smtp.* in st.secrets)"
+
+
+# -------------------------
+# RFI helpers (PDF + email)
+# -------------------------
+
+def parse_emails(s: str) -> list[str]:
+    parts = re.split(r"[;,\s]+", (s or "").strip())
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if "@" in p and "." in p:
+            out.append(p)
+    # de-dup, preserve order
+    seen = set(); dedup = []
+    for e in out:
+        if e.lower() in seen:
+            continue
+        seen.add(e.lower()); dedup.append(e)
+    return dedup
+
+
+def generate_rfi_pdf(rfi: dict) -> bytes:
+    """Create a simple one-page PDF for an RFI."""
+    try:
+        from reportlab.lib.pagesizes import LETTER
+        from reportlab.pdfgen import canvas
+    except Exception as e:
+        raise RuntimeError("Missing reportlab. Add it to requirements.txt") from e
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=LETTER)
+    w, h = LETTER
+
+    def draw_label_value(y, label, value):
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(40, y, label)
+        c.setFont("Helvetica", 10)
+        c.drawString(150, y, (value or "—")[:120])
+        return y - 14
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, h - 50, "Request for Information (RFI)")
+
+    y = h - 80
+    y = draw_label_value(y, "RFI ID:", str(rfi.get("id") or "—"))
+    y = draw_label_value(y, "Project:", rfi.get("project"))
+    y = draw_label_value(y, "Subject:", rfi.get("subject"))
+    y = draw_label_value(y, "Discipline:", rfi.get("discipline"))
+    y = draw_label_value(y, "Spec Section:", rfi.get("spec_section"))
+    y = draw_label_value(y, "Priority:", rfi.get("priority"))
+    y = draw_label_value(y, "Status:", rfi.get("status"))
+    y = draw_label_value(y, "Due Date:", rfi.get("due_date"))
+    y = draw_label_value(y, "Assignee:", rfi.get("assignee_email"))
+
+    y -= 8
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(40, y, "Question")
+    y -= 14
+    c.setFont("Helvetica", 10)
+
+    question = (rfi.get("question") or "").strip() or "—"
+    # Simple wrapping
+    max_chars = 95
+    lines = []
+    for para in question.splitlines():
+        para = para.strip()
+        if not para:
+            lines.append("")
+            continue
+        while len(para) > max_chars:
+            cut = para.rfind(" ", 0, max_chars)
+            if cut < 20:
+                cut = max_chars
+            lines.append(para[:cut].strip())
+            para = para[cut:].strip()
+        lines.append(para)
+
+    for ln in lines[:35]:
+        c.drawString(50, y, ln)
+        y -= 12
+        if y < 80:
+            break
+
+    c.setFont("Helvetica-Oblique", 8)
+    c.drawString(40, 40, "Generated by Civil Mini-Apps")
+    c.showPage()
+    c.save()
+
+    return buf.getvalue()
+
+
+def rfi_email_html(rfi: dict) -> str:
+    esc = lambda s: (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    q_html = esc(rfi.get("question") or "").replace("\n", "<br/>")
+    return f"""
+    <h3>RFI #{esc(str(rfi.get('id') or ''))} — {esc(rfi.get('subject') or '')}</h3>
+    <p><b>Project:</b> {esc(rfi.get('project') or '')}<br/>
+       <b>Discipline:</b> {esc(rfi.get('discipline') or '')}<br/>
+       <b>Spec Section:</b> {esc(rfi.get('spec_section') or '')}<br/>
+       <b>Priority:</b> {esc(rfi.get('priority') or '')}<br/>
+       <b>Due:</b> {esc(rfi.get('due_date') or '')}</p>
+    <p><b>Question</b><br/>{q_html}</p>
+    <p style='color:#666'>Sent from Civil Mini-Apps</p>
+    """
+
+def apply_rfi_impacts(tasks_df: pd.DataFrame, rfis_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply schedule impact days from open RFIs to a tasks table.
+
+    Expects rfis_df to have columns: related_tasks, schedule_impact_days, status, id.
+    Returns: (modified tasks_df, impacts_df)
+    """
+    if tasks_df is None or tasks_df.empty:
+        return tasks_df, pd.DataFrame()
+    if rfis_df is None or rfis_df.empty:
+        return tasks_df, pd.DataFrame()
+
+    tasks = tasks_df.copy()
+    if "RFI_Impact_Days" not in tasks.columns:
+        tasks["RFI_Impact_Days"] = 0
+
+    impacts = []
+    for _, r in rfis_df.iterrows():
+        try:
+            days = int(float(r.get("schedule_impact_days") or 0))
+        except Exception:
+            days = 0
+        if days <= 0:
+            continue
+        rel = str(r.get("related_tasks") or "").strip()
+        if not rel:
+            continue
+        task_names = [t.strip() for t in rel.split(",") if t.strip()]
+        if not task_names:
+            continue
+
+        # Distribute evenly (integer days) across listed tasks.
+        per = max(1, days // len(task_names))
+        remainder = days - per * len(task_names)
+
+        for i, tname in enumerate(task_names):
+            add = per + (1 if i < remainder else 0)
+            mask = tasks["Task"].astype(str) == tname
+            if mask.any():
+                tasks.loc[mask, "RFI_Impact_Days"] = tasks.loc[mask, "RFI_Impact_Days"] + add
+                impacts.append({
+                    "rfi_id": r.get("id"),
+                    "task": tname,
+                    "added_days": add,
+                    "status": r.get("status"),
+                    "subject": r.get("subject"),
+                })
+
+    if impacts:
+        # Preserve original duration if needed
+        if "Duration_Base" not in tasks.columns:
+            tasks["Duration_Base"] = tasks["Duration"]
+        tasks["Duration"] = (pd.to_numeric(tasks["Duration"], errors="coerce").fillna(0).astype(int) +
+                              pd.to_numeric(tasks["RFI_Impact_Days"], errors="coerce").fillna(0).astype(int))
+
+    return tasks, pd.DataFrame(impacts)
 
 # -------------------------
 # Feedback digest (pull, filter, summarize)
@@ -1124,7 +1685,8 @@ Built by a civil engineering student for practical use in the field.
 
 with st.sidebar.expander("Leave feedback", expanded=False):
     _cur_page = st.session_state.get("__page__", "Submittal Checker")
-    fb_page = st.selectbox("Which page?", ["Submittal Checker", "Schedule What-Ifs"], index=(0 if _cur_page=="Submittal Checker" else 1))
+    pages_for_fb = ["Submittal Checker", "Schedule What-Ifs", "RFI Manager", "Aging Dashboard"]
+    fb_page = st.selectbox("Which page?", pages_for_fb, index=(pages_for_fb.index(_cur_page) if _cur_page in pages_for_fb else 0))
     fb_rating = st.slider("Overall rating", 1, 5, 5, help="5 = great; 1 = needs work")
     fb_cats = st.multiselect(
         "What applies?",
@@ -1899,6 +2461,29 @@ def schedule_whatifs_page():
     if "Overlap_OK" in edited_df.columns: edited_df["Overlap_OK"] = edited_df["Overlap_OK"].fillna(False).astype(bool)
     else: edited_df["Overlap_OK"] = False
 
+    # Optional: apply schedule impacts from open RFIs
+    apply_rfi = st.checkbox("Apply open RFI schedule impacts", value=False, help="Adds Schedule_Impact_Days from open RFIs to linked tasks (Related_Tasks).")
+    edited_df_use = edited_df
+    if apply_rfi:
+        try:
+            rfis = db_list_rfis(backend, limit=5000)
+            if not rfis.empty:
+                impacts_src = rfis.copy()
+                impacts_src["schedule_impact_days"] = pd.to_numeric(impacts_src.get("schedule_impact_days", 0), errors="coerce").fillna(0).astype(int)
+                impacts_src["status"] = impacts_src.get("status", "").astype(str)
+                open_mask = ~impacts_src["status"].str.lower().isin(["closed", "cancelled"])
+                impacts_src = impacts_src[open_mask & (impacts_src["schedule_impact_days"] > 0)]
+                edited_df_use, impacts_applied = apply_rfi_impacts(edited_df, impacts_src)
+                if impacts_applied.empty:
+                    st.info("No open RFIs with schedule impact days to apply.")
+                else:
+                    st.success(f"Applied RFI impacts to {impacts_applied['Task'].nunique()} task(s).")
+                    df_fullwidth(impacts_applied, hide_index=True, height=rows_to_height(len(impacts_applied)+2))
+            else:
+                st.info("No RFIs found in the current storage backend.")
+        except Exception as e:
+            st.warning(f"Could not apply RFI impacts: {e}")
+
     st.markdown("---")
     left, right = st.columns([1,1])
     with left:
@@ -1936,7 +2521,7 @@ def schedule_whatifs_page():
             if missing:
                 st.error(f"Missing required columns: {missing}"); st.stop()
 
-            base_schedule, base_days = cpm_schedule(edited_df, overlap_frac, clamp_ff)
+            base_schedule, base_days = cpm_schedule(edited_df_use, overlap_frac, clamp_ff)
             if cal_mode: base_schedule = calendarize(base_schedule, proj_start, cbd)
 
             st.success(f"Baseline duration: {base_days} days")
@@ -1945,74 +2530,35 @@ def schedule_whatifs_page():
             chart_fullwidth(gantt_chart(base_schedule))
 
             # Simple greedy crash loop
-            # --- replace these three functions in Schedule What-Ifs section ---
+            def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
+                crit = schedule[schedule["Critical"]]
+                if crit.empty: return None
+                merged = crit.merge(
+                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
+                    on="Task", how="left"
+                )
+                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
+                can = merged[merged["Duration"] > merged["Min_Duration"]]
+                if can.empty: return None
+                can = can.sort_values(["slope","ES"], kind="stable")
+                return str(can.iloc[0]["Task"])
 
-    def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
-        """
-        Pick the next task to crash:
-          - only tasks currently on the critical path
-          - only tasks whose current Duration > Min_Duration
-          - choose lowest cost slope, then earliest ES as tie-breaker
-        """
-        crit = schedule[schedule["Critical"]].copy()
-        if crit.empty:
-            return None
-    
-        # Bring in cfg columns; keep schedule columns un-suffixed
-        merged = crit.merge(
-            df_cfg[["Task", "Duration", "Min_Duration", "Normal_Cost_per_day", "Crash_Cost_per_day"]],
-            on="Task",
-            how="left",
-            suffixes=("", "_cfg")
-        )
-    
-        # We want the **cfg** durations (editable table) for crash decisions
-        if "Duration_cfg" not in merged or "Min_Duration" not in merged:
-            return None  # safety
-    
-        merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
-    
-        can = merged[merged["Duration_cfg"] > merged["Min_Duration"]]
-        if can.empty:
-            return None
-    
-        can = can.sort_values(["slope", "ES"], kind="stable")
-        return str(can.iloc[0]["Task"])
-    
-    
-    def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
-        """Reduce chosen task’s duration by 1 day, respecting Min_Duration."""
-        new = df_cfg.copy()
-        mask = new["Task"] == task
-        # clamp at Min_Duration so it never goes below
-        new.loc[mask, "Duration"] = np.maximum(
-            (new.loc[mask, "Duration"] - 1).astype(int),
-            new.loc[mask, "Min_Duration"].astype(int)
-        )
-        return new
-    
-    
-    def total_cost(df_cfg: pd.DataFrame) -> float:
-        """
-        Approximate total daily cost:
-          baseline = sum(Normal/day * baseline_duration)
-          added cost = (crashed_days * (Crash/day - Normal/day))
-        """
-        base_dur = df_cfg.get("_baseline_duration", df_cfg["Duration"]).astype(float)
-        normal = df_cfg["Normal_Cost_per_day"].astype(float)
-        crash  = df_cfg["Crash_Cost_per_day"].astype(float)
-    
-        baseline_cost = float((normal * base_dur).sum())
-        crashed_days  = (base_dur - df_cfg["Duration"].astype(float)).clip(lower=0.0)
-        added_cost    = (crashed_days * (crash - normal).clip(lower=0.0)).sum()
-        return float(baseline_cost + added_cost)
+            def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
+                new = df_cfg.copy()
+                new.loc[new["Task"]==task, "Duration"] = new.loc[new["Task"]==task, "Duration"] - 1
+                return new
 
+            def total_cost(df_cfg: pd.DataFrame) -> float:
+                baseline = (df_cfg["Normal_Cost_per_day"] * df_cfg["Duration"].round(0)).sum()
+                crashed_days = (df_cfg.get("_baseline_duration", df_cfg["Duration"]) - df_cfg["Duration"]).clip(lower=0)
+                slope = (df_cfg["Crash_Cost_per_day"] - df_cfg["Normal_Cost_per_day"]).clip(lower=0)
+                return float(baseline + (crashed_days * slope).sum())
 
             if run_crash:
                 if target_days >= base_days:
                     st.info("Target ≥ baseline; nothing to crash.")
                 else:
-                    df_cfg = edited_df.copy()
+                    df_cfg = edited_df_use.copy()
                     df_cfg["_baseline_duration"] = df_cfg["Duration"]
                     log = []
                     schedule, cur = cpm_schedule(df_cfg, overlap_frac, clamp_ff)
@@ -2025,8 +2571,8 @@ def schedule_whatifs_page():
 
                     crashed_schedule, final_days = schedule, cur
                     if cal_mode: crashed_schedule = calendarize(crashed_schedule, proj_start, cbd)
-                    edited_df["_baseline_duration"] = edited_df["Duration"]; base_cost = total_cost(edited_df)
-                    df_cfg["_baseline_duration"] = edited_df["Duration"]; crash_cost = total_cost(df_cfg)
+                    edited_df_use["_baseline_duration"] = edited_df_use["Duration"]; base_cost = total_cost(edited_df_use)
+                    df_cfg["_baseline_duration"] = edited_df_use["Duration"]; crash_cost = total_cost(df_cfg)
 
                     st.markdown("### Crashed Scenario")
                     st.success(f"New duration: {final_days} days (target: {target_days})")
@@ -2045,15 +2591,356 @@ def schedule_whatifs_page():
         except Exception as e:
             st.exception(e)
 
+
+
+# =========================
+# RFI Manager (page)
+# =========================
+
+def rfi_manager_page():
+    st.header("RFI Manager")
+    st.caption("Create, send, and track RFIs. RFIs are stored in the selected backend.")
+
+    # Load
+    rfis = db_list_rfis(backend, limit=5000)
+    if rfis.empty:
+        rfis = pd.DataFrame(columns=[
+            "id","created_at","updated_at","user_id","project","subject","question","discipline",
+            "spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails",
+            "related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes",
+        ])
+
+    # New RFI form
+    with st.expander("Create new RFI", expanded=True):
+        with st.form("new_rfi_form"):
+            c1, c2, c3 = st.columns(3)
+            project = c1.text_input("Project", value="")
+            discipline = c2.selectbox("Discipline", ["General","Civil","Structural","MEP","Geotech","Traffic","Environmental","Other"], index=0)
+            priority = c3.selectbox("Priority", ["Low","Normal","High","Urgent"], index=1)
+
+            subject = st.text_input("Subject")
+            spec_section = st.text_input("Spec / Drawing Ref (optional)", placeholder="e.g., 03 30 00 / S-201")
+            question = st.text_area("Question / Clarification needed", height=160)
+
+            c4, c5, c6 = st.columns(3)
+            due_date = c4.date_input("Due date (optional)", value=None)
+            assignee_email = c5.text_input("Assignee (optional)", placeholder="pm@company.com")
+            to_emails = c6.text_input("To (emails)", placeholder="architect@firm.com; engineer@firm.com")
+
+            cc_emails = st.text_input("CC (emails)", placeholder="super@company.com")
+
+            st.markdown("**Schedule impact (optional)**")
+            c7, c8, c9 = st.columns(3)
+            related_tasks = c7.text_input("Related schedule task(s)", placeholder="B - Foundations; C - Structure")
+            schedule_impact_days = c8.number_input("Potential delay (days)", min_value=0, step=1, value=0)
+            cost_impact = c9.number_input("Potential cost impact ($)", min_value=0.0, step=1000.0, value=0.0)
+
+            thread_notes = st.text_area("Notes / Thread", height=100)
+
+            create = st.form_submit_button("Save draft")
+
+        if create:
+            if not project.strip() or not subject.strip() or not question.strip():
+                st.warning("Project, Subject, and Question are required.")
+            else:
+                rfi_id = db_upsert_rfi(backend, {
+                    "id": None,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat(),
+                    "user_id": _current_user_label(),
+                    "project": project.strip(),
+                    "subject": subject.strip(),
+                    "question": question.strip(),
+                    "discipline": discipline,
+                    "spec_section": spec_section.strip() or None,
+                    "priority": priority,
+                    "status": "Draft",
+                    "due_date": str(due_date) if due_date else None,
+                    "assignee_email": assignee_email.strip() or None,
+                    "to_emails": ";".join(parse_emails(to_emails)),
+                    "cc_emails": ";".join(parse_emails(cc_emails)),
+                    "related_tasks": related_tasks.strip() or None,
+                    "schedule_impact_days": int(schedule_impact_days or 0),
+                    "cost_impact": float(cost_impact or 0.0),
+                    "last_sent_at": None,
+                    "last_reminded_at": None,
+                    "last_response_at": None,
+                    "thread_notes": thread_notes.strip() or None,
+                })
+                st.success(f"Saved draft RFI #{rfi_id}.")
+                st.rerun()
+
+    st.markdown("---")
+    st.subheader("RFI List")
+
+    # Filters
+    f1, f2, f3, f4 = st.columns([0.28,0.24,0.24,0.24])
+    proj_opts = ["All"] + sorted([p for p in rfis.get("project", pd.Series(dtype=str)).dropna().unique().tolist() if str(p).strip()])
+    status_opts = ["All","Draft","Sent","Answered","Closed"]
+    prio_opts = ["All","Low","Normal","High","Urgent"]
+
+    f_project = f1.selectbox("Project", proj_opts, index=0)
+    f_status = f2.selectbox("Status", status_opts, index=0)
+    f_priority = f3.selectbox("Priority", prio_opts, index=0)
+    search = f4.text_input("Search", placeholder="subject / spec / keyword")
+
+    view = rfis.copy()
+    if f_project != "All":
+        view = view[view["project"] == f_project]
+    if f_status != "All":
+        view = view[view["status"] == f_status]
+    if f_priority != "All":
+        view = view[view["priority"] == f_priority]
+    if search.strip():
+        s = search.strip().lower()
+        hay = (view.get("subject","").astype(str) + " " + view.get("question","").astype(str) + " " + view.get("spec_section","").astype(str)).str.lower()
+        view = view[hay.str.contains(re.escape(s), regex=True, na=False)]
+
+    # Quick metrics
+    def _age_days(ts):
+        try:
+            return (pd.Timestamp.utcnow() - pd.to_datetime(ts, errors="coerce")).days
+        except Exception:
+            return None
+
+    open_mask = view.get("status", "").isin(["Draft","Sent","Answered"]) if not view.empty else pd.Series([], dtype=bool)
+    overdue = 0
+    if not view.empty and "due_date" in view.columns:
+        dd = pd.to_datetime(view["due_date"], errors="coerce")
+        overdue = int(((dd.notna()) & (dd.dt.date < datetime.utcnow().date()) & open_mask).sum())
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Open RFIs", int(open_mask.sum()) if len(open_mask) else 0)
+    m2.metric("Overdue", overdue)
+    m3.metric("Total", len(view))
+
+    # Display table
+    show_cols = ["id","project","subject","status","priority","due_date","last_sent_at","last_response_at","schedule_impact_days","related_tasks"]
+    for c in show_cols:
+        if c not in view.columns:
+            view[c] = None
+    df_fullwidth(view[show_cols].sort_values("id", ascending=False, kind="stable"), hide_index=True, height=rows_to_height(min(len(view)+5, 60)))
+
+    st.markdown("---")
+    st.subheader("Open / Edit an RFI")
+    rid = st.number_input("RFI ID", min_value=0, step=1, value=0)
+    if rid and st.button("Load RFI"):
+        st.session_state["__rfi_edit_id__"] = int(rid)
+        st.rerun()
+
+    edit_id = st.session_state.get("__rfi_edit_id__")
+    if edit_id:
+        rfi = db_get_rfi(backend, int(edit_id)) or {}
+        if not rfi:
+            st.warning("RFI not found.")
+        else:
+            with st.expander(f"Editing RFI #{edit_id}", expanded=True):
+                c1, c2, c3 = st.columns(3)
+                project = c1.text_input("Project", value=rfi.get("project") or "")
+                discipline = c2.text_input("Discipline", value=rfi.get("discipline") or "")
+                priority = c3.selectbox("Priority", ["Low","Normal","High","Urgent"], index=["Low","Normal","High","Urgent"].index(rfi.get("priority") or "Normal"))
+
+                subject = st.text_input("Subject", value=rfi.get("subject") or "")
+                spec_section = st.text_input("Spec / Drawing Ref", value=rfi.get("spec_section") or "")
+                question = st.text_area("Question", value=rfi.get("question") or "", height=160)
+
+                c4, c5, c6 = st.columns(3)
+                status = c4.selectbox("Status", ["Draft","Sent","Answered","Closed"], index=["Draft","Sent","Answered","Closed"].index(rfi.get("status") or "Draft"))
+                due = c5.text_input("Due date (YYYY-MM-DD)", value=rfi.get("due_date") or "")
+                assignee_email = c6.text_input("Assignee", value=rfi.get("assignee_email") or "")
+
+                to_emails = st.text_input("To", value=rfi.get("to_emails") or "")
+                cc_emails = st.text_input("CC", value=rfi.get("cc_emails") or "")
+
+                c7, c8, c9 = st.columns(3)
+                related_tasks = c7.text_input("Related tasks", value=rfi.get("related_tasks") or "")
+                impact_days = c8.number_input("Schedule impact days", min_value=0, step=1, value=int(rfi.get("schedule_impact_days") or 0))
+                cost_impact = c9.number_input("Cost impact ($)", min_value=0.0, step=1000.0, value=float(rfi.get("cost_impact") or 0.0))
+
+                thread_notes = st.text_area("Notes / Thread", value=rfi.get("thread_notes") or "", height=120)
+
+                b1, b2, b3, b4 = st.columns([0.25,0.25,0.25,0.25])
+
+                if b1.button("Save changes"):
+                    rfi.update({
+                        "updated_at": datetime.utcnow().isoformat(),
+                        "user_id": rfi.get("user_id") or _current_user_label(),
+                        "project": project.strip(),
+                        "discipline": discipline.strip() or None,
+                        "priority": priority,
+                        "subject": subject.strip(),
+                        "spec_section": spec_section.strip() or None,
+                        "question": question.strip(),
+                        "status": status,
+                        "due_date": due.strip() or None,
+                        "assignee_email": assignee_email.strip() or None,
+                        "to_emails": ";".join(parse_emails(to_emails)),
+                        "cc_emails": ";".join(parse_emails(cc_emails)),
+                        "related_tasks": related_tasks.strip() or None,
+                        "schedule_impact_days": int(impact_days or 0),
+                        "cost_impact": float(cost_impact or 0.0),
+                        "thread_notes": thread_notes.strip() or None,
+                    })
+                    db_upsert_rfi(backend, rfi)
+                    st.success("Saved.")
+                    st.rerun()
+
+                # PDF download
+                pdf_bytes = generate_rfi_pdf(rfi)
+                b2.download_button("Download PDF", pdf_bytes, file_name=f"RFI_{edit_id}.pdf", mime="application/pdf")
+
+                # Send email
+                attach_pdf = st.checkbox("Attach PDF when emailing", value=True)
+                if b3.button("Send / Re-send email"):
+                    to_list = parse_emails(rfi.get("to_emails") or "")
+                    cc_list = parse_emails(rfi.get("cc_emails") or "")
+                    recips = to_list + cc_list
+                    if not recips:
+                        st.warning("Add at least one recipient in To/CC.")
+                    else:
+                        subj = f"RFI #{edit_id}: {rfi.get('subject') or ''}"
+                        html = rfi_email_html(rfi)
+                        atts = [(f"RFI_{edit_id}.pdf", pdf_bytes)] if attach_pdf else None
+                        ok, msg = send_email(recips, subj, html, attachments=atts)
+                        if ok:
+                            rfi["status"] = "Sent" if rfi.get("status") in (None, "Draft") else rfi.get("status")
+                            rfi["last_sent_at"] = datetime.utcnow().isoformat()
+                            rfi["updated_at"] = datetime.utcnow().isoformat()
+                            db_upsert_rfi(backend, rfi)
+                            st.success(f"Email sent ({msg}).")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+                if b4.button("Delete RFI"):
+                    db_delete_rfi(backend, int(edit_id))
+                    st.session_state.pop("__rfi_edit_id__", None)
+                    st.success("Deleted.")
+                    st.rerun()
+
+
+# =========================
+# Aging Dashboard (page)
+# =========================
+
+def aging_dashboard_page():
+    st.header("Aging Dashboard")
+    st.caption("Spot lagging submittals and RFIs. Use this as a lightweight 'PM pulse' panel.")
+
+    # Tunables
+    c1, c2, c3 = st.columns(3)
+    submittal_lag_days = c1.number_input("Flag submittals older than (days)", min_value=1, value=14, step=1)
+    rfi_remind_after = c2.number_input("Remind on RFIs after (days since last sent)", min_value=1, value=7, step=1)
+    rfi_overdue_grace = c3.number_input("Overdue grace (days)", min_value=0, value=0, step=1)
+
+    st.markdown("---")
+    st.subheader("Submittal Runs (Memory Bank)")
+
+    bank = db_list_submittals(backend)
+    if bank.empty:
+        st.info("No saved submittal runs yet.")
+    else:
+        # age from date_submitted if present, otherwise created_at
+        dt = pd.to_datetime(bank.get("date_submitted"), errors="coerce")
+        created = pd.to_datetime(bank.get("created_at"), errors="coerce")
+        base = dt.fillna(created)
+        bank = bank.copy()
+        bank["Age_days"] = (pd.Timestamp.utcnow() - base).dt.days
+        lag = bank[bank["Age_days"] >= int(submittal_lag_days)].copy()
+        st.metric("Lagging runs", len(lag))
+        df_fullwidth(lag.sort_values(["Age_days","created_at"], ascending=[False,False], kind="stable"), hide_index=True, height=rows_to_height(min(len(lag)+6, 50)))
+
+    st.markdown("---")
+    st.subheader("RFIs")
+    rfis = db_list_rfis(backend, limit=5000)
+    if rfis.empty:
+        st.info("No RFIs yet.")
+        return
+
+    rfis = rfis.copy()
+    rfis["created_at_dt"] = pd.to_datetime(rfis.get("created_at"), errors="coerce")
+    rfis["last_sent_at_dt"] = pd.to_datetime(rfis.get("last_sent_at"), errors="coerce")
+    rfis["due_dt"] = pd.to_datetime(rfis.get("due_date"), errors="coerce")
+
+    open_mask = rfis.get("status","").isin(["Draft","Sent","Answered"])  # treat Answered as open until Closed
+    open_rfis = rfis[open_mask].copy()
+
+    # derived ages
+    open_rfis["Age_days"] = (pd.Timestamp.utcnow() - open_rfis["created_at_dt"]).dt.days
+    open_rfis["Days_since_sent"] = (pd.Timestamp.utcnow() - open_rfis["last_sent_at_dt"]).dt.days
+
+    overdue_mask = open_rfis["due_dt"].notna() & ((open_rfis["due_dt"].dt.date + pd.to_timedelta(rfi_overdue_grace, unit='D')).dt.date < datetime.utcnow().date())
+    remind_mask = open_rfis["last_sent_at_dt"].notna() & (open_rfis["Days_since_sent"] >= int(rfi_remind_after))
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Open RFIs", len(open_rfis))
+    m2.metric("Overdue", int(overdue_mask.sum()))
+    m3.metric("Need reminder", int(remind_mask.sum()))
+
+    show = open_rfis.copy()
+    show["Overdue"] = overdue_mask
+    show["Needs_Reminder"] = remind_mask
+
+    show_cols = ["id","project","subject","status","priority","due_date","Age_days","Days_since_sent","Overdue","Needs_Reminder","assignee_email","to_emails"]
+    for c in show_cols:
+        if c not in show.columns:
+            show[c] = None
+    df_fullwidth(show[show_cols].sort_values(["Overdue","Needs_Reminder","Age_days"], ascending=[False,False,False], kind="stable"), hide_index=True, height=rows_to_height(min(len(show)+6, 70)))
+
+    st.markdown("### Reminder sending")
+    st.caption("Reminders send via your configured email provider (SendGrid/SMTP).")
+
+    attach_pdf = st.checkbox("Attach RFI PDF to reminders", value=False)
+    reminder_cc_owner = st.text_input("CC me (optional)", value="")
+
+    if st.button("Send reminders to flagged RFIs"):
+        if not remind_mask.any():
+            st.info("No RFIs currently meet the reminder rule.")
+        else:
+            sent = 0
+            failed = 0
+            for _, r in open_rfis[remind_mask].iterrows():
+                rfi = db_get_rfi(backend, int(r["id"])) or r.to_dict()
+                recips = parse_emails(rfi.get("to_emails") or "")
+                recips += parse_emails(rfi.get("cc_emails") or "")
+                recips += parse_emails(reminder_cc_owner)
+                recips = list(dict.fromkeys(recips))
+                if not recips:
+                    continue
+
+                subj = f"Reminder: RFI #{rfi.get('id')}: {rfi.get('subject') or ''}"
+                html = rfi_email_html(rfi) + "<p><i>Reminder:</i> Please respond when you can. Thank you.</p>"
+                atts = None
+                if attach_pdf:
+                    try:
+                        atts = [(f"RFI_{rfi.get('id')}.pdf", generate_rfi_pdf(rfi))]
+                    except Exception:
+                        atts = None
+
+                ok, msg = send_email(recips, subj, html, attachments=atts)
+                if ok:
+                    sent += 1
+                    rfi["last_reminded_at"] = datetime.utcnow().isoformat()
+                    rfi["updated_at"] = datetime.utcnow().isoformat()
+                    db_upsert_rfi(backend, rfi)
+                else:
+                    failed += 1
+            st.success(f"Reminders sent: {sent}. Failed: {failed}.")
+
 # =========================
 # App Navigation
 # =========================
-page = st.sidebar.radio("Pages", ["Submittal Checker", "Schedule What-Ifs"], index=0)
+PAGES = ["Submittal Checker", "Schedule What-Ifs", "RFI Manager", "Aging Dashboard"]
+page = st.sidebar.radio("Pages", PAGES, index=0)
 st.session_state["__page__"] = page
 if page == "Submittal Checker":
     submittal_checker_page()
-else:
+elif page == "Schedule What-Ifs":
     schedule_whatifs_page()
+elif page == "RFI Manager":
+    rfi_manager_page()
+else:
+    aging_dashboard_page()
 
 # =========================
 # README (quick)
