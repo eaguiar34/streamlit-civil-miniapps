@@ -1,12 +1,13 @@
-# python
 __pycache__/
-*.pyc
+.pytest_cache/
 .venv/
-venv/
-
-# streamlit
+.DS_Store
+.env
 .streamlit/secrets.toml
-
-# local data
-data/
-checker.db
+*.pyc
+*.pyo
+*.pyd
+dist/
+build/
+.idea/
+.vscode/
