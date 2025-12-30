@@ -2531,17 +2531,17 @@ def schedule_whatifs_page():
 
             # Simple greedy crash loop
             def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
-                crit = schedule[schedule["Critical"]]
-                if crit.empty: return None
-                merged = crit.merge(
-                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
-                    on="Task", how="left"
-                )
-                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
-                can = merged[merged["Duration"] > merged["Min_Duration"]]
-                if can.empty: return None
-                can = can.sort_values(["slope","ES"], kind="stable")
-                return str(can.iloc[0]["Task"])
+-                crit = schedule[schedule["Critical"]]
+-                if crit.empty: return None
+-                merged = crit.merge(
+-                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
+-                    on="Task", how="left"
+-                )
+-                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
+-                can = merged[merged["Duration"] > merged["Min_Duration"]]
+-                if can.empty: return None
+-                can = can.sort_values(["slope","ES"], kind="stable")
+-                return str(can.iloc[0]["Task"])
 
             def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
                 new = df_cfg.copy()
