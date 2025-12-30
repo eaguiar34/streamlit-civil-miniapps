@@ -2821,7 +2821,7 @@ def rfi_manager_page():
                 links = [u.strip() for u in (links_raw or "").splitlines() if u.strip()]
                 db_add_rfi_links(backend, rfi_id, links)
                 db_add_rfi_attachments(backend, rfi_id, attachments_files or [])
-st.success(f"Saved draft RFI #{rfi_id}.")
+    st.success(f"Saved draft RFI #{rfi_id}.")
     st.rerun()
 
     st.markdown("---")
