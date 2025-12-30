@@ -109,13 +109,6 @@ def bm25_scores(query: str, docs: list[str]) -> list[float]:
 # App bootstrap
 # =========================
 st.set_page_config(page_title="FieldFlow", layout="wide")
-# Sidebar layout helper: keep "footer" sections at the bottom
-st.markdown("""
-<style>
-[data-testid="stSidebar"] > div:first-child {display: flex; flex-direction: column; height: 100vh;}
-.sidebar-spacer {flex: 1 1 auto;}
-</style>
-""", unsafe_allow_html=True)
 
 # ---------- Width shims (handles Streamlit deprecations gracefully)
 def df_fullwidth(df, **kwargs):
@@ -1665,18 +1658,14 @@ except Exception as e:
     st.sidebar.error(f"Backend error: {e}")
     backend = get_backend(BACKEND_SQLITE)
 
-=========================
+
+# =========================
+
 # Sidebar: Pages
-# =========================
 PAGES = ["Submittal Checker", "Schedule What-Ifs", "RFI Manager", "Aging Dashboard"]
-if "__page__" not in st.session_state:
-    st.session_state["__page__"] = PAGES[0]
-page = st.sidebar.radio("Pages", PAGES, key="__page__")
+page = st.sidebar.radio("Pages", PAGES, index=0, key="__page__")
+st.sidebar.divider()
 
-# Spacer pushes the sections below toward the bottom
-st.sidebar.markdown("<div class='sidebar-spacer'></div>", unsafe_allow_html=True)
-
-# =========================
 # Sidebar: About + Feedback
 # =========================
 
@@ -2548,17 +2537,21 @@ def schedule_whatifs_page():
 
             # Simple greedy crash loop
             def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
--                crit = schedule[schedule["Critical"]]
--                if crit.empty: return None
--                merged = crit.merge(
--                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
--                    on="Task", how="left"
--                )
--                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
--                can = merged[merged["Duration"] > merged["Min_Duration"]]
--                if can.empty: return None
--                can = can.sort_values(["slope","ES"], kind="stable")
--                return str(can.iloc[0]["Task"])
+                crit = schedule[schedule["Critical"]]
+                if crit.empty: return None
+                merged = crit.merge(
+                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
+                    on="Task", how="left", suffixes=("_sched","_cfg")
+                )
+                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
+                # After merge, pandas suffixes duplicate column names (e.g., Duration -> Duration_sched/Duration_cfg).
+                dur_col = "Duration_cfg" if "Duration_cfg" in merged.columns else "Duration"
+                merged[dur_col] = pd.to_numeric(merged[dur_col], errors="coerce")
+                merged["Min_Duration"] = pd.to_numeric(merged["Min_Duration"], errors="coerce")
+                can = merged[merged[dur_col] > merged["Min_Duration"]]
+                if can.empty: return None
+                can = can.sort_values(["slope","ES"], kind="stable")
+                return str(can.iloc[0]["Task"])
 
             def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
                 new = df_cfg.copy()
@@ -2948,17 +2941,14 @@ def aging_dashboard_page():
 # App Navigation
 # =========================
 page = st.session_state.get("__page__", "Submittal Checker")
-
 if page == "Submittal Checker":
     submittal_checker_page()
 elif page == "Schedule What-Ifs":
     schedule_whatifs_page()
 elif page == "RFI Manager":
     rfi_manager_page()
-elif page == "Aging Dashboard":
-    aging_dashboard_page()
 else:
-    submittal_checker_page()
+    aging_dashboard_page()
 
 # =========================
 # README (quick)
