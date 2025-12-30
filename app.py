@@ -2822,7 +2822,7 @@ def rfi_manager_page():
                 db_add_rfi_links(backend, rfi_id, links)
                 db_add_rfi_attachments(backend, rfi_id, attachments_files or [])
 st.success(f"Saved draft RFI #{rfi_id}.")
-                st.rerun()
+    st.rerun()
 
     st.markdown("---")
     st.subheader("RFI List")
