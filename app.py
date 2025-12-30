@@ -181,6 +181,66 @@ class StorageBackend:
     def list_submittals(self) -> pd.DataFrame: ...
     def get_submittal(self, id_: int) -> dict: ...
     def delete_submittal(self, id_: int) -> None: ...
+
+    # --- RFI links / attachments (stored locally in SQLite) -----------------
+
+    def add_rfi_link(self, rfi_id: int, url: str, label: Optional[str] = None) -> int:
+        url = (url or "").strip()
+        if not url:
+            return -1
+        cur = self.con.execute(
+            "INSERT INTO rfi_links (rfi_id, url, label, created_at) VALUES (?,?,?,?)",
+            (int(rfi_id), url, label, utc_now_iso()),
+        )
+        self.con.commit()
+        return int(cur.lastrowid)
+
+    def list_rfi_links(self, rfi_id: int) -> List[Dict[str, Any]]:
+        cur = self.con.execute(
+            "SELECT id, rfi_id, url, label, created_at FROM rfi_links WHERE rfi_id=? ORDER BY id DESC",
+            (int(rfi_id),),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def delete_rfi_link(self, link_id: int) -> None:
+        self.con.execute("DELETE FROM rfi_links WHERE id=?", (int(link_id),))
+        self.con.commit()
+
+    def add_rfi_attachment(self, rfi_id: int, filename: str, mime_type: str, content: bytes) -> int:
+        filename = (filename or "attachment").strip() or "attachment"
+        mime_type = (mime_type or "").strip() or None
+        content = content or b""
+        cur = self.con.execute(
+            "INSERT INTO rfi_attachments (rfi_id, filename, mime_type, content, size_bytes, created_at) VALUES (?,?,?,?,?,?)",
+            (int(rfi_id), filename, mime_type, sqlite3.Binary(content), int(len(content)), utc_now_iso()),
+        )
+        self.con.commit()
+        return int(cur.lastrowid)
+
+    def list_rfi_attachments(self, rfi_id: int) -> List[Dict[str, Any]]:
+        cur = self.con.execute(
+            "SELECT id, rfi_id, filename, mime_type, size_bytes, created_at FROM rfi_attachments WHERE rfi_id=? ORDER BY id DESC",
+            (int(rfi_id),),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_rfi_attachment(self, attachment_id: int) -> Optional[Dict[str, Any]]:
+        cur = self.con.execute(
+            "SELECT id, rfi_id, filename, mime_type, size_bytes, created_at, content FROM rfi_attachments WHERE id=?",
+            (int(attachment_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+    def delete_rfi_attachment(self, attachment_id: int) -> None:
+        self.con.execute("DELETE FROM rfi_attachments WHERE id=?", (int(attachment_id),))
+        self.con.commit()
+
     def open_url_hint(self, rec: dict) -> str | None: ...
 
     # NEW
@@ -254,7 +314,28 @@ class SQLiteBackend(StorageBackend):
             last_response_at TEXT,
             response_text TEXT,
             notes TEXT
-        )""")
+        )
+
+            CREATE TABLE IF NOT EXISTS rfi_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rfi_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                label TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(rfi_id) REFERENCES rfis(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS rfi_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rfi_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                mime_type TEXT,
+                content BLOB NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(rfi_id) REFERENCES rfis(id) ON DELETE CASCADE
+            );
+""")
         con.commit()
         self.con = con
 
@@ -1306,6 +1387,53 @@ def db_get_rfi(b: StorageBackend, id_: int) -> dict:
 
 def db_delete_rfi(b: StorageBackend, id_: int) -> None:
     return b.delete_rfi(id_)
+
+
+# RFI links / attachments (best-effort: supported by Local SQLite)
+
+def db_add_rfi_links(b: StorageBackend, rfi_id: int, urls: List[str]) -> None:
+    fn = getattr(b, "add_rfi_link", None)
+    if not callable(fn):
+        return
+    for u in urls or []:
+        u = (u or "").strip()
+        if u:
+            fn(int(rfi_id), u, None)
+
+def db_list_rfi_links(b: StorageBackend, rfi_id: int) -> List[Dict[str, Any]]:
+    fn = getattr(b, "list_rfi_links", None)
+    return fn(int(rfi_id)) if callable(fn) else []
+
+def db_delete_rfi_link(b: StorageBackend, link_id: int) -> None:
+    fn = getattr(b, "delete_rfi_link", None)
+    if callable(fn):
+        fn(int(link_id))
+
+def db_add_rfi_attachments(b: StorageBackend, rfi_id: int, files: List[Any]) -> None:
+    fn = getattr(b, "add_rfi_attachment", None)
+    if not callable(fn):
+        return
+    for f in files or []:
+        if f is None:
+            continue
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        fn(int(rfi_id), getattr(f, "name", "attachment"), getattr(f, "type", "") or "", data)
+
+def db_list_rfi_attachments(b: StorageBackend, rfi_id: int) -> List[Dict[str, Any]]:
+    fn = getattr(b, "list_rfi_attachments", None)
+    return fn(int(rfi_id)) if callable(fn) else []
+
+def db_get_rfi_attachment(b: StorageBackend, attachment_id: int) -> Optional[Dict[str, Any]]:
+    fn = getattr(b, "get_rfi_attachment", None)
+    return fn(int(attachment_id)) if callable(fn) else None
+
+def db_delete_rfi_attachment(b: StorageBackend, attachment_id: int) -> None:
+    fn = getattr(b, "delete_rfi_attachment", None)
+    if callable(fn):
+        fn(int(attachment_id))
 
 # -------------------------
 # Tiny settings helper (piggyback on presets table)
@@ -2624,28 +2752,40 @@ def rfi_manager_page():
     with st.expander("Create new RFI", expanded=True):
         with st.form("new_rfi_form"):
             c1, c2, c3 = st.columns(3)
-            project = c1.text_input("Project", value="")
+            project = c1.text_input("Project", value="", help="Job name/number (e.g., \"SR-60 Bridge Rehab – Phase 2\").")
             discipline = c2.selectbox("Discipline", ["General","Civil","Structural","MEP","Geotech","Traffic","Environmental","Other"], index=0)
             priority = c3.selectbox("Priority", ["Low","Normal","High","Urgent"], index=1)
 
-            subject = st.text_input("Subject")
-            spec_section = st.text_input("Spec / Drawing Ref (optional)", placeholder="e.g., 03 30 00 / S-201")
+            subject = st.text_input("Subject", help="Short title for the RFI (one line).")
+            spec_section = st.text_input("Spec / Drawing Ref (optional)", placeholder="e.g., 03 30 00 / S-201", help="Reference the governing spec section / drawing sheet / detail.")
             question = st.text_area("Question / Clarification needed", height=160)
 
             c4, c5, c6 = st.columns(3)
-            due_date = c4.date_input("Due date (optional)", value=None)
-            assignee_email = c5.text_input("Assignee (optional)", placeholder="pm@company.com")
-            to_emails = c6.text_input("To (emails)", placeholder="architect@firm.com; engineer@firm.com")
+            due_date = c4.date_input("Due date (optional)", value=None, help="When you need an answer by (optional).")
+            assignee_email = c5.text_input("Assignee (optional)", placeholder="pm@company.com", help="Internal owner responsible for follow-ups.")
+            to_emails = c6.text_input("To (emails)", placeholder="architect@firm.com; engineer@firm.com", help="Recipients (comma/semicolon separated).")
 
-            cc_emails = st.text_input("CC (emails)", placeholder="super@company.com")
+            cc_emails = st.text_input("CC (emails)", placeholder="super@company.com", help="CC list (comma/semicolon separated).")
 
             st.markdown("**Schedule impact (optional)**")
             c7, c8, c9 = st.columns(3)
-            related_tasks = c7.text_input("Related schedule task(s)", placeholder="B - Foundations; C - Structure")
-            schedule_impact_days = c8.number_input("Potential delay (days)", min_value=0, step=1, value=0)
-            cost_impact = c9.number_input("Potential cost impact ($)", min_value=0.0, step=1000.0, value=0.0)
+            related_tasks = c7.text_input("Related schedule task(s)", placeholder="B - Foundations; C - Structure", help="Optional. Tie the RFI to schedule activities impacted.")
+            schedule_impact_days = c8.number_input("Potential delay (days)", min_value=0, step=1, value=0, help="Your rough guess of potential delay if unanswered / changed.")
+            cost_impact = c9.number_input("Potential cost impact ($)", min_value=0.0, step=1000.0, value=0.0, help="Rough ROM cost impact (optional).")
 
-            thread_notes = st.text_area("Notes / Thread", height=100)
+            thread_notes = st.text_area("Notes / Thread", height=100, help="Context, meeting notes, decision log, follow-up notes.")
+
+            links_raw = st.text_area(
+                "Links (Google Doc / OneDrive / SharePoint) (optional)",
+                height=70,
+                help="Paste one URL per line. Use this for Google Docs or online Word files (SharePoint/OneDrive)."
+            )
+            attachments_files = st.file_uploader(
+                "Attachments (PDF/CSV/DOCX)",
+                type=["pdf", "csv", "docx"],
+                accept_multiple_files=True,
+                help="Attach supporting files (export Google Docs as .docx if needed)."
+            )
 
             create = st.form_submit_button("Save draft")
 
@@ -2677,7 +2817,11 @@ def rfi_manager_page():
                     "last_response_at": None,
                     "thread_notes": thread_notes.strip() or None,
                 })
-                st.success(f"Saved draft RFI #{rfi_id}.")
+                
+                links = [u.strip() for u in (links_raw or "").splitlines() if u.strip()]
+                db_add_rfi_links(backend, rfi_id, links)
+                db_add_rfi_attachments(backend, rfi_id, attachments_files or [])
+st.success(f"Saved draft RFI #{rfi_id}.")
                 st.rerun()
 
     st.markdown("---")
