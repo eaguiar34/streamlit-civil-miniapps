@@ -2717,96 +2717,154 @@ def schedule_whatifs_page():
 
 def rfi_manager_page():
     st.header("RFI Manager")
-    st.caption("Create, send, and track RFIs. RFIs are stored in the selected backend.")
 
-    # Load
-    rfis = db_list_rfis(backend, limit=5000)
-    if rfis.empty:
-        rfis = pd.DataFrame(columns=[
-            "id","created_at","updated_at","user_id","project","subject","question","discipline",
-            "spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails",
-            "related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes",
-        ])
+    backend = get_backend_choice()
 
-    # New RFI form
+    # --- Create / Draft form ---
     with st.expander("Create new RFI", expanded=True):
+        st.caption("Fields marked required: **Project**, **Subject**, **Question / Clarification needed**.")
         with st.form("new_rfi_form"):
             c1, c2, c3 = st.columns(3)
-        project = c1.text_input("Project", value="", help="Project name / job number this RFI belongs to.")
-        discipline = c2.selectbox("Discipline", ["General","Civil","Structural","MEP","Geotech","Traffic","Environmental","Survey"], index=0, help="Pick the discipline this RFI is about.")
-        priority = c3.selectbox("Priority", ["Low","Normal","High","Urgent"], index=1, help="How time-sensitive is this request?")
+            project = c1.text_input(
+                "Project *",
+                value="",
+                help="Your project/job identifier (e.g., 'LA River Rehab - Phase 2').",
+            )
+            discipline = c2.selectbox(
+                "Discipline",
+                ["General", "Civil", "Structural", "MEP", "Geotech", "Traffic", "Utilities", "Architectural"],
+                index=0,
+                help="Used for filtering and reporting.",
+            )
+            priority = c3.selectbox(
+                "Priority",
+                ["Low", "Normal", "High", "Urgent"],
+                index=1,
+                help="Used for triage and the aging dashboard.",
+            )
 
-        subject = st.text_input("Subject", help="Short title. Aim for something searchable (e.g., 'Slab vapor barrier spec').")
-        spec_section = st.text_input("Spec / Drawing Ref (optional)", placeholder="e.g., 03 30 00 / S-201", help="Where in the contract docs is this issue referenced? (Spec section, sheet/detail, RFI reference, etc.)")
-        question = st.text_area("Question / Clarification needed", height=160, help="What are you asking? Include context, constraints, and proposed options if you have them.")
+            subject = st.text_input(
+                "Subject *",
+                help="Short title you would put in an email subject line.",
+            )
+            spec_section = st.text_input(
+                "Spec / Drawing Ref (optional)",
+                placeholder="e.g., 03 30 00 / S-201",
+                help="Reference the spec section, sheet, detail, or addendum item.",
+            )
+            question = st.text_area(
+                "Question / Clarification needed *",
+                height=160,
+                help="Write the actual question. Include assumptions and what decision you need.",
+            )
 
-        c4, c5, c6 = st.columns(3)
-        due_date = c4.date_input("Due date (optional)", value=None, help="Target response date (internal or contractual).")
-        assignee_email = c5.text_input("Assignee (optional)", placeholder="pm@company.com", help="Who on your team owns this RFI?")
-        to_emails = c6.text_input("To (emails)", placeholder="architect@firm.com; engineer@firm.com", help="Who should receive the RFI email? Separate multiple with semicolons.")
+            c4, c5, c6 = st.columns(3)
+            due_date = c4.date_input(
+                "Due date (optional)",
+                value=None,
+                help="When you need a response by (drives 'Overdue' logic).",
+            )
+            assignee_email = c5.text_input(
+                "Assignee (optional)",
+                placeholder="pm@company.com",
+                help="Internal owner responsible for follow-up.",
+            )
+            to_emails = c6.text_input(
+                "To (emails)",
+                placeholder="architect@firm.com; engineer@firm.com",
+                help="External recipients. Separate with commas or semicolons.",
+            )
 
-        cc_emails = st.text_input("CC (emails)", placeholder="super@company.com", help="Optional CC recipients (semicolon-separated).")
+            cc_emails = st.text_input(
+                "CC (emails)",
+                placeholder="super@company.com",
+                help="Optional CC list. Separate with commas or semicolons.",
+            )
 
-        st.markdown("**Schedule impact (optional)**")
-        c7, c8, c9 = st.columns(3)
-        related_tasks = c7.text_input("Related schedule task(s)", placeholder="B - Foundations; C - Structure", help="Schedule activities affected (optional).")
-        schedule_impact_days = c8.number_input("Potential delay (days)", min_value=0, step=1, value=0, help="If unanswered, how many days could this impact the schedule?")
-        cost_impact = c9.number_input("Potential cost impact ($)", min_value=0.0, step=1000.0, value=0.0, help="Rough cost exposure (optional).")
+            st.markdown("**Schedule impact (optional)**")
+            c7, c8, c9 = st.columns(3)
+            related_tasks = c7.text_input(
+                "Related schedule task(s)",
+                placeholder="B - Foundations; C - Structure",
+                help="Helps tie the RFI back to the schedule what-ifs.",
+            )
+            schedule_impact_days = c8.number_input(
+                "Potential delay (days)",
+                min_value=0,
+                step=1,
+                value=0,
+                help="Your best estimate if this is not resolved quickly.",
+            )
+            cost_impact = c9.number_input(
+                "Potential cost impact ($)",
+                min_value=0.0,
+                step=1000.0,
+                value=0.0,
+                help="Rough order-of-magnitude cost impact.",
+            )
 
-        thread_notes = st.text_area("Notes / Thread", height=100, help="Internal notes, call logs, assumptions, or running thread (optional).")
+            thread_notes = st.text_area(
+                "Notes / Thread",
+                height=100,
+                help="Paste email snippets, meeting notes, and decisions as they happen.",
+            )
 
+            links_raw = st.text_area(
+                "Links (optional)",
+                height=90,
+                help="One link per line (plan room, BIM 360, Procore, Drive, etc.).",
+            )
 
-        links_raw = st.text_area("Links (optional)", height=80, help="Paste one URL per line (drawings/spec/cloud files/email threads).")
-        attachments_files = st.file_uploader(
-            "Attachments (optional)",
-            type=["pdf", "csv", "docx", "txt"],
-            accept_multiple_files=True,
-            help="Upload supporting docs. Google Docs can be downloaded as DOCX/PDF first; Word is .docx.",
-        )
+            attachments_files = st.file_uploader(
+                "Attachments (optional)",
+                type=["pdf", "csv", "docx", "doc", "txt"],
+                accept_multiple_files=True,
+                help=(
+                    "Upload supporting docs. For Google Docs, download as .docx or PDF first. "
+                    "Supported: PDF, CSV, Word (.doc/.docx), TXT."
+                ),
+            )
 
-        create = st.form_submit_button("Save draft")
+            create = st.form_submit_button("Save draft")
 
         if create:
             if not project.strip() or not subject.strip() or not question.strip():
                 st.warning("Project, Subject, and Question are required.")
             else:
-                rfi_id = db_upsert_rfi(backend, {
-                    "id": None,
-                    "created_at": datetime.utcnow().isoformat(),
-                    "updated_at": datetime.utcnow().isoformat(),
-                    "user_id": _current_user_label(),
-                    "project": project.strip(),
-                    "subject": subject.strip(),
-                    "question": question.strip(),
-                    "discipline": discipline,
-                    "spec_section": spec_section.strip() or None,
-                    "priority": priority,
-                    "status": "Draft",
-                    "due_date": str(due_date) if due_date else None,
-                    "assignee_email": assignee_email.strip() or None,
-                    "to_emails": ";".join(parse_emails(to_emails)),
-                    "cc_emails": ";".join(parse_emails(cc_emails)),
-                    "related_tasks": related_tasks.strip() or None,
-                    "schedule_impact_days": int(schedule_impact_days or 0),
-                    "cost_impact": float(cost_impact or 0.0),
-                    "last_sent_at": None,
-                    "last_reminded_at": None,
-                    "last_response_at": None,
-                    "thread_notes": thread_notes.strip() or None,
-                })
+                rfi_id = db_upsert_rfi(
+                    backend,
+                    {
+                        "id": None,
+                        "created_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat(),
+                        "user_id": _current_user_label(),
+                        "project": project.strip(),
+                        "subject": subject.strip(),
+                        "question": question.strip(),
+                        "discipline": discipline,
+                        "spec_section": spec_section.strip() or None,
+                        "priority": priority,
+                        "status": "Draft",
+                        "due_date": str(due_date) if due_date else None,
+                        "assignee_email": assignee_email.strip() or None,
+                        "to_emails": ";".join(parse_emails(to_emails)),
+                        "cc_emails": ";".join(parse_emails(cc_emails)),
+                        "related_tasks": related_tasks.strip() or None,
+                        "schedule_impact_days": int(schedule_impact_days or 0),
+                        "cost_impact": float(cost_impact or 0.0),
+                        "last_sent_at": None,
+                        "last_reminded_at": None,
+                        "last_response_at": None,
+                        "thread_notes": thread_notes.strip() or None,
+                    },
+                )
 
                 links = [u.strip() for u in (links_raw or "").splitlines() if u.strip()]
                 if links:
                     db_add_rfi_links(backend, rfi_id, links)
 
-                files_payload = []
-                for uf in (attachments_files or []):
-                    try:
-                        files_payload.append({"filename": uf.name, "mime": getattr(uf, "type", None), "data": uf.getvalue()})
-                    except Exception:
-                        continue
-                if files_payload:
-                    db_add_rfi_attachments(backend, rfi_id, files_payload)
+                if attachments_files:
+                    db_add_rfi_attachments(backend, rfi_id, attachments_files)
 
                 st.success(f"Saved draft RFI #{rfi_id}.")
                 st.rerun()
@@ -2814,11 +2872,16 @@ def rfi_manager_page():
     st.markdown("---")
     st.subheader("RFI List")
 
+    rfis = db_list_rfis(backend)
+    if rfis.empty:
+        st.info("No RFIs yet. Create one above to start.")
+        return
+
     # Filters
-    f1, f2, f3, f4 = st.columns([0.28,0.24,0.24,0.24])
+    f1, f2, f3, f4 = st.columns([0.28, 0.24, 0.24, 0.24])
     proj_opts = ["All"] + sorted([p for p in rfis.get("project", pd.Series(dtype=str)).dropna().unique().tolist() if str(p).strip()])
-    status_opts = ["All","Draft","Sent","Answered","Closed"]
-    prio_opts = ["All","Low","Normal","High","Urgent"]
+    status_opts = ["All", "Draft", "Sent", "Answered", "Closed"]
+    prio_opts = ["All", "Low", "Normal", "High", "Urgent"]
 
     f_project = f1.selectbox("Project", proj_opts, index=0)
     f_status = f2.selectbox("Status", status_opts, index=0)
@@ -2834,182 +2897,111 @@ def rfi_manager_page():
         view = view[view["priority"] == f_priority]
     if search.strip():
         s = search.strip().lower()
-        hay = (view.get("subject","").astype(str) + " " + view.get("question","").astype(str) + " " + view.get("spec_section","").astype(str)).str.lower()
-        view = view[hay.str.contains(re.escape(s), regex=True, na=False)]
+        for col in ["subject", "question", "spec_section", "thread_notes"]:
+            if col not in view.columns:
+                view[col] = ""
+        mask = (
+            view["subject"].fillna("").str.lower().str.contains(s)
+            | view["question"].fillna("").str.lower().str.contains(s)
+            | view["spec_section"].fillna("").str.lower().str.contains(s)
+            | view["thread_notes"].fillna("").str.lower().str.contains(s)
+        )
+        view = view[mask]
 
-    # Quick metrics
-    def _age_days(ts):
-        try:
-            return (pd.Timestamp.utcnow() - pd.to_datetime(ts, errors="coerce")).days
-        except Exception:
-            return None
-
-    open_mask = view.get("status", "").isin(["Draft","Sent","Answered"]) if not view.empty else pd.Series([], dtype=bool)
+    # Quick counts
+    today = date.today()
     overdue = 0
-    if not view.empty and "due_date" in view.columns:
-        dd = pd.to_datetime(view["due_date"], errors="coerce")
-        overdue = int(((dd.notna()) & (dd.dt.date < datetime.utcnow().date()) & open_mask).sum())
+    for _, r in view.iterrows():
+        try:
+            if r.get("status") not in ("Answered", "Closed") and r.get("due_date"):
+                dd = date.fromisoformat(str(r.get("due_date")))
+                if dd < today:
+                    overdue += 1
+        except Exception:
+            pass
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Open RFIs", int(open_mask.sum()) if len(open_mask) else 0)
-    m2.metric("Overdue", overdue)
-    m3.metric("Total", len(view))
+    cA, cB, cC = st.columns(3)
+    cA.metric("Open RFIs", int((view["status"].fillna("") != "Closed").sum()))
+    cB.metric("Overdue", int(overdue))
+    cC.metric("Total", int(len(view)))
 
-    # Display table
-    show_cols = ["id","project","subject","status","priority","due_date","last_sent_at","last_response_at","schedule_impact_days","related_tasks"]
-    for c in show_cols:
-        if c not in view.columns:
-            view[c] = None
-    df_fullwidth(view[show_cols].sort_values("id", ascending=False, kind="stable"), hide_index=True, height=rows_to_height(min(len(view)+5, 60)))
+    st.dataframe(
+        view[
+            [
+                "id",
+                "project",
+                "subject",
+                "status",
+                "priority",
+                "due_date",
+                "last_sent_at",
+                "last_response_at",
+                "schedule_impact_days",
+                "related_tasks",
+            ]
+        ].sort_values(by=["id"], ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.markdown("---")
     st.subheader("Open / Edit an RFI")
-    rid = st.number_input("RFI ID", min_value=0, step=1, value=0)
-    if rid and st.button("Load RFI"):
-        st.session_state["__rfi_edit_id__"] = int(rid)
+
+    rfi_ids = view["id"].dropna().astype(int).tolist()
+    pick = st.selectbox("RFI ID", [0] + rfi_ids, index=0, help="Select an RFI to view/edit details.")
+    if not pick:
+        return
+
+    rfi = rfis[rfis["id"] == pick].iloc[0].to_dict()
+
+    with st.form("edit_rfi_form"):
+        c1, c2, c3 = st.columns(3)
+        status = c1.selectbox("Status", ["Draft", "Sent", "Answered", "Closed"], index=["Draft","Sent","Answered","Closed"].index(rfi.get("status","Draft")))
+        priority = c2.selectbox("Priority", ["Low", "Normal", "High", "Urgent"], index=["Low","Normal","High","Urgent"].index(rfi.get("priority","Normal")))
+        due = c3.date_input("Due date (optional)", value=date.fromisoformat(rfi["due_date"]) if rfi.get("due_date") else None)
+
+        subject = st.text_input("Subject", value=rfi.get("subject",""), help="Short title.")
+        spec_section = st.text_input("Spec / Drawing Ref (optional)", value=rfi.get("spec_section") or "")
+        question = st.text_area("Question / Clarification needed", value=rfi.get("question",""), height=160)
+
+        c4, c5, c6 = st.columns(3)
+        assignee_email = c4.text_input("Assignee (optional)", value=rfi.get("assignee_email") or "")
+        to_emails = c5.text_input("To (emails)", value=rfi.get("to_emails") or "")
+        cc_emails = c6.text_input("CC (emails)", value=rfi.get("cc_emails") or "")
+
+        st.markdown("**Schedule impact (optional)**")
+        c7, c8, c9 = st.columns(3)
+        related_tasks = c7.text_input("Related schedule task(s)", value=rfi.get("related_tasks") or "")
+        schedule_impact_days = c8.number_input("Potential delay (days)", min_value=0, step=1, value=int(rfi.get("schedule_impact_days") or 0))
+        cost_impact = c9.number_input("Potential cost impact ($)", min_value=0.0, step=1000.0, value=float(rfi.get("cost_impact") or 0.0))
+
+        thread_notes = st.text_area("Notes / Thread", value=rfi.get("thread_notes") or "", height=140)
+
+        save = st.form_submit_button("Save changes")
+
+    if save:
+        db_upsert_rfi(
+            backend,
+            {
+                **rfi,
+                "updated_at": datetime.utcnow().isoformat(),
+                "status": status,
+                "priority": priority,
+                "due_date": str(due) if due else None,
+                "subject": subject.strip(),
+                "spec_section": spec_section.strip() or None,
+                "question": question.strip(),
+                "assignee_email": assignee_email.strip() or None,
+                "to_emails": ";".join(parse_emails(to_emails)),
+                "cc_emails": ";".join(parse_emails(cc_emails)),
+                "related_tasks": related_tasks.strip() or None,
+                "schedule_impact_days": int(schedule_impact_days or 0),
+                "cost_impact": float(cost_impact or 0.0),
+                "thread_notes": thread_notes.strip() or None,
+            },
+        )
+        st.success("Saved.")
         st.rerun()
-
-    edit_id = st.session_state.get("__rfi_edit_id__")
-    if edit_id:
-        rfi = db_get_rfi(backend, int(edit_id)) or {}
-        if not rfi:
-            st.warning("RFI not found.")
-        else:
-            with st.expander(f"Editing RFI #{edit_id}", expanded=True):
-                c1, c2, c3 = st.columns(3)
-                project = c1.text_input("Project", value=rfi.get("project") or "", help="Project name / job number.")
-                discipline = c2.text_input("Discipline", value=rfi.get("discipline") or "General", help="Discipline bucket (free text).")
-                subject = st.text_input("Subject", value=rfi.get("subject") or "", help="Short searchable title.")
-                prio_opts = ["Low","Normal","High","Urgent"]
-                priority = c3.selectbox("Priority", prio_opts, index=prio_opts.index(rfi.get("priority") or "Normal"), help="How urgent is this RFI?")
-                spec_section = st.text_input("Spec / Drawing Ref (optional)", value=rfi.get("spec_section") or "", help="Spec section / drawing sheet/detail reference (optional).")
-                question = st.text_area("Question / Clarification needed", value=rfi.get("question") or "", height=160, help="Main question + context.")
-
-                c4, c5, c6 = st.columns(3)
-                status_opts = ["Draft","Sent","Answered","Closed"]
-                status = c4.selectbox("Status", status_opts, index=status_opts.index(rfi.get("status") or "Draft"), help="Lifecycle status for tracking + aging.")
-                status = c4.selectbox("Status", status_opts, index=status_opts.index(rfi.get("status") or "Draft"), help="Lifecycle status for tracking + aging.")
-                assignee_email = c6.text_input("Assignee", value=rfi.get("assignee_email") or "", help="Owner on your team.")
-                to_emails = st.text_input("To", value=rfi.get("to_emails") or "")
-                to_emails = st.text_input("To (emails)", value=rfi.get("to_emails") or "", help="Semicolon-separated recipients.")
-                cc_emails = st.text_input("CC (emails)", value=rfi.get("cc_emails") or "", help="Optional CCs (semicolon-separated).")
-                due = st.text_input("Due date (optional)", value=rfi.get("due_date") or "", help="Target response date (e.g., 2026-01-15). Leave blank if none.")
-
-                st.markdown("**Links & Attachments**")
-                existing_links = db_list_rfi_links(backend, rfi_id)
-                if existing_links:
-                    for lk in existing_links:
-                        lc1, lc2 = st.columns([0.85, 0.15])
-                        lc1.markdown(f"- {lk.get('url')}")
-                        if lc2.button("Delete", key=f"del_link_{lk.get('id')}"):
-                            db_delete_rfi_link(backend, int(lk.get("id")))
-                            st.rerun()
-                new_links_raw = st.text_area("Add links (one per line)", height=70, help="Paste URLs to drawings/specs/email threads/cloud files.")
-
-                existing_attachments = db_list_rfi_attachments(backend, rfi_id)
-                if existing_attachments:
-                    for att in existing_attachments:
-                        a1, a2, a3 = st.columns([0.6, 0.25, 0.15])
-                        a1.write(att.get("filename"))
-                        data = db_get_rfi_attachment_data(backend, int(att.get("id")))
-                        if data:
-                            fname, mime, b = data
-                            a2.download_button("Download", data=b, file_name=fname, mime=mime or "application/octet-stream", key=f"dl_att_{att.get('id')}")
-                        if a3.button("Delete", key=f"del_att_{att.get('id')}"):
-                            db_delete_rfi_attachment(backend, int(att.get("id")))
-                            st.rerun()
-
-                new_attachments = st.file_uploader(
-                    "Add attachments",
-                    type=["pdf", "csv", "docx", "txt"],
-                    accept_multiple_files=True,
-                    help="Upload supporting docs (PDF/CSV/DOCX/TXT).",
-                )
-
-                related_tasks = st.text_input("Related schedule task(s)", value=rfi.get("related_tasks") or "", help="Schedule activities affected (optional).")
-                impact_days = st.number_input("Schedule impact (days)", min_value=0, step=1, value=int(rfi.get("schedule_impact_days") or 0), help="Potential delay if unresolved.")
-                cost_impact = st.number_input("Potential cost impact ($)", min_value=0.0, step=1000.0, value=float(rfi.get("cost_impact") or 0.0), help="Optional rough order-of-magnitude.")
-
-                thread_notes = st.text_area("Notes / Thread", value=rfi.get("thread_notes") or "", height=120)
-
-                b1, b2, b3, b4 = st.columns([0.25,0.25,0.25,0.25])
-
-                if b1.button("Save changes"):
-
-                    # Append any new links / attachments
-                    new_links = [u.strip() for u in (new_links_raw or "").splitlines() if u.strip()]
-                    if new_links:
-                        db_add_rfi_links(backend, rfi_id, new_links)
-
-                    files_payload = []
-                    for uf in (new_attachments or []):
-                        try:
-                            files_payload.append({"filename": uf.name, "mime": getattr(uf, "type", None), "data": uf.getvalue()})
-                        except Exception:
-                            continue
-                    if files_payload:
-                        db_add_rfi_attachments(backend, rfi_id, files_payload)
-
-                    rfi.update({
-                        "updated_at": datetime.utcnow().isoformat(),
-                        "user_id": rfi.get("user_id") or _current_user_label(),
-                        "project": project.strip(),
-                        "discipline": discipline.strip() or None,
-                        "priority": priority,
-                        "subject": subject.strip(),
-                        "spec_section": spec_section.strip() or None,
-                        "question": question.strip(),
-                        "status": status,
-                        "due_date": due.strip() or None,
-                        "assignee_email": assignee_email.strip() or None,
-                        "to_emails": ";".join(parse_emails(to_emails)),
-                        "cc_emails": ";".join(parse_emails(cc_emails)),
-                        "related_tasks": related_tasks.strip() or None,
-                        "schedule_impact_days": int(impact_days or 0),
-                        "cost_impact": float(cost_impact or 0.0),
-                        "thread_notes": thread_notes.strip() or None,
-                    })
-                    db_upsert_rfi(backend, rfi)
-                    st.success("Saved.")
-                    st.rerun()
-
-                # PDF download
-                pdf_bytes = generate_rfi_pdf(rfi)
-                b2.download_button("Download PDF", pdf_bytes, file_name=f"RFI_{edit_id}.pdf", mime="application/pdf")
-
-                # Send email
-                attach_pdf = st.checkbox("Attach PDF when emailing", value=True)
-                if b3.button("Send / Re-send email"):
-                    to_list = parse_emails(rfi.get("to_emails") or "")
-                    cc_list = parse_emails(rfi.get("cc_emails") or "")
-                    recips = to_list + cc_list
-                    if not recips:
-                        st.warning("Add at least one recipient in To/CC.")
-                    else:
-                        subj = f"RFI #{edit_id}: {rfi.get('subject') or ''}"
-                        html = rfi_email_html(rfi)
-                        atts = [(f"RFI_{edit_id}.pdf", pdf_bytes)] if attach_pdf else None
-                        ok, msg = send_email(recips, subj, html, attachments=atts)
-                        if ok:
-                            rfi["status"] = "Sent" if rfi.get("status") in (None, "Draft") else rfi.get("status")
-                            rfi["last_sent_at"] = datetime.utcnow().isoformat()
-                            rfi["updated_at"] = datetime.utcnow().isoformat()
-                            db_upsert_rfi(backend, rfi)
-                            st.success(f"Email sent ({msg}).")
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
-                if b4.button("Delete RFI"):
-                    db_delete_rfi(backend, int(edit_id))
-                    st.session_state.pop("__rfi_edit_id__", None)
-                    st.success("Deleted.")
-                    st.rerun()
-
-
-# =========================
-# Aging Dashboard (page)
-# =========================
 
 def aging_dashboard_page():
     st.header("Aging Dashboard")
