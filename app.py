@@ -113,19 +113,19 @@ st.set_page_config(page_title="FieldFlow", layout="wide")
 # ---------- Width shims (handles Streamlit deprecations gracefully)
 def df_fullwidth(df, **kwargs):
     try:
-        return st.dataframe(df, use_container_width=True, **kwargs)
+        return st.dataframe(df, width='stretch', **kwargs)
     except TypeError:
         return st.dataframe(df, **kwargs)
 
 def editor_fullwidth(df, **kwargs):
     try:
-        return st.data_editor(df, use_container_width=True, **kwargs)
+        return st.data_editor(df, width='stretch', **kwargs)
     except TypeError:
         return st.data_editor(df, **kwargs)
 
 def chart_fullwidth(chart, **kwargs):
     try:
-        return st.altair_chart(chart, use_container_width=True, **kwargs)
+        return st.altair_chart(chart, width='stretch', **kwargs)
     except TypeError:
         return st.altair_chart(chart, **kwargs)
 
@@ -1347,6 +1347,12 @@ def get_backend(kind: str) -> StorageBackend:
     return SQLiteBackend(os.path.join(data_dir, "checker.db"))
 
 # Thin wrappers
+
+def get_backend_choice():
+    """Convenience wrapper for pages that just want the currently selected backend."""
+    backend_key = st.session_state.get("__backend_choice__", BACKEND_SQLITE)
+    return get_backend(backend_key)
+
 def db_save_preset(b: StorageBackend, name: str, payload: dict): return b.save_preset(name, payload)
 def db_load_presets(b: StorageBackend) -> dict: return b.load_presets()
 def db_delete_preset(b: StorageBackend, name: str): return b.delete_preset(name)
@@ -1833,7 +1839,7 @@ with st.sidebar.expander("Recent feedback (owner view)", expanded=False):
         if _fb.empty:
             st.caption("No feedback yet.")
         else:
-            st.dataframe(_fb[["created_at","user_id","page","rating","message"]], use_container_width=True, hide_index=True)
+            st.dataframe(_fb[["created_at","user_id","page","rating","message"]], width='stretch', hide_index=True)
     except Exception as e:
         st.caption(f"(Feedback listing unavailable: {e})")
 
@@ -2940,7 +2946,7 @@ def rfi_manager_page():
                 "related_tasks",
             ]
         ].sort_values(by=["id"], ascending=False),
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
     )
 
