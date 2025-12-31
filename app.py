@@ -2831,12 +2831,17 @@ def rfi_manager_page():
                 ),
             )
 
-            create = st.form_submit_button("Save draft")
+            cbtn1, cbtn2 = st.columns(2)
 
-        if create:
+            save_draft = cbtn1.form_submit_button("Save draft", type="secondary", use_container_width=True)
+
+            submit_rfi = cbtn2.form_submit_button("Submit", type="primary", use_container_width=True)
+        if save_draft or submit_rfi:
             if not project.strip() or not subject.strip() or not question.strip():
                 st.warning("Project, Subject, and Question are required.")
             else:
+                new_status = "Draft" if save_draft else "Sent"
+                sent_at = datetime.utcnow().isoformat() if submit_rfi else None
                 rfi_id = db_upsert_rfi(
                     backend,
                     {
@@ -2850,7 +2855,7 @@ def rfi_manager_page():
                         "discipline": discipline,
                         "spec_section": spec_section.strip() or None,
                         "priority": priority,
-                        "status": "Draft",
+                        "status": new_status,
                         "due_date": str(due_date) if due_date else None,
                         "assignee_email": assignee_email.strip() or None,
                         "to_emails": ";".join(parse_emails(to_emails)),
@@ -2858,7 +2863,7 @@ def rfi_manager_page():
                         "related_tasks": related_tasks.strip() or None,
                         "schedule_impact_days": int(schedule_impact_days or 0),
                         "cost_impact": float(cost_impact or 0.0),
-                        "last_sent_at": None,
+                        "last_sent_at": sent_at,
                         "last_reminded_at": None,
                         "last_response_at": None,
                         "thread_notes": thread_notes.strip() or None,
@@ -2872,7 +2877,7 @@ def rfi_manager_page():
                 if attachments_files:
                     db_add_rfi_attachments(backend, rfi_id, attachments_files)
 
-                st.success(f"Saved draft RFI #{rfi_id}.")
+                st.success(f"{'Submitted' if submit_rfi else 'Saved draft'} RFI #{rfi_id}.")
                 st.rerun()
 
     st.markdown("---")
