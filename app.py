@@ -1722,18 +1722,14 @@ def summarize_feedback(df: pd.DataFrame) -> dict:
 from pathlib import Path
 import streamlit as st
 
-LOGO_PATH = Path(__file__).parent / "assets" / "fieldflow_logo.png"
+LOGO_PATH = Path(__file__).parent / "assets" / "FieldFlow_logo.png"
 
 if LOGO_PATH.exists():
     st.sidebar.image(str(LOGO_PATH), use_container_width=True)
 else:
     st.sidebar.write("FieldFlow")  # fallback
 
-st.set_page_config(
-    page_title="FieldFlow",
-    page_icon="🛠️",  # easiest
-    layout="wide"
-)
+st.set_page_config(page_title="FieldFlow", page_icon="🦺", layout="wide")
 
 st.sidebar.title("FieldFlow")
 st.sidebar.subheader("Storage")
