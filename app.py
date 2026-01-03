@@ -1715,6 +1715,21 @@ def summarize_feedback(df: pd.DataFrame) -> dict:
     top_words = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:15]
     return {"count": count, "avg_rating": avg, "by_page": by_page, "top_words": top_words}
 
+from pathlib import Path
+import streamlit as st
+
+LOGO_PATH = Path(__file__).parent / "assets" / "fieldflow_logo.png"
+
+if LOGO_PATH.exists():
+    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+else:
+    st.sidebar.write("FieldFlow")  # fallback
+
+st.set_page_config(
+    page_title="FieldFlow",
+    page_icon="🛠️",  # easiest
+    layout="wide"
+)
 
 # =========================
 # Sidebar: storage + auth
