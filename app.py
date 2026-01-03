@@ -1715,6 +1715,10 @@ def summarize_feedback(df: pd.DataFrame) -> dict:
     top_words = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:15]
     return {"count": count, "avg_rating": avg, "by_page": by_page, "top_words": top_words}
 
+
+# =========================
+# Sidebar: storage + auth
+# =========================
 from pathlib import Path
 import streamlit as st
 
@@ -1731,9 +1735,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# =========================
-# Sidebar: storage + auth
-# =========================
 st.sidebar.title("FieldFlow")
 st.sidebar.subheader("Storage")
 
