@@ -1,10 +1,8 @@
 [server]
-# make it behave nicely on cloud
 headless = true
-enableCORS = true
-enableXsrfProtection = true
-# cap uploads so nobody slams you with a 500 MB PDF
-maxUploadSize = 50
+port = 8501
+enableCORS = false
+enableXsrfProtection = false
 
 [browser]
 gatherUsageStats = false
@@ -12,3 +10,5 @@ gatherUsageStats = false
 [theme]
 base = "light"        # you can switch to "dark"
 primaryColor = "#125E8A"
+
+
