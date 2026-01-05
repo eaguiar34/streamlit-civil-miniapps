@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# create venv if missing
+# FieldFlow local runner (macOS/Linux)
+# Usage:
+#   bash scripts/run_local.sh
+#
+# Prereqs: Python 3.11+ recommended
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
 if [ ! -d ".venv" ]; then
   python3 -m venv .venv
 fi
+
 source .venv/bin/activate
-
 python -m pip install --upgrade pip
-pip install -r requirements.txt
 
-# sanity checks
-python scripts/test_secrets.py || true
+if [ -f "requirements.txt" ]; then
+  pip install -r requirements.txt
+else
+  echo "ERROR: requirements.txt not found in repo root."
+  exit 1
+fi
 
-# run
+# Run
 streamlit run app.py
-
-chmod +x scripts/run_local.sh
