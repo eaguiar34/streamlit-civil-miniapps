@@ -750,17 +750,68 @@ def google_oauth_start():
     st.session_state["__google_flow__"] = flow
     st.markdown(f"[Continue to Google]({auth_url})")
 
-def google_oauth_callback():
+def google_oauth_callback() -> bool:
+    """Handle Google's redirect back to the app.
+
+    Note: Streamlit can create a *new* session on a full-page OAuth redirect, so
+    we try to be resilient if session_state was reset (state/flow missing).
+    """
     from google_auth_oauthlib.flow import Flow
+
     cfg = get_secret("google_oauth", {})
     params = st.query_params
-    if "code" not in params or "state" not in params: return False
-    if params.get("state") != st.session_state.get("__google_state__"): return False
-    flow: Flow = st.session_state.get("__google_flow__")
-    if not flow: return False
+
+    code = params.get("code")
+    state = params.get("state")
+    if not code:
+        return False
+
+    expected_state = st.session_state.get("__google_state__")
+    if expected_state and state and state != expected_state:
+        # If we *do* have an expected state, enforce it.
+        return False
+
+    # Prefer the saved flow (if we still have it); otherwise rebuild a fresh flow.
+    flow: Flow | None = st.session_state.get("__google_flow__")
+    if flow is None:
+        try:
+            flow = Flow.from_client_config(
+                {
+                    "web": {
+                        "client_id": cfg["client_id"],
+                        "client_secret": cfg["client_secret"],
+                        "redirect_uris": [cfg["redirect_uri"]],
+                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                        "token_uri": "https://oauth2.googleapis.com/token",
+                    }
+                },
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive.file",
+                    "openid", "email", "profile",
+                ],
+            )
+        except Exception as e:
+            st.sidebar.error(f"Google OAuth setup error: {e}")
+            return False
+
     flow.redirect_uri = cfg["redirect_uri"]
-    flow.fetch_token(code=params["code"])
+
+    try:
+        flow.fetch_token(code=code)
+    except Exception as e:
+        st.sidebar.error(f"Google OAuth token exchange failed: {e}")
+        return False
+
     creds = flow.credentials
+
+    expiry = None
+    try:
+        if getattr(creds, "expiry", None):
+            expiry = creds.expiry.isoformat()
+    except Exception:
+        expiry = None
+
     st.session_state["__google_token__"] = {
         "token": creds.token,
         "refresh_token": getattr(creds, "refresh_token", None),
@@ -768,18 +819,75 @@ def google_oauth_callback():
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": creds.scopes,
+        "expiry": expiry,
     }
-    ui = requests.get("https://www.googleapis.com/oauth2/v3/userinfo",
-                      headers={"Authorization": f"Bearer {creds.token}"}).json()
-    st.session_state["__google_user__"] = ui.get("email","google-user")
+
+    try:
+        ui = requests.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {creds.token}"},
+            timeout=10,
+        ).json()
+        st.session_state["__google_user__"] = ui.get("email", "google-user")
+    except Exception:
+        st.session_state["__google_user__"] = "google-user"
+
+    # Clean up
+    st.session_state.pop("__google_flow__", None)
+    st.session_state.pop("__google_state__", None)
     st.query_params.clear()
     return True
 
 def google_credentials():
+    """Build (and refresh if needed) google.oauth2.credentials.Credentials."""
     from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from datetime import datetime, timezone
+
     tok = st.session_state.get("__google_token__")
-    if not tok: return None
-    return Credentials(**tok)
+    if not tok:
+        return None
+
+    expiry_dt = None
+    expiry_raw = tok.get("expiry")
+    if isinstance(expiry_raw, str) and expiry_raw:
+        try:
+            # Handles both '...+00:00' and '...Z' styles.
+            s = expiry_raw.replace("Z", "+00:00")
+            expiry_dt = datetime.fromisoformat(s)
+            if expiry_dt.tzinfo is None:
+                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            expiry_dt = None
+
+    creds = Credentials(
+        token=tok.get("token"),
+        refresh_token=tok.get("refresh_token"),
+        token_uri=tok.get("token_uri"),
+        client_id=tok.get("client_id"),
+        client_secret=tok.get("client_secret"),
+        scopes=tok.get("scopes"),
+        expiry=expiry_dt,
+    )
+
+    # Refresh if expired (or within ~60s) and we have a refresh token.
+    try:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            expiry = None
+            try:
+                if getattr(creds, "expiry", None):
+                    expiry = creds.expiry.isoformat()
+            except Exception:
+                expiry = None
+            tok["token"] = creds.token
+            tok["expiry"] = expiry
+            st.session_state["__google_token__"] = tok
+    except Exception:
+        # If refresh fails, we just return the creds as-is; backend will error with a useful message.
+        pass
+
+    return creds
 
 class GoogleSheetsOAuth(StorageBackend):
     def __init__(self, title: str):
@@ -1027,34 +1135,107 @@ def ms_oauth_start():
     )
     st.markdown(f"[Continue to Microsoft]({auth_url})")
 
-def ms_oauth_callback():
+def ms_oauth_callback() -> bool:
+    """Handle Microsoft's redirect back to the app.
+
+    Streamlit can create a new session on redirect; if that happens, we may not
+    have the saved __ms_state__. If we *do* have it, enforce it; otherwise proceed.
+    """
     cfg = get_secret("microsoft_oauth", {})
     params = st.query_params
-    if "code" not in params or "state" not in params: return False
-    if params.get("state") != st.session_state.get("__ms_state__"): return False
+
+    code = params.get("code")
+    state = params.get("state")
+    if not code:
+        return False
+
+    expected_state = st.session_state.get("__ms_state__")
+    if expected_state and state and state != expected_state:
+        return False
+
     token_url = f"https://login.microsoftonline.com/{cfg.get('tenant_id','common')}/oauth2/v2.0/token"
+    scopes = " ".join(["openid","profile","email","offline_access","Files.ReadWrite","User.Read"])
+
     data = {
         "client_id": cfg["client_id"],
         "client_secret": cfg["client_secret"],
-        "code": params["code"],
+        "code": code,
         "redirect_uri": cfg["redirect_uri"],
         "grant_type": "authorization_code",
+        "scope": scopes,
     }
-    tok = requests.post(token_url, data=data).json()
+
+    tok = requests.post(token_url, data=data, timeout=20).json()
     if "access_token" not in tok:
+        desc = tok.get("error_description") or tok.get("error") or str(tok)
+        st.sidebar.error(f"Microsoft OAuth token exchange failed: {desc}")
         return False
+
     tok["_obtained"] = int(time.time())
+    if "expires_in" in tok:
+        try:
+            tok["_expires_at"] = int(time.time()) + int(tok["expires_in"]) - 60
+        except Exception:
+            pass
+
     st.session_state["__ms_token__"] = tok
-    me = requests.get("https://graph.microsoft.com/v1.0/me",
-                      headers={"Authorization": f"Bearer {tok['access_token']}"}).json()
-    st.session_state["__ms_user__"] = me.get("userPrincipalName","microsoft-user")
+
+    try:
+        me = requests.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers={"Authorization": f"Bearer {tok['access_token']}"},
+            timeout=10,
+        ).json()
+        st.session_state["__ms_user__"] = me.get("userPrincipalName", "microsoft-user")
+    except Exception:
+        st.session_state["__ms_user__"] = "microsoft-user"
+
+    st.session_state.pop("__ms_state__", None)
     st.query_params.clear()
     return True
 
-def ms_access_token():
+def ms_access_token() -> str | None:
+    """Return a valid Microsoft Graph access token (refreshing if needed)."""
+    cfg = get_secret("microsoft_oauth", {})
     tok = st.session_state.get("__ms_token__")
-    if not tok: return None
-    return tok["access_token"]
+    if not tok:
+        return None
+
+    now = int(time.time())
+    exp = tok.get("_expires_at")
+    if isinstance(exp, int) and now < exp and tok.get("access_token"):
+        return tok["access_token"]
+
+    # Try refresh_token flow if available.
+    refresh_tok = tok.get("refresh_token")
+    if not refresh_tok:
+        return tok.get("access_token")
+
+    token_url = f"https://login.microsoftonline.com/{cfg.get('tenant_id','common')}/oauth2/v2.0/token"
+    scopes = " ".join(["openid","profile","email","offline_access","Files.ReadWrite","User.Read"])
+
+    data = {
+        "client_id": cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "refresh_token": refresh_tok,
+        "redirect_uri": cfg["redirect_uri"],
+        "grant_type": "refresh_token",
+        "scope": scopes,
+    }
+
+    new_tok = requests.post(token_url, data=data, timeout=20).json()
+    if "access_token" not in new_tok:
+        # Keep the old token; might still work briefly.
+        return tok.get("access_token")
+
+    new_tok["_obtained"] = int(time.time())
+    try:
+        new_tok["_expires_at"] = int(time.time()) + int(new_tok.get("expires_in", 3600)) - 60
+    except Exception:
+        pass
+
+    st.session_state["__ms_token__"] = new_tok
+    return new_tok["access_token"]
 
 class MSExcelOAuth(StorageBackend):
     def __init__(self, title: str):
@@ -1768,14 +1949,20 @@ elif backend_choice == BACKEND_MS_OAUTH:
 if st.session_state.get("__do_google_oauth__"):
     st.session_state.pop("__do_google_oauth__", None)
     google_oauth_start()
+    st.info("After signing in, you'll be redirected back here. If nothing happens, check for pop-up blocking.")
+    st.stop()
 elif st.session_state.get("__do_ms_oauth__"):
     st.session_state.pop("__do_ms_oauth__", None)
     ms_oauth_start()
+    st.info("After signing in, you'll be redirected back here. If nothing happens, check for pop-up blocking.")
+    st.stop()
 else:
-    if "code" in st.query_params and "state" in st.query_params:
-        # try both; only one will succeed
-        google_oauth_callback()
-        ms_oauth_callback()
+    # OAuth redirect back into the app
+    if "code" in st.query_params:
+        ok = google_oauth_callback() or ms_oauth_callback()
+        if ok:
+            # callbacks clear query params; rerun to show authenticated UI cleanly
+            st.rerun()
 
 # Instantiate backend (fallback to SQLite on error)
 try:
