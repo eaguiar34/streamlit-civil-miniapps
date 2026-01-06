@@ -780,6 +780,17 @@ def google_oauth_callback():
     if not code or not state:
         return False
 
+    # Ignore if this callback isn't for Google (helps when multiple providers share ?code=...).
+    if isinstance(state, str) and not state.startswith("g_"):
+        return False
+
+    # Guard against double-processing the same authorization code (refresh/back button can trigger this)
+    used = st.session_state.setdefault("__oauth_used_codes__", set())
+    if code in used:
+        st.query_params.clear()
+        return False
+    used.add(code)
+
     # If we still have the original state, enforce it. (Streamlit Cloud may lose it.)
     saved_state = st.session_state.get("__google_state__")
     if saved_state is not None and state != saved_state:
@@ -1119,6 +1130,12 @@ def ms_oauth_callback():
     if not code or not state:
         return False
 
+    used = st.session_state.setdefault("__oauth_used_codes__", set())
+    if code in used:
+        st.query_params.clear()
+        return False
+    used.add(code)
+
     saved_state = st.session_state.get("__ms_state__")
     if saved_state is not None and state != saved_state:
         return False
@@ -1199,15 +1216,43 @@ class MSExcelOAuth(StorageBackend):
     def _hed(self): return {"Authorization": f"Bearer {self.token}", "Content-Type":"application/json"}
 
     def _ensure_workbook(self):
-        r = requests.get(f"{self.base}/me/drive/root/children", headers=self._hed()).json()
+        r_resp = requests.get(f"{self.base}/me/drive/root/children", headers=self._hed(), timeout=20)
+        try:
+            r = r_resp.json()
+        except Exception:
+            raise RuntimeError(f"Microsoft Graph returned non-JSON when listing Drive root (status {r_resp.status_code}).")
+
+        if isinstance(r, dict) and "error" in r:
+            err = r.get("error", {})
+            raise RuntimeError(f"Microsoft Graph error listing Drive root: {err.get('code','')} {err.get('message','')}")
+
         wid = None
         for item in r.get("value", []):
-            if item.get("name")==f"{self.title}.xlsx":
-                wid = item["id"]; break
+            if item.get("name") == f"{self.title}.xlsx":
+                wid = item.get("id")
+                break
+
         if not wid:
-            payload = {"name": f"{self.title}.xlsx","file":{}}
-            created = requests.post(f"{self.base}/me/drive/root/children", headers=self._hed(), data=json.dumps(payload)).json()
-            wid = created["id"]
+            payload = {"name": f"{self.title}.xlsx", "file": {}}
+            c_resp = requests.post(
+                f"{self.base}/me/drive/root/children",
+                headers=self._hed(),
+                data=json.dumps(payload),
+                timeout=20,
+            )
+            try:
+                created = c_resp.json()
+            except Exception:
+                raise RuntimeError(f"Microsoft Graph returned non-JSON when creating workbook (status {c_resp.status_code}).")
+
+            if isinstance(created, dict) and "error" in created:
+                err = created.get("error", {})
+                raise RuntimeError(f"Microsoft Graph error creating workbook: {err.get('code','')} {err.get('message','')}")
+
+            wid = created.get("id")
+            if not wid:
+                raise RuntimeError(f"Workbook creation did not return an id (status {c_resp.status_code}). Response keys: {list(created.keys()) if isinstance(created, dict) else type(created)}")
+
         return wid
 
     def _ensure_worksheet(self, name: str, headers: list[str]):
