@@ -721,11 +721,24 @@ class GoogleSheetsSA(StorageBackend):
         except: return None
 
 # ---- Google OAuth helpers + Sheets backend
+def _qp_value(params, key):
+    """Return a single query-param value, handling Streamlit's list values."""
+    v = params.get(key)
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
+
 def google_oauth_start():
+    import secrets as _secrets
     from google_auth_oauthlib.flow import Flow
+
     cfg = get_secret("google_oauth", {})
     if not cfg:
-        st.error("Google OAuth not configured in secrets."); return
+        st.error("Google OAuth not configured in secrets.")
+        return
+
+    state = "g_" + _secrets.token_urlsafe(16)
+
     flow = Flow.from_client_config(
         {
             "web": {
@@ -739,79 +752,64 @@ def google_oauth_start():
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive.file",
-            "openid","email","profile",
+            "openid", "email", "profile",
         ],
+        state=state,
     )
     flow.redirect_uri = cfg["redirect_uri"]
-    auth_url, state = flow.authorization_url(
-        access_type="offline", include_granted_scopes="true", prompt="consent"
+
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
     )
+
+    # Best-effort CSRF protection (may be lost across redirects on Streamlit Cloud).
     st.session_state["__google_state__"] = state
-    st.session_state["__google_flow__"] = flow
+
     st.markdown(f"[Continue to Google]({auth_url})")
-
-def google_oauth_callback() -> bool:
-    """Handle Google's redirect back to the app.
-
-    Note: Streamlit can create a *new* session on a full-page OAuth redirect, so
-    we try to be resilient if session_state was reset (state/flow missing).
-    """
+def google_oauth_callback():
+    """Handle the OAuth redirect back from Google."""
     from google_auth_oauthlib.flow import Flow
 
     cfg = get_secret("google_oauth", {})
     params = st.query_params
 
-    code = params.get("code")
-    state = params.get("state")
-    if not code:
+    code = _qp_value(params, "code")
+    state = _qp_value(params, "state")
+    if not code or not state:
         return False
 
-    expected_state = st.session_state.get("__google_state__")
-    if expected_state and state and state != expected_state:
-        # If we *do* have an expected state, enforce it.
+    # If we still have the original state, enforce it. (Streamlit Cloud may lose it.)
+    saved_state = st.session_state.get("__google_state__")
+    if saved_state is not None and state != saved_state:
         return False
 
-    # Prefer the saved flow (if we still have it); otherwise rebuild a fresh flow.
-    flow: Flow | None = st.session_state.get("__google_flow__")
-    if flow is None:
-        try:
-            flow = Flow.from_client_config(
-                {
-                    "web": {
-                        "client_id": cfg["client_id"],
-                        "client_secret": cfg["client_secret"],
-                        "redirect_uris": [cfg["redirect_uri"]],
-                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                        "token_uri": "https://oauth2.googleapis.com/token",
-                    }
-                },
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive.file",
-                    "openid", "email", "profile",
-                ],
-            )
-        except Exception as e:
-            st.sidebar.error(f"Google OAuth setup error: {e}")
-            return False
+    # Ignore callbacks that aren't for Google (we prefix state with 'g_').
+    if isinstance(state, str) and not state.startswith("g_"):
+        return False
 
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+                "redirect_uris": [cfg["redirect_uri"]],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        },
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.file",
+            "openid", "email", "profile",
+        ],
+        state=state,
+    )
     flow.redirect_uri = cfg["redirect_uri"]
-
-    try:
-        flow.fetch_token(code=code)
-    except Exception as e:
-        st.sidebar.error(f"Google OAuth token exchange failed: {e}")
-        return False
+    flow.fetch_token(code=code)
 
     creds = flow.credentials
-
-    expiry = None
-    try:
-        if getattr(creds, "expiry", None):
-            expiry = creds.expiry.isoformat()
-    except Exception:
-        expiry = None
-
     st.session_state["__google_token__"] = {
         "token": creds.token,
         "refresh_token": getattr(creds, "refresh_token", None),
@@ -819,76 +817,45 @@ def google_oauth_callback() -> bool:
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": creds.scopes,
-        "expiry": expiry,
     }
 
-    try:
-        ui = requests.get(
-            "https://www.googleapis.com/oauth2/v3/userinfo",
-            headers={"Authorization": f"Bearer {creds.token}"},
-            timeout=10,
-        ).json()
-        st.session_state["__google_user__"] = ui.get("email", "google-user")
-    except Exception:
-        st.session_state["__google_user__"] = "google-user"
+    ui = requests.get(
+        "https://www.googleapis.com/oauth2/v3/userinfo",
+        headers={"Authorization": f"Bearer {creds.token}"},
+        timeout=15,
+    ).json()
+    st.session_state["__google_user__"] = ui.get("email", "google-user")
 
-    # Clean up
-    st.session_state.pop("__google_flow__", None)
-    st.session_state.pop("__google_state__", None)
     st.query_params.clear()
     return True
-
 def google_credentials():
-    """Build (and refresh if needed) google.oauth2.credentials.Credentials."""
+    """Return Google Credentials (OAuth), refreshing if needed."""
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
-    from datetime import datetime, timezone
 
     tok = st.session_state.get("__google_token__")
     if not tok:
         return None
 
-    expiry_dt = None
-    expiry_raw = tok.get("expiry")
-    if isinstance(expiry_raw, str) and expiry_raw:
-        try:
-            # Handles both '...+00:00' and '...Z' styles.
-            s = expiry_raw.replace("Z", "+00:00")
-            expiry_dt = datetime.fromisoformat(s)
-            if expiry_dt.tzinfo is None:
-                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            expiry_dt = None
+    creds = Credentials(**tok)
 
-    creds = Credentials(
-        token=tok.get("token"),
-        refresh_token=tok.get("refresh_token"),
-        token_uri=tok.get("token_uri"),
-        client_id=tok.get("client_id"),
-        client_secret=tok.get("client_secret"),
-        scopes=tok.get("scopes"),
-        expiry=expiry_dt,
-    )
-
-    # Refresh if expired (or within ~60s) and we have a refresh token.
+    # Best-effort refresh if expired and we have a refresh token.
     try:
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            expiry = None
-            try:
-                if getattr(creds, "expiry", None):
-                    expiry = creds.expiry.isoformat()
-            except Exception:
-                expiry = None
-            tok["token"] = creds.token
-            tok["expiry"] = expiry
-            st.session_state["__google_token__"] = tok
+            st.session_state["__google_token__"] = {
+                "token": creds.token,
+                "refresh_token": creds.refresh_token,
+                "token_uri": creds.token_uri,
+                "client_id": creds.client_id,
+                "client_secret": creds.client_secret,
+                "scopes": creds.scopes,
+            }
     except Exception:
-        # If refresh fails, we just return the creds as-is; backend will error with a useful message.
+        # If refresh fails, fall back to the existing creds; caller can re-auth.
         pass
 
     return creds
-
 class GoogleSheetsOAuth(StorageBackend):
     def __init__(self, title: str):
         import gspread
@@ -1118,125 +1085,108 @@ class GoogleSheetsOAuth(StorageBackend):
 
 # ---- Microsoft OAuth helpers + Excel backend
 def ms_oauth_start():
+    import secrets as _secrets
+
     cfg = get_secret("microsoft_oauth", {})
     if not cfg:
-        st.error("Microsoft OAuth not configured in secrets."); return
+        st.error("Microsoft OAuth not configured in secrets.")
+        return
+
+    state = "m_" + _secrets.token_urlsafe(16)
+
     params = {
         "client_id": cfg["client_id"],
         "response_type": "code",
         "redirect_uri": cfg["redirect_uri"],
         "response_mode": "query",
-        "scope": " ".join(["openid","profile","email","offline_access","Files.ReadWrite","User.Read"]),
-        "state": "ms_state_" + str(int(time.time()))
+        "scope": " ".join(["openid", "profile", "email", "offline_access", "Files.ReadWrite", "User.Read"]),
+        "state": state,
     }
-    st.session_state["__ms_state__"] = params["state"]
+
+    st.session_state["__ms_state__"] = state
+
     auth_url = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?{q}".format(
-        tenant=cfg.get("tenant_id","common"), q=urllib.parse.urlencode(params)
+        tenant=cfg.get("tenant_id", "common"),
+        q=urllib.parse.urlencode(params),
     )
     st.markdown(f"[Continue to Microsoft]({auth_url})")
-
-def ms_oauth_callback() -> bool:
-    """Handle Microsoft's redirect back to the app.
-
-    Streamlit can create a new session on redirect; if that happens, we may not
-    have the saved __ms_state__. If we *do* have it, enforce it; otherwise proceed.
-    """
+def ms_oauth_callback():
     cfg = get_secret("microsoft_oauth", {})
     params = st.query_params
 
-    code = params.get("code")
-    state = params.get("state")
-    if not code:
+    code = _qp_value(params, "code")
+    state = _qp_value(params, "state")
+    if not code or not state:
         return False
 
-    expected_state = st.session_state.get("__ms_state__")
-    if expected_state and state and state != expected_state:
+    saved_state = st.session_state.get("__ms_state__")
+    if saved_state is not None and state != saved_state:
+        return False
+
+    if isinstance(state, str) and not state.startswith("m_"):
         return False
 
     token_url = f"https://login.microsoftonline.com/{cfg.get('tenant_id','common')}/oauth2/v2.0/token"
-    scopes = " ".join(["openid","profile","email","offline_access","Files.ReadWrite","User.Read"])
-
     data = {
         "client_id": cfg["client_id"],
         "client_secret": cfg["client_secret"],
         "code": code,
         "redirect_uri": cfg["redirect_uri"],
         "grant_type": "authorization_code",
-        "scope": scopes,
+        "scope": "openid profile email offline_access Files.ReadWrite User.Read",
     }
 
     tok = requests.post(token_url, data=data, timeout=20).json()
     if "access_token" not in tok:
-        desc = tok.get("error_description") or tok.get("error") or str(tok)
-        st.sidebar.error(f"Microsoft OAuth token exchange failed: {desc}")
         return False
 
     tok["_obtained"] = int(time.time())
-    if "expires_in" in tok:
-        try:
-            tok["_expires_at"] = int(time.time()) + int(tok["expires_in"]) - 60
-        except Exception:
-            pass
-
     st.session_state["__ms_token__"] = tok
 
-    try:
-        me = requests.get(
-            "https://graph.microsoft.com/v1.0/me",
-            headers={"Authorization": f"Bearer {tok['access_token']}"},
-            timeout=10,
-        ).json()
-        st.session_state["__ms_user__"] = me.get("userPrincipalName", "microsoft-user")
-    except Exception:
-        st.session_state["__ms_user__"] = "microsoft-user"
+    me = requests.get(
+        "https://graph.microsoft.com/v1.0/me",
+        headers={"Authorization": f"Bearer {tok['access_token']}"},
+        timeout=20,
+    ).json()
+    st.session_state["__ms_user__"] = me.get("userPrincipalName", "microsoft-user")
 
-    st.session_state.pop("__ms_state__", None)
     st.query_params.clear()
     return True
-
-def ms_access_token() -> str | None:
-    """Return a valid Microsoft Graph access token (refreshing if needed)."""
-    cfg = get_secret("microsoft_oauth", {})
+def ms_access_token():
+    """Return Microsoft Graph access token, refreshing if needed."""
     tok = st.session_state.get("__ms_token__")
     if not tok:
         return None
 
-    now = int(time.time())
-    exp = tok.get("_expires_at")
-    if isinstance(exp, int) and now < exp and tok.get("access_token"):
-        return tok["access_token"]
+    access = tok.get("access_token")
+    if not access:
+        return None
 
-    # Try refresh_token flow if available.
-    refresh_tok = tok.get("refresh_token")
-    if not refresh_tok:
-        return tok.get("access_token")
-
-    token_url = f"https://login.microsoftonline.com/{cfg.get('tenant_id','common')}/oauth2/v2.0/token"
-    scopes = " ".join(["openid","profile","email","offline_access","Files.ReadWrite","User.Read"])
-
-    data = {
-        "client_id": cfg["client_id"],
-        "client_secret": cfg["client_secret"],
-        "refresh_token": refresh_tok,
-        "redirect_uri": cfg["redirect_uri"],
-        "grant_type": "refresh_token",
-        "scope": scopes,
-    }
-
-    new_tok = requests.post(token_url, data=data, timeout=20).json()
-    if "access_token" not in new_tok:
-        # Keep the old token; might still work briefly.
-        return tok.get("access_token")
-
-    new_tok["_obtained"] = int(time.time())
+    # Refresh if we know it's expired and we have a refresh token.
     try:
-        new_tok["_expires_at"] = int(time.time()) + int(new_tok.get("expires_in", 3600)) - 60
+        obtained = int(tok.get("_obtained", 0))
+        expires_in = int(tok.get("expires_in", 0))
+        # Refresh a little early (60s).
+        if tok.get("refresh_token") and expires_in and obtained and (time.time() > obtained + expires_in - 60):
+            cfg = get_secret("microsoft_oauth", {})
+            token_url = f"https://login.microsoftonline.com/{cfg.get('tenant_id','common')}/oauth2/v2.0/token"
+            data = {
+                "client_id": cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+                "grant_type": "refresh_token",
+                "refresh_token": tok["refresh_token"],
+                "redirect_uri": cfg["redirect_uri"],
+                "scope": "openid profile email offline_access Files.ReadWrite User.Read",
+            }
+            new_tok = requests.post(token_url, data=data, timeout=20).json()
+            if "access_token" in new_tok:
+                new_tok["_obtained"] = int(time.time())
+                st.session_state["__ms_token__"] = new_tok
+                return new_tok["access_token"]
     except Exception:
         pass
 
-    st.session_state["__ms_token__"] = new_tok
-    return new_tok["access_token"]
-
+    return access
 class MSExcelOAuth(StorageBackend):
     def __init__(self, title: str):
         self.base = "https://graph.microsoft.com/v1.0"
@@ -1514,26 +1464,64 @@ class MSExcelOAuth(StorageBackend):
     def open_url_hint(self, rec: dict) -> str | None:
         return "https://www.office.com/launch/excel"
 
-@st.cache_resource
 def get_backend(kind: str) -> StorageBackend:
+    """Create a backend instance.
+
+    NOTE: OAuth-backed backends are intentionally NOT cached because their behavior depends
+    on per-session OAuth tokens stored in st.session_state.
+    """
+    if kind in (BACKEND_GS_OAUTH, BACKEND_MS_OAUTH):
+        title = get_secret("sheets.title", "SubmittalCheckerData")
+        if kind == BACKEND_GS_OAUTH:
+            return GoogleSheetsOAuth(title)
+        return MSExcelOAuth(title)
+    return _get_backend_cached(kind)
+
+@st.cache_resource
+def _get_backend_cached(kind: str) -> StorageBackend:
     title = get_secret("sheets.title", "SubmittalCheckerData")
     if kind == BACKEND_GS_SERVICE:
         return GoogleSheetsSA(title)
-    if kind == BACKEND_GS_OAUTH:
-        return GoogleSheetsOAuth(title)
-    if kind == BACKEND_MS_OAUTH:
-        return MSExcelOAuth(title)
     data_dir = os.path.join(os.path.dirname(__file__), "data")
     os.makedirs(data_dir, exist_ok=True)
     return SQLiteBackend(os.path.join(data_dir, "checker.db"))
 
 # Thin wrappers
 
-def get_backend_choice():
-    """Convenience wrapper for pages that just want the currently selected backend."""
-    backend_key = st.session_state.get("__backend_choice__", BACKEND_SQLITE)
-    return get_backend(backend_key)
+def get_backend_choice() -> StorageBackend:
+    """Return the backend instance for the current selection.
 
+    OAuth backends require the user to sign in first. If the user hasn't signed in yet,
+    we keep the app usable by temporarily falling back to SQLite. Once sign-in completes,
+    this will automatically switch to the selected OAuth backend.
+    """
+    selected_key = st.session_state.get("__backend_choice__", BACKEND_SQLITE)
+
+    # Decide what we can actually instantiate right now.
+    effective_key = selected_key
+    if selected_key == BACKEND_GS_OAUTH and google_credentials() is None:
+        st.sidebar.warning("Google not signed in. Click **Sign in** above, then return here.")
+        effective_key = BACKEND_SQLITE
+    elif selected_key == BACKEND_MS_OAUTH and not ms_access_token():
+        st.sidebar.warning("Microsoft not signed in. Click **Sign in** above, then return here.")
+        effective_key = BACKEND_SQLITE
+
+    # Reuse existing instance if it matches what we'd instantiate now.
+    inst = st.session_state.get("__backend_instance__")
+    inst_effective = st.session_state.get("__backend_effective_kind__")
+    if inst is not None and inst_effective == effective_key:
+        return inst
+
+    try:
+        inst = get_backend(effective_key)
+    except Exception as e:
+        st.sidebar.error(f"Backend error: {e}")
+        inst = get_backend(BACKEND_SQLITE)
+        effective_key = BACKEND_SQLITE
+
+    st.session_state["__backend_instance__"] = inst
+    st.session_state["__backend_effective_kind__"] = effective_key
+    return inst
 def db_save_preset(b: StorageBackend, name: str, payload: dict): return b.save_preset(name, payload)
 def db_load_presets(b: StorageBackend) -> dict: return b.load_presets()
 def db_delete_preset(b: StorageBackend, name: str): return b.delete_preset(name)
@@ -1949,27 +1937,44 @@ elif backend_choice == BACKEND_MS_OAUTH:
 if st.session_state.get("__do_google_oauth__"):
     st.session_state.pop("__do_google_oauth__", None)
     google_oauth_start()
-    st.info("After signing in, you'll be redirected back here. If nothing happens, check for pop-up blocking.")
     st.stop()
 elif st.session_state.get("__do_ms_oauth__"):
     st.session_state.pop("__do_ms_oauth__", None)
     ms_oauth_start()
-    st.info("After signing in, you'll be redirected back here. If nothing happens, check for pop-up blocking.")
     st.stop()
 else:
-    # OAuth redirect back into the app
-    if "code" in st.query_params:
-        ok = google_oauth_callback() or ms_oauth_callback()
-        if ok:
-            # callbacks clear query params; rerun to show authenticated UI cleanly
+    code = _qp_value(st.query_params, "code")
+    state = _qp_value(st.query_params, "state")
+    if code and state:
+        handled = False
+
+        # Use state prefixes to avoid "Google handler tries to redeem Microsoft code" chaos.
+        if isinstance(state, str) and state.startswith("g_"):
+            try:
+                handled = bool(google_oauth_callback())
+            except Exception as e:
+                st.sidebar.warning(f"Google OAuth callback failed: {e}")
+        elif isinstance(state, str) and state.startswith("m_"):
+            try:
+                handled = bool(ms_oauth_callback())
+            except Exception as e:
+                st.sidebar.warning(f"Microsoft OAuth callback failed: {e}")
+        else:
+            # Back-compat: if state isn't prefixed, attempt both but don't crash.
+            try:
+                handled = bool(google_oauth_callback()) or handled
+            except Exception as e:
+                st.sidebar.warning(f"Google OAuth callback failed: {e}")
+            try:
+                handled = bool(ms_oauth_callback()) or handled
+            except Exception as e:
+                st.sidebar.warning(f"Microsoft OAuth callback failed: {e}")
+
+        if handled:
             st.rerun()
 
-# Instantiate backend (fallback to SQLite on error)
-try:
-    backend = get_backend(backend_choice)
-except Exception as e:
-    st.sidebar.error(f"Backend error: {e}")
-    backend = get_backend(BACKEND_SQLITE)
+# Instantiate backend
+backend = get_backend_choice()
 
 
 # =========================
