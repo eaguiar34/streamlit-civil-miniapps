@@ -2,72 +2,43 @@ import streamlit as st
 from pathlib import Path
 import fieldflow_core as core
 
-st.set_page_config(page_title="FieldFlow • Settings & Examples", page_icon="🦺", layout="wide")
-backend = core.render_sidebar("Settings & Examples")
+st.set_page_config(page_title="Settings & Examples", page_icon="🧰", layout="wide")
+core.render_sidebar("Settings & Examples")
 
 st.title("Settings & Examples")
 
-st.markdown("""
-This page is for:
-- Downloading **sample input files** (spec/submittal/schedule)
-- Initializing cloud storage backends safely (especially OneDrive/Excel) so the app doesn't hit quota errors during normal reruns.
-""")
+st.markdown("### Sample files (download)")
+base = Path(__file__).resolve().parents[1] / "sample_data"
 
-st.subheader("Sample files (from repo: sample_data/)")
-sample_dir = Path(__file__).resolve().parents[1] / "sample_data"
+samples = [
+    ("spec_sample.txt", "Spec sample (text)"),
+    ("submittal_sample.txt", "Submittal sample (text)"),
+    ("schedule_sample.csv", "Schedule sample (CSV)"),
+]
 
-def dl(path: Path, label: str):
-    if not path.exists():
-        st.info(f"Not found in this deployment: {path.name} (expected under sample_data/)")
-        return
-    data = path.read_bytes()
-    st.download_button(label, data=data, file_name=path.name, use_container_width=True)
+for fn, label in samples:
+    fp = base / fn
+    if fp.exists():
+        st.download_button(
+            label=f"Download: {label}",
+            data=fp.read_bytes(),
+            file_name=fn,
+            mime="application/octet-stream",
+            use_container_width=True,
+        )
+    else:
+        st.warning(f"Missing file: {fp}")
 
-dl(sample_dir / "spec_sample.txt", "Download spec_sample.txt")
-dl(sample_dir / "submittal_sample", "Download submittal_sample (rename to .txt if needed)")
-dl(sample_dir / "schedule_sample.csv", "Download schedule_sample.csv")
+st.markdown("---")
+st.markdown("### One-time setup for Microsoft (avoids Graph workbook creation spam)")
+st.markdown(
+    "If you're using **Microsoft 365 Excel (OAuth)**, click **Initialize OneDrive workbook** in the sidebar once. "
+    "This creates the workbook a single time and saves its ID to session storage so reruns don't keep trying to create it."
+)
 
-st.divider()
-st.subheader("Cloud storage initialization")
-
-# Microsoft init
-ms_signed_in = bool(core.ms_access_token())
-st.write(f"Microsoft status: {'🟢 signed in' if ms_signed_in else '⚪ not signed in'}")
-if ms_signed_in:
-    if st.button("Initialize OneDrive workbook (recommended once per session)"):
-        try:
-            msb = core.MSExcelOAuth(core.get_secret("sheets.title", "FieldFlow"))
-            wb_id = msb.initialize_workbook()
-            st.success(f"Workbook initialized. id={wb_id}")
-        except Exception as e:
-            st.error(f"Microsoft init failed: {e}")
-else:
-    st.caption("Select Microsoft storage in the sidebar and click Sign in.")
-
-# Google init (optional)
-st.divider()
-g_signed_in = core.google_credentials() is not None
-st.write(f"Google status: {'🟢 signed in' if g_signed_in else '⚪ not signed in'}")
-if g_signed_in:
-    if st.button("Initialize Google Sheet tabs (optional)"):
-        try:
-            gb = core.GoogleSheetsOAuth(core.get_secret('sheets.title', 'FieldFlow'))
-            # Touch presets sheet by saving and deleting a sentinel preset
-            gb.save_preset('__init__', {'ok': True})
-            gb.delete_preset('__init__')
-            st.success("Google Sheets initialized (presets tab reachable).")
-        except Exception as e:
-            st.error(f"Google init failed: {e}")
-else:
-    st.caption("Select Google Sheets (OAuth) in the sidebar and click Sign in.")
-
-st.divider()
-st.subheader("Deployment notes (Streamlit Cloud)")
-st.markdown("""
-1. Put secrets in **Streamlit Cloud → App → Settings → Secrets** (never commit secrets to GitHub).
-2. Ensure OAuth Redirect URIs match exactly:
-   - Google: `https://fieldflow.streamlit.app/`
-   - Azure: `https://fieldflow.streamlit.app/`
-3. After changing secrets, click **Reboot** in Streamlit Cloud.
-""")
-
+st.markdown("### Troubleshooting")
+st.markdown(
+    "- If pages show `AttributeError: module 'fieldflow_core' has no attribute ...`, your deployed `fieldflow_core.py` is not the updated one.\n"
+    "- Make sure your GitHub repo contains **fieldflow_core.py** at the repo root, and the `pages/` folder contains **05_Settings_and_Examples.py**.\n"
+    "- In Streamlit Cloud, **Manage app → Reboot app** after pushing the latest commit."
+)
