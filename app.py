@@ -110,8 +110,8 @@ def bm25_scores(query: str, docs: list[str]) -> list[float]:
 # =========================
 st.set_page_config(page_title="FieldFlow", layout="wide")
 
-# ---------- Width shims (handles Streamlit deprecations gracefully)
-def df_fullwidth(df, **kwargs):
+# ----------  shims (handles Streamlit deprecations gracefully)
+def df_full(df, **kwargs):
     try:
         return st.dataframe(df, width='stretch', **kwargs)
     except TypeError:
@@ -1952,7 +1952,7 @@ import streamlit as st
 LOGO_PATH = Path(__file__).parent / "assets" / "FieldFlow_logo.png"
 
 if LOGO_PATH.exists():
-    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+    st.sidebar.image(str(LOGO_PATH), width = 'stretch')
 else:
     st.sidebar.write("FieldFlow")  # fallback
 
@@ -3104,9 +3104,9 @@ def rfi_manager_page():
 
             cbtn1, cbtn2 = st.columns(2)
 
-            save_draft = cbtn1.form_submit_button("Save draft", type="secondary", use_container_width=True)
+            save_draft = cbtn1.form_submit_button("Save draft", type="secondary", width = 'stretch')
 
-            submit_rfi = cbtn2.form_submit_button("Submit", type="primary", use_container_width=True)
+            submit_rfi = cbtn2.form_submit_button("Submit", type="primary", width = 'stretch')
         if save_draft or submit_rfi:
             if not project.strip() or not subject.strip() or not question.strip():
                 st.warning("Project, Subject, and Question are required.")
