@@ -1211,9 +1211,32 @@ class MSExcelOAuth(StorageBackend):
         if not self.token:
             raise RuntimeError("Microsoft not authenticated.")
         self.title = title
-        self._workbook_id = self._ensure_workbook()
+
+        # Streamlit reruns can recreate this object frequently, which can trigger lots of
+        # Graph calls (list root / create file) and lead to throttling/quota errors.
+        # Cache the workbook id per-session and lazily resolve it only when we actually need it.
+        self._workbook_id = None
+        self._workbook_cache_key = f"__ms_workbook_id__::{self.title}"
+        if self._workbook_cache_key in st.session_state:
+            self._workbook_id = st.session_state[self._workbook_cache_key]
+
 
     def _hed(self): return {"Authorization": f"Bearer {self.token}", "Content-Type":"application/json"}
+
+
+    def _get_workbook_id(self) -> str:
+        if self._workbook_id:
+            return self._workbook_id
+
+        wid = st.session_state.get(self._workbook_cache_key)
+        if wid:
+            self._workbook_id = wid
+            return wid
+
+        wid = self._ensure_workbook()
+        self._workbook_id = wid
+        st.session_state[self._workbook_cache_key] = wid
+        return wid
 
     def _ensure_workbook(self):
         r_resp = requests.get(f"{self.base}/me/drive/root/children", headers=self._hed(), timeout=20)
@@ -1256,7 +1279,7 @@ class MSExcelOAuth(StorageBackend):
         return wid
 
     def _ensure_worksheet(self, name: str, headers: list[str]):
-        url_ws = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets"
+        url_ws = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets"
         r = requests.get(url_ws, headers=self._hed()).json()
         names = [w["name"] for w in r.get("value",[])]
         if name not in names:
@@ -1294,11 +1317,11 @@ class MSExcelOAuth(StorageBackend):
         end_cell = f"{self._col_name(end_col_num)}{end_row}"
         address = f"{col_letters}{start_row}:{end_cell}"
 
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws_name)}/range(address='{address}')"
+        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws_name)}/range(address='{address}')"
         requests.patch(url, headers=self._hed(), data=json.dumps({"values": values_2d}))
 
     def _append_rows(self, ws_name: str, values_2d: list[list]):
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws_name)}/usedRange(valuesOnly=true)"
+        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws_name)}/usedRange(valuesOnly=true)"
         r = requests.get(url, headers=self._hed()).json()
         row_count = r.get("rowCount", 0) or 0
         start_cell = f"A{row_count+1}" if row_count>0 else "A1"
@@ -1318,7 +1341,7 @@ class MSExcelOAuth(StorageBackend):
 
     def list_feedback(self, limit: int = 50) -> pd.DataFrame:
         self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"])
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote('feedback')}/usedRange(valuesOnly=true)"
+        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote('feedback')}/usedRange(valuesOnly=true)"
         r = requests.get(url, headers=self._hed()).json()
         vals = r.get("values", [])
         if len(vals) <= 1:
@@ -1338,7 +1361,7 @@ class MSExcelOAuth(StorageBackend):
         ]
         self._ensure_worksheet(ws, headers)
         # Load current
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
         r = requests.get(url, headers=self._hed()).json()
         vals = r.get("values", [])
         existing = vals[1:] if len(vals) > 1 else []
@@ -1392,7 +1415,7 @@ class MSExcelOAuth(StorageBackend):
             "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
         ]
         self._ensure_worksheet(ws, headers)
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
         r = requests.get(url, headers=self._hed()).json()
         vals = r.get("values", [])
         if len(vals) <= 1:
@@ -1427,7 +1450,7 @@ class MSExcelOAuth(StorageBackend):
     def load_presets(self) -> dict:
         ws = "presets"; headers = ["name","json","updated_at"]
         self._ensure_worksheet(ws, headers)
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
         r = requests.get(url, headers=self._hed()).json()
         vals = r.get("values", [])
         out = {}
@@ -1452,7 +1475,7 @@ class MSExcelOAuth(StorageBackend):
                                       "pass_count","review_count","pass_rate",
                                       "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"]
         self._ensure_worksheet(ws, headers)
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
         r = requests.get(url, headers=self._hed()).json()
         vals = r.get("values", [])
         run_id = max(1, len(vals))  # naive id
@@ -1483,7 +1506,7 @@ class MSExcelOAuth(StorageBackend):
                                       "pass_count","review_count","pass_rate",
                                       "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"]
         self._ensure_worksheet(ws, headers)
-        url = f"{self.base}/me/drive/items/{self._workbook_id}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
         r = requests.get(url, headers=self._hed()).json()
         vals = r.get("values", [])
         if len(vals) <= 1:
@@ -2892,6 +2915,9 @@ def schedule_whatifs_page():
 
             base_schedule, base_days = cpm_schedule(edited_df_use, overlap_frac, clamp_ff)
             if cal_mode: base_schedule = calendarize(base_schedule, proj_start, cbd)
+            # Persist latest baseline result for export/save
+            st.session_state['__schedule_baseline_df__'] = base_schedule.copy()
+            st.session_state['__schedule_baseline_days__'] = int(base_days)
 
             st.success(f"Baseline duration: {base_days} days")
             df_fullwidth(base_schedule, hide_index=True, height=rows_to_height(len(base_schedule)+5))
@@ -2944,6 +2970,10 @@ def schedule_whatifs_page():
 
                     crashed_schedule, final_days = schedule, cur
                     if cal_mode: crashed_schedule = calendarize(crashed_schedule, proj_start, cbd)
+                    # Persist latest crashed result for export/save
+                    st.session_state['__schedule_crashed_df__'] = crashed_schedule.copy() if crashed_schedule is not None else None
+                    st.session_state['__schedule_crashed_days__'] = int(final_days)
+                    st.session_state['__schedule_crash_log__'] = list(log)
                     edited_df_use["_baseline_duration"] = edited_df_use["Duration"]; base_cost = total_cost(edited_df_use)
                     df_cfg["_baseline_duration"] = edited_df_use["Duration"]; crash_cost = total_cost(df_cfg)
 
@@ -2951,7 +2981,86 @@ def schedule_whatifs_page():
                     st.success(f"New duration: {final_days} days (target: {target_days})")
                     st.metric("Added cost (approx)", f"${crash_cost - base_cost:,.0f}")
 
-                    st.subheader("Crashed Schedule")
+                    st.subheader
+    # -------------------------
+    # Export / Save results
+    # -------------------------
+    base_df = st.session_state.get("__schedule_baseline_df__")
+    crash_df = st.session_state.get("__schedule_crashed_df__")
+
+    if base_df is not None and isinstance(base_df, pd.DataFrame) and not base_df.empty:
+        st.subheader("Save / Export results")
+
+        options = ["Baseline"]
+        if crash_df is not None and isinstance(crash_df, pd.DataFrame) and not crash_df.empty:
+            options.append("Crashed")
+
+        which = st.radio("Which result do you want to save?", options, horizontal=True, key="__schedule_save_choice__")
+        df_sel = crash_df if which == "Crashed" else base_df
+
+        # Make a CSV download (always available)
+        df_csv = df_sel.copy()
+        for c in df_csv.columns:
+            if pd.api.types.is_datetime64_any_dtype(df_csv[c]):
+                df_csv[c] = df_csv[c].dt.strftime("%Y-%m-%d")
+        csv_bytes = df_csv.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label=f"Download {which} schedule as CSV",
+            data=csv_bytes,
+            file_name=f"schedule_{which.lower()}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        # Save into the selected storage backend (Google Sheets / Microsoft Excel via OAuth)
+        backend = get_backend_choice()
+
+        # Suggest a unique worksheet/tab name to avoid overwriting and reduce API calls.
+        default_tab = f"schedule_{which.lower()}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        tab_name = st.text_input("Worksheet / tab name", value=default_tab, key="__schedule_tab_name__")
+
+        def _df_to_rows(df: pd.DataFrame) -> tuple[list[str], list[list[str]]]:
+            out = df.copy()
+            for c in out.columns:
+                if pd.api.types.is_datetime64_any_dtype(out[c]):
+                    out[c] = out[c].dt.strftime("%Y-%m-%d")
+            out = out.fillna("")
+            headers = out.columns.astype(str).tolist()
+            body = out.astype(str).values.tolist()
+            return headers, body
+
+        can_save = isinstance(backend, (GoogleSheetsOAuth, MSExcelOAuth))
+        if not can_save:
+            st.info("To save directly into a spreadsheet, select **Google Sheets (OAuth)** or **Microsoft 365 Excel (OAuth)** in the Storage dropdown.")
+        else:
+            if st.button(f"Save {which} result to storage", type="primary", use_container_width=True, key="__schedule_save_btn__"):
+                try:
+                    headers, body = _df_to_rows(df_sel)
+
+                    if isinstance(backend, GoogleSheetsOAuth):
+                        ws = backend._ensure_ws(tab_name, headers)
+                        try:
+                            ws.clear()
+                        except Exception:
+                            pass
+                        ws.update([headers])
+                        if body:
+                            ws.append_rows(body, value_input_option="RAW")
+
+                    elif isinstance(backend, MSExcelOAuth):
+                        backend._ensure_worksheet(tab_name, headers)
+                        backend._update_range(tab_name, "A1", [headers])
+                        if body:
+                            backend._append_rows(tab_name, body)
+
+                    st.success(f"Saved to '{tab_name}'.")
+                    backend.open_url_hint()
+
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+
+("Crashed Schedule")
                     df_fullwidth(crashed_schedule, hide_index=True, height=rows_to_height(len(crashed_schedule)+5))
                     st.subheader("Gantt (Crashed)")
                     chart_fullwidth(gantt_chart(crashed_schedule))
