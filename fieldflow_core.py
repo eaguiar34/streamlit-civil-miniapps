@@ -2039,12 +2039,6 @@ def render_sidebar(active_page: str = "Home"):
     """Shared sidebar: logo + storage selection + OAuth sign-in + basic help.
     Call this at the top of every page.
     """
-    # --- Logo (Linux is case-sensitive) ---
-    logo_path = _Path(__file__).parent / "assets" / "FieldFlow_logo.png"
-    if logo_path.exists():
-        st.sidebar.image(str(logo_path), use_container_width=True)
-
-    st.sidebar.markdown("## FieldFlow")
 
     # --- OAuth callbacks (must run on every page because redirect lands on *a page*) ---
     handled = False
