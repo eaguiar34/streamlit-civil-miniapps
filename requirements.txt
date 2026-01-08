@@ -7,3 +7,7 @@ google-auth
 google-auth-oauthlib
 requests-oauthlib
 gspread
+altair
+rapidfuzz
+pypdf
+python-docx
