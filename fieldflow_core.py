@@ -25,6 +25,17 @@ import streamlit as st
 import altair as alt
 import requests
 
+# ---- OAuth scopes (keep stable to avoid Google 'scope changed' errors) ----
+GOOGLE_SCOPES = [
+    'openid',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive.file',
+]
+
+MS_SCOPES = 'openid profile email offline_access Files.ReadWrite User.Read'
+
 # ==== Robust PDF/OCR/Table extraction helpers (add after imports) ====
 import hashlib
 
@@ -752,11 +763,7 @@ def google_oauth_start():
                 "token_uri": "https://oauth2.googleapis.com/token",
             }
         },
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.file",
-            "openid", "email", "profile",
-        ],
+        scopes=GOOGLE_SCOPES,
         state=state,
     )
     flow.redirect_uri = cfg["redirect_uri"]
@@ -813,15 +820,19 @@ def google_oauth_callback():
                 "token_uri": "https://oauth2.googleapis.com/token",
             }
         },
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.file",
-            "openid", "email", "profile",
-        ],
+        scopes=GOOGLE_SCOPES,
         state=state,
     )
     flow.redirect_uri = cfg["redirect_uri"]
-    flow.fetch_token(code=code)
+    try:
+        flow.fetch_token(code=code)
+    except Exception as e:
+        msg = str(e)
+        # Common when you change requested scopes between deployments.
+        if "Scope has changed" in msg:
+            for k in ["__google_token__", "__google_user__", "__google_state__", "__google_code_verifier__"]:
+                st.session_state.pop(k, None)
+        raise
 
     creds = flow.credentials
     st.session_state["__google_token__"] = {
@@ -1153,7 +1164,7 @@ def ms_oauth_callback():
         "code": code,
         "redirect_uri": cfg["redirect_uri"],
         "grant_type": "authorization_code",
-        "scope": "openid profile email offline_access Files.ReadWrite User.Read",
+        "scope": MS_SCOPES,
     }
 
     tok = requests.post(token_url, data=data, timeout=20).json()
@@ -1196,7 +1207,7 @@ def ms_access_token():
                 "grant_type": "refresh_token",
                 "refresh_token": tok["refresh_token"],
                 "redirect_uri": cfg["redirect_uri"],
-                "scope": "openid profile email offline_access Files.ReadWrite User.Read",
+                "scope": MS_SCOPES,
             }
             new_tok = requests.post(token_url, data=data, timeout=20).json()
             if "access_token" in new_tok:
@@ -1221,15 +1232,21 @@ class MSExcelOAuth(StorageBackend):
     def _hed(self): return {"Authorization": f"Bearer {self.token}", "Content-Type":"application/json"}
 
     def _get_workbook_id(self) -> str:
-        """Return workbook id, creating the workbook if needed (cached in session_state)."""
+        """Return workbook id (must be initialized once).
+
+        We do **not** auto-create on every rerun because Streamlit reruns frequently and
+        Microsoft Graph can rate-limit workbook creation.
+        """
         if self._workbook_id:
             return self._workbook_id
-        self._workbook_id = self._ensure_workbook()
+        # Prefer cached id set by the sidebar init button
         try:
-            st.session_state["__ms_workbook_id__"] = self._workbook_id
+            self._workbook_id = st.session_state.get('__ms_workbook_id__')
         except Exception:
-            pass
-        return self._workbook_id
+            self._workbook_id = None
+        if self._workbook_id:
+            return self._workbook_id
+        raise RuntimeError('OneDrive workbook not initialized. Open **Microsoft storage setup** in the sidebar and click **Initialize OneDrive workbook**.')
 
     def _ensure_workbook(self):
         r_resp = requests.get(f"{self.base}/me/drive/root/children", headers=self._hed(), timeout=20)
@@ -2039,6 +2056,19 @@ def render_sidebar(active_page: str = "Home"):
     """Shared sidebar: logo + storage selection + OAuth sign-in + basic help.
     Call this at the top of every page.
     """
+    # --- Logo (make it robust to filename case/extension) ---
+    assets_dir = _Path(__file__).parent / 'assets'
+    logo_candidates = [
+        'FieldFlow_logo.png', 'FieldFlow_logo.PNG',
+        'FieldFlow_logo.jpg', 'FieldFlow_logo.jpeg',
+    ]
+    for nm in logo_candidates:
+        lp = assets_dir / nm
+        if lp.exists():
+            st.sidebar.image(str(lp), use_container_width=True)
+            break
+
+    st.sidebar.markdown("## FieldFlow")
 
     # --- OAuth callbacks (must run on every page because redirect lands on *a page*) ---
     handled = False
@@ -2064,18 +2094,61 @@ def render_sidebar(active_page: str = "Home"):
         if st.button("Microsoft", use_container_width=True):
             ms_oauth_start()
 
-    # Show signed-in status
-    if google_credentials() is not None:
+    # Signed-in status + sign-out
+    g_ok = google_credentials() is not None
+    m_ok = bool(ms_access_token())
+
+    if g_ok:
         st.sidebar.success("Google: signed in")
     else:
         st.sidebar.info("Google: not signed in")
 
-    if ms_access_token():
+    if m_ok:
         st.sidebar.success("Microsoft: signed in")
     else:
         st.sidebar.info("Microsoft: not signed in")
 
-    # --- Storage backend selection ---
+    colso1, colso2 = st.sidebar.columns(2)
+    with colso1:
+        if g_ok and st.button("Sign out Google", use_container_width=True):
+            for k in ["__google_token__", "__google_state__", "__google_code_verifier__"]:
+                st.session_state.pop(k, None)
+            # Clear query params so we don't re-process callback on rerun
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            st.rerun()
+    with colso2:
+        if m_ok and st.button("Sign out Microsoft", use_container_width=True):
+            for k in ["__ms_token__", "__ms_state__", "__ms_code_verifier__", "__ms_workbook_id__"]:
+                st.session_state.pop(k, None)
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            st.rerun()
+
+    # One-time Microsoft workbook init (prevents quotaLimitReached on reruns)
+    if m_ok:
+        with st.sidebar.expander("Microsoft workbook (OneDrive)", expanded=False):
+            wb_id = st.session_state.get("__ms_workbook_id__")
+            if wb_id:
+                st.caption("Workbook initialized ✅")
+            else:
+                st.caption("Workbook not initialized yet.")
+                if st.button("Initialize OneDrive workbook", use_container_width=True):
+                    try:
+                        cfg = get_secret("sheets", {})
+                        title = cfg.get("title") or "FieldFlow"
+                        b = MSExcelOAuth(title)
+                        wid = b._ensure_workbook()
+                        st.session_state["__ms_workbook_id__"] = wid
+                        st.success("Workbook created and cached for this session.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Workbook init failed: {e}")
+# --- Storage backend selection ---
     st.sidebar.markdown("### Storage")
     options = [
         (BACKEND_SQLITE, "Local (SQLite)"),
