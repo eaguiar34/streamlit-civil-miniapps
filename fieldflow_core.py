@@ -1,3 +1,7 @@
+# fieldflow_core.py
+# Auto-generated modular core from your monolithic app.py
+
+
 # app.py
 # FieldFlow: Submittal Checker + Schedule What-Ifs
 # - Sidebar pages
@@ -108,6 +112,7 @@ def bm25_scores(query: str, docs: list[str]) -> list[float]:
 # =========================
 # App bootstrap
 # =========================
+
 # ---------- Width shims (handles Streamlit deprecations gracefully)
 def df_fullwidth(df, **kwargs):
     try:
@@ -1215,26 +1220,16 @@ class MSExcelOAuth(StorageBackend):
 
     def _hed(self): return {"Authorization": f"Bearer {self.token}", "Content-Type":"application/json"}
 
-    def is_initialized(self) -> bool:
-        return bool(self._workbook_id)
-
-    def init_workbook(self) -> str:
-        """Create/find the workbook once and cache its id in session_state."""
+    def _get_workbook_id(self) -> str:
+        """Return workbook id, creating the workbook if needed (cached in session_state)."""
+        if self._workbook_id:
+            return self._workbook_id
         self._workbook_id = self._ensure_workbook()
         try:
             st.session_state["__ms_workbook_id__"] = self._workbook_id
         except Exception:
             pass
         return self._workbook_id
-
-    def _get_workbook_id(self) -> str:
-        """Return workbook id if initialized; otherwise raise a friendly error."""
-        if self._workbook_id:
-            return self._workbook_id
-        raise RuntimeError(
-            "OneDrive workbook not initialized. Open **Settings & Examples** and click "
-            "**Initialize OneDrive workbook** once."
-        )
 
     def _ensure_workbook(self):
         r_resp = requests.get(f"{self.base}/me/drive/root/children", headers=self._hed(), timeout=20)
@@ -1588,56 +1583,31 @@ def get_backend_choice() -> StorageBackend:
     st.session_state["__backend_instance__"] = inst
     st.session_state["__backend_effective_kind__"] = effective_key
     return inst
-
-def _backend_call(label: str, fn, default=None):
-    try:
-        return fn()
-    except Exception as e:
-        # Show in sidebar so it doesn't interrupt the main layout
-        try:
-            st.sidebar.error(f"Backend error ({label}): {e}")
-        except Exception:
-            st.error(f"Backend error ({label}): {e}")
-        return default
-
-def db_save_preset(b: StorageBackend, name: str, payload: dict):
-    return _backend_call("save_preset", lambda: b.save_preset(name, payload), None)
-
-def db_load_presets(b: StorageBackend) -> dict:
-    return _backend_call("load_presets", lambda: b.load_presets(), {})
-
-def db_delete_preset(b: StorageBackend, name: str):
-    return _backend_call("delete_preset", lambda: b.delete_preset(name), None)
-
+def db_save_preset(b: StorageBackend, name: str, payload: dict): return b.save_preset(name, payload)
+def db_load_presets(b: StorageBackend) -> dict: return b.load_presets()
+def db_delete_preset(b: StorageBackend, name: str): return b.delete_preset(name)
 def db_save_submittal(b: StorageBackend, meta: dict, csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
-    return int(_backend_call("save_submittal", lambda: b.save_submittal(meta, csv_bytes, spec_excerpt, sub_excerpt), 0) or 0)
+    return b.save_submittal(meta, csv_bytes, spec_excerpt, sub_excerpt)
+def db_list_submittals(b: StorageBackend) -> pd.DataFrame: return b.list_submittals()
+def db_get_submittal(b: StorageBackend, id_: int) -> dict: return b.get_submittal(id_)
+def db_delete_submittal(b: StorageBackend, id_: int): return b.delete_submittal(id_)
+def db_open_url_hint(b: StorageBackend, rec: dict) -> str | None: return b.open_url_hint(rec)
 
-def db_list_submittals(b: StorageBackend) -> pd.DataFrame:
-    return _backend_call("list_submittals", lambda: b.list_submittals(), pd.DataFrame())
-
-def db_get_submittal(b: StorageBackend, id_: int) -> dict:
-    return _backend_call("get_submittal", lambda: b.get_submittal(id_), {})
-
-def db_delete_submittal(b: StorageBackend, id_: int):
-    return _backend_call("delete_submittal", lambda: b.delete_submittal(id_), None)
-
-def db_open_url_hint(b: StorageBackend, rec: dict) -> str | None:
-    return _backend_call("open_url_hint", lambda: b.open_url_hint(rec), None)
 
 # RFI wrappers
 
 def db_upsert_rfi(b: StorageBackend, row: dict) -> int:
-    return int(_backend_call("upsert_rfi", lambda: b.upsert_rfi(row), 0) or 0)
+    return b.upsert_rfi(row)
 
 def db_list_rfis(b: StorageBackend, limit: int = 5000) -> pd.DataFrame:
-    return _backend_call("list_rfis", lambda: b.list_rfis(limit=limit), pd.DataFrame())
+    return b.list_rfis(limit=limit)
 
 def db_get_rfi(b: StorageBackend, id_: int) -> dict:
-    return _backend_call("get_rfi", lambda: b.get_rfi(id_), {})
+    return b.get_rfi(id_)
 
 def db_delete_rfi(b: StorageBackend, id_: int) -> None:
-    _backend_call("delete_rfi", lambda: b.delete_rfi(id_), None)
-    return None
+    return b.delete_rfi(id_)
+
 # -------------------------
 # Tiny settings helper (piggyback on presets table)
 # -------------------------
@@ -1976,58 +1946,68 @@ def summarize_feedback(df: pd.DataFrame) -> dict:
     return {"count": count, "avg_rating": avg, "by_page": by_page, "top_words": top_words}
 
 
-
-
-def _current_user_label() -> str:
-    if "__google_user__" in st.session_state:
-        return st.session_state["__google_user__"]
-    if "__ms_user__" in st.session_state:
-        return st.session_state["__ms_user__"]
-    return "anonymous"
-
-
 # =========================
-# Modular sidebar helper (used by multipage app)
+# Sidebar: storage + auth
 # =========================
+from pathlib import Path
+import streamlit as st
 
-def render_sidebar(active_page: str = "") -> None:
-    """Render the left sidebar (storage selection + OAuth sign-in).
+LOGO_PATH = Path(__file__).parent / "assets" / "FieldFlow_logo.png"
 
-    This is safe to call from Streamlit multipage apps (no st.set_page_config here).
-    """
-    from pathlib import Path
+if LOGO_PATH.exists():
+    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+else:
+    st.sidebar.write("FieldFlow")  # fallback
 
-    # Logo (case-sensitive on Streamlit Cloud)
-    logo_path = Path(__file__).parent / "assets" / "FieldFlow_logo.png"
-    if logo_path.exists():
-        st.sidebar.image(str(logo_path), use_container_width=True)
-    else:
-        st.sidebar.title("FieldFlow")
+st.sidebar.title("FieldFlow")
+st.sidebar.subheader("Storage")
 
-    st.sidebar.subheader("Storage")
+backend_choice = st.sidebar.selectbox(
+    "Save presets & memory bank to",
+    BACKEND_CHOICES,
+    index=BACKEND_CHOICES.index(_ensure_ss("__backend_choice__", BACKEND_SQLITE)),
+)
+st.session_state["__backend_choice__"] = backend_choice
 
-    # Storage backend choice
-    backend_choice = st.sidebar.selectbox(
-        "Save presets & memory bank to",
-        BACKEND_CHOICES,
-        index=BACKEND_CHOICES.index(_ensure_ss("__backend_choice__", BACKEND_SQLITE)),
-        key="__backend_choice__",
-    )
+def _badge(ok): return "🟢 signed in" if ok else "⚪ not signed in"
 
-    # OAuth callback handling (runs when provider redirects back with ?code=...&state=...)
-    try:
-        qp = st.query_params  # Streamlit >= 1.30
-        state = qp.get("state")
-    except Exception:
-        try:
-            qp = st.experimental_get_query_params()
-            state = qp.get("state", [None])[0]
-        except Exception:
-            state = None
+if backend_choice == BACKEND_GS_OAUTH:
+    st.sidebar.write("Google: " + _badge("__google_user__" in st.session_state))
+    colA, colB = st.sidebar.columns(2)
+    if colA.button("Sign in"):
+        st.session_state["__do_google_oauth__"] = True
+        st.rerun()
+    if colB.button("Sign out"):
+        for k in ["__google_token__","__google_user__","__google_flow__","__google_state__"]:
+            st.session_state.pop(k, None)
+        st.success("Signed out of Google.")
+elif backend_choice == BACKEND_MS_OAUTH:
+    st.sidebar.write("Microsoft: " + _badge("__ms_user__" in st.session_state))
+    colA, colB = st.sidebar.columns(2)
+    if colA.button("Sign in"):
+        st.session_state["__do_ms_oauth__"] = True
+        st.rerun()
+    if colB.button("Sign out"):
+        for k in ["__ms_token__","__ms_user__","__ms_state__"]:
+            st.session_state.pop(k, None)
+        st.success("Signed out of Microsoft.")
 
-    if state:
+# Handle OAuth flows
+if st.session_state.get("__do_google_oauth__"):
+    st.session_state.pop("__do_google_oauth__", None)
+    google_oauth_start()
+    st.stop()
+elif st.session_state.get("__do_ms_oauth__"):
+    st.session_state.pop("__do_ms_oauth__", None)
+    ms_oauth_start()
+    st.stop()
+else:
+    code = _qp_value(st.query_params, "code")
+    state = _qp_value(st.query_params, "state")
+    if code and state:
         handled = False
-        # Prefix state with g_ / m_ to avoid mixed-provider callbacks
+
+        # Use state prefixes to avoid "Google handler tries to redeem Microsoft code" chaos.
         if isinstance(state, str) and state.startswith("g_"):
             try:
                 handled = bool(google_oauth_callback())
@@ -2039,7 +2019,7 @@ def render_sidebar(active_page: str = "") -> None:
             except Exception as e:
                 st.sidebar.warning(f"Microsoft OAuth callback failed: {e}")
         else:
-            # Back-compat: attempt both but don't crash
+            # Back-compat: if state isn't prefixed, attempt both but don't crash.
             try:
                 handled = bool(google_oauth_callback()) or handled
             except Exception as e:
@@ -2052,55 +2032,1291 @@ def render_sidebar(active_page: str = "") -> None:
         if handled:
             st.rerun()
 
-    # Status badges
-    def _badge(ok: bool) -> str:
-        return "🟢 signed in" if ok else "⚪ not signed in"
 
-    g_ok = google_credentials() is not None
-    m_ok = bool(ms_access_token())
+from pathlib import Path as _Path
 
-    st.sidebar.write(f"Google: {_badge(g_ok)}")
-    cols = st.sidebar.columns(2)
-    if cols[0].button("Google Sign in", use_container_width=True, disabled=g_ok):
-        google_oauth_start()
-    if cols[1].button("Google Sign out", use_container_width=True, disabled=not g_ok):
-        st.session_state.pop("__google_creds__", None)
-        st.session_state.pop("__google_user__", None)
+def render_sidebar(active_page: str = "Home"):
+    """Shared sidebar: logo + storage selection + OAuth sign-in + basic help.
+    Call this at the top of every page.
+    """
+    # --- Logo (Linux is case-sensitive) ---
+    logo_path = _Path(__file__).parent / "assets" / "FieldFlow_logo.png"
+    if logo_path.exists():
+        st.sidebar.image(str(logo_path), use_container_width=True)
+
+    st.sidebar.markdown("## FieldFlow")
+
+    # --- OAuth callbacks (must run on every page because redirect lands on *a page*) ---
+    handled = False
+    try:
+        handled = bool(google_oauth_callback()) or handled
+    except Exception as e:
+        st.sidebar.warning(f"Google OAuth callback failed: {e}")
+    try:
+        handled = bool(ms_oauth_callback()) or handled
+    except Exception as e:
+        st.sidebar.warning(f"Microsoft OAuth callback failed: {e}")
+
+    if handled:
         st.rerun()
 
-    st.sidebar.write(f"Microsoft: {_badge(m_ok)}")
-    cols = st.sidebar.columns(2)
-    if cols[0].button("Microsoft Sign in", use_container_width=True, disabled=m_ok):
-        ms_oauth_start()
-    if cols[1].button("Microsoft Sign out", use_container_width=True, disabled=not m_ok):
-        st.session_state.pop("__ms_token__", None)
-        st.session_state.pop("__ms_user__", None)
-        st.session_state.pop("__ms_workbook_id__", None)
-        st.rerun()
+    # --- Sign-in / sign-out ---
+    st.sidebar.markdown("### Sign in")
+    colg, colm = st.sidebar.columns(2)
+    with colg:
+        if st.button("Google", use_container_width=True):
+            google_oauth_start()
+    with colm:
+        if st.button("Microsoft", use_container_width=True):
+            ms_oauth_start()
 
-    # OneDrive workbook initialization (prevents Graph quota spam on reruns)
-    if backend_choice == BACKEND_MS_OAUTH and m_ok:
-        with st.sidebar.expander("Microsoft workbook", expanded=False):
-            wid = st.session_state.get("__ms_workbook_id__")
-            if wid:
-                st.success("Workbook initialized.")
+    # Show signed-in status
+    if google_credentials() is not None:
+        st.sidebar.success("Google: signed in")
+    else:
+        st.sidebar.info("Google: not signed in")
+
+    if ms_access_token():
+        st.sidebar.success("Microsoft: signed in")
+    else:
+        st.sidebar.info("Microsoft: not signed in")
+
+    # --- Storage backend selection ---
+    st.sidebar.markdown("### Storage")
+    options = [
+        (BACKEND_SQLITE, "Local (SQLite)"),
+        (BACKEND_GS_SERVICE, "Google Sheets (Service Account)"),
+        (BACKEND_GS_OAUTH, "Google Sheets (OAuth)"),
+        (BACKEND_MS_OAUTH, "Microsoft 365 Excel (OAuth)"),
+    ]
+    labels = [label for _, label in options]
+    key_to_idx = {k: i for i, (k, _) in enumerate(options)}
+    current = st.session_state.get("__backend_choice__", BACKEND_SQLITE)
+    idx = key_to_idx.get(current, 0)
+    chosen_label = st.sidebar.selectbox("Where to save data", labels, index=idx)
+    chosen_key = dict(options)[chosen_label]
+    st.session_state["__backend_choice__"] = chosen_key
+
+    # Helpful hint: show effective backend (OAuth falls back to SQLite until signed in)
+    eff = chosen_key
+    if chosen_key == BACKEND_GS_OAUTH and google_credentials() is None:
+        eff = BACKEND_SQLITE
+    if chosen_key == BACKEND_MS_OAUTH and not ms_access_token():
+        eff = BACKEND_SQLITE
+    st.sidebar.caption(f"Effective backend: **{eff}**")
+
+    # --- Navigation hint (since we're using Streamlit multipage) ---
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"Page: **{active_page}**")
+    st.sidebar.caption("Use the left nav (pages) to switch tools.")
+
+
+def submittal_checker_page():
+    backend = get_backend_choice()
+    st.header("Submittal Checker")
+
+    # Readers
+    try:
+        from rapidfuzz import fuzz
+    except Exception:
+        st.error("Missing dependency `rapidfuzz`. pip install rapidfuzz")
+        return
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        PdfReader = None
+    try:
+        import docx
+    except Exception:
+        docx = None
+
+    def _read_pdf(file: io.BytesIO) -> str:
+        if not PdfReader: return ""
+        reader = PdfReader(file)
+        parts = []
+        for p in reader.pages:
+            try: parts.append(p.extract_text() or "")
+            except Exception: pass
+        return "\n".join(parts)
+
+    def _read_docx(file: io.BytesIO) -> str:
+        if not docx: return ""
+        d = docx.Document(file)
+        return "\n".join(p.text for p in d.paragraphs)
+
+    def _read_txt(file: io.BytesIO) -> str:
+        return file.read().decode(errors="ignore")
+
+    def _read_csv(file: io.BytesIO) -> str:
+        df = pd.read_csv(file)
+        strings = []
+        for col in df.columns:
+            try: strings.extend(df[col].astype(str).tolist())
+            except: pass
+        return "\n".join(strings)
+
+    def read_any(uploaded) -> str:
+        name = (getattr(uploaded, "name","") or "").lower()
+        raw_bytes = uploaded.read()
+        data = io.BytesIO(raw_bytes)
+
+        # primary text extraction
+        if name.endswith(".pdf"):
+            base = _read_pdf(data)
+            # OCR fallback
+            if use_ocr and (not base or len(base.strip()) < 40):
+                base = ocr_pdf_to_text(io.BytesIO(raw_bytes)) or base
+            # tables
+            tabtxt = tabula_tables_to_text(io.BytesIO(raw_bytes)) if use_table else ""
+            return (base + "\n\n" + tabtxt).strip()
+        if name.endswith(".docx"): return _read_docx(data)
+        if name.endswith(".txt"):  return _read_txt(data)
+        if name.endswith(".csv"):  return _read_csv(data)
+        raise ValueError(f"Unsupported file: {name}")
+
+    BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+[.)]|[A-Z]\.|[A-Z]\))\s+")
+    HEADER_RE = re.compile(r"^(?:PART|SECTION|DIVISION|SUBMITTALS?|WARRANTY|SHOP DRAWINGS)\b", re.I)
+    def clean_text(t: str) -> str:
+        t = re.sub(r"\r","\n", t)
+        t = re.sub(r"\n{2,}","\n", t)
+        return t.strip()
+    def split_into_chunks(t: str) -> List[str]:
+        lines = [ln.strip() for ln in t.split("\n")]
+        chunks, acc = [], []
+        def flush():
+            if acc:
+                s = " ".join(acc).strip()
+                if s: chunks.append(s)
+                acc.clear()
+        for ln in lines:
+            if not ln:
+                flush(); continue
+            if BULLET_RE.search(ln) or HEADER_RE.search(ln):
+                flush(); chunks.append(ln); continue
+            acc.append(ln)
+        flush()
+        seen, out = set(), []
+        for c in chunks:
+            k = c.lower()
+            if k not in seen:
+                out.append(c); seen.add(k)
+        return out
+
+    # Presets + defaults
+    DEFAULTS = {
+        "must": "data sheet,warranty,certificate",
+        "nice": "shop drawing,test report,O&M manual",
+        "forbid": "by others,not provided,N/A",
+        "weights": {"alpha":0.45,"beta":0.35,"gamma":0.20,"delta":0.20,"epsilon":0.05},
+        "threshold": 85,
+    }
+    def _apply_preset(p):
+        st.session_state["kw_must"] = p.get("must", DEFAULTS["must"])
+        st.session_state["kw_nice"] = p.get("nice", DEFAULTS["nice"])
+        st.session_state["kw_forbid"] = p.get("forbid", DEFAULTS["forbid"])
+        w = p.get("weights", DEFAULTS["weights"])
+        st.session_state["w_alpha"] = float(w.get("alpha", DEFAULTS["weights"]["alpha"]))
+        st.session_state["w_beta"] = float(w.get("beta", DEFAULTS["weights"]["beta"]))
+        st.session_state["w_gamma"] = float(w.get("gamma", DEFAULTS["weights"]["gamma"]))
+        st.session_state["w_delta"] = float(w.get("delta", DEFAULTS["weights"]["delta"]))
+        st.session_state["w_epsilon"] = float(w.get("epsilon", DEFAULTS["weights"]["epsilon"]))
+        st.session_state["hybrid_threshold"] = int(p.get("threshold", DEFAULTS["threshold"]))
+        st.rerun()
+    if "kw_must" not in st.session_state:
+        _apply_preset(DEFAULTS)
+
+    # Sources
+    cL, cR = st.columns(2)
+    with cL:
+        st.subheader("Spec Source")
+        spec_file = st.file_uploader("Upload spec (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="spec_file")
+        spec_text_area = st.text_area("Or paste spec text", height=220, placeholder="Paste specification clauses…", key="spec_text")
+    with cR:
+        st.subheader("Submittal Source")
+        sub_file = st.file_uploader("Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="sub_file")
+        sub_text_area = st.text_area("Or paste submittal text", height=220, placeholder="Paste submittal content…", key="sub_text")
+
+    st.markdown("---")
+    with st.expander("Reviewer policy, keywords & weights", expanded=False):
+        # Presets
+        row1 = st.columns([0.35,0.2,0.2,0.25])
+        presets = db_load_presets(backend)
+        with row1[0]:
+            sel = st.selectbox("Load preset", ["—"] + sorted(presets.keys()))
+        with row1[1]:
+            if st.button("Load"):
+                if sel != "—":
+                    _apply_preset(presets[sel])
+        with row1[2]:
+            if st.button("Reset"):
+                _apply_preset(DEFAULTS)
+        with row1[3]:
+            if sel != "—" and st.button("Delete preset"):
+                db_delete_preset(backend, sel); st.success(f"Deleted {sel}"); st.rerun()
+
+        cA, cB = st.columns(2)
+        with cA:
+            must_text = st.text_area("Must-have terms (comma-separated)",
+                                     st.session_state["kw_must"], key="kw_must",
+                                     help="All must appear in the best-matching submittal excerpt; otherwise PASS is blocked.")
+            nice_text = st.text_area("Nice-to-have terms",
+                                     st.session_state["kw_nice"], key="kw_nice",
+                                     help="Improves the coverage portion of the hybrid score.")
+        with cB:
+            forbid_text = st.text_area("Forbidden phrases",
+                                       st.session_state["kw_forbid"], key="kw_forbid",
+                                       help="Any hit blocks PASS and applies a penalty.")
+            st.caption("Forbidden always blocks PASS regardless of score.")
+
+        st.markdown("**Scoring weights**")
+        α = st.slider("Lexical weight", 0.0, 1.0, st.session_state["w_alpha"], 0.05, key="w_alpha",
+                      help="RapidFuzz token-set similarity of spec vs. submittal text (literal match strength).")
+        β = st.slider("Semantic weight", 0.0, 1.0, st.session_state["w_beta"], 0.05, key="w_beta",
+                      help="Embedding cosine similarity (meaning match). Uses sentence-transformers if available.")
+        γ = st.slider("Coverage weight", 0.0, 1.0, st.session_state["w_gamma"], 0.05, key="w_gamma",
+                      help="Coverage: 70% must + 30% nice. Encourages presence of reviewer keywords.")
+        δ = st.slider("Forbidden penalty per hit", 0.0, 1.0, st.session_state["w_delta"], 0.05, key="w_delta",
+                      help="Subtract this per forbidden phrase hit in the best match.")
+        ε = st.slider("Section boost (match)", 0.0, 0.5, st.session_state["w_epsilon"], 0.01, key="w_epsilon",
+                      help="Small bonus when headings align (e.g., Warranty vs. Warranty).")
+
+        row2 = st.columns([0.8,0.2])
+        with row2[0]:
+            pname = st.text_input("Preset name", placeholder="e.g., Div03_Concrete_ReviewerA")
+        with row2[1]:
+            if st.button("Save preset"):
+                payload = {
+                    "must": st.session_state["kw_must"],
+                    "nice": st.session_state["kw_nice"],
+                    "forbid": st.session_state["kw_forbid"],
+                    "weights": {"alpha":α, "beta":β, "gamma":γ, "delta":δ, "epsilon":ε},
+                    "threshold": st.session_state.get("hybrid_threshold", 85),
+                }
+                if not pname.strip():
+                    st.warning("Enter a preset name.")
+                else:
+                    db_save_preset(backend, pname.strip(), payload)
+                    st.success(f"Saved preset: {pname.strip()}"); st.rerun()
+
+    threshold = st.slider("Hybrid PASS threshold", 0, 100,
+                          st.session_state.get("hybrid_threshold", 85),
+                          help="Final decision threshold on the 0–100 hybrid score.")
+    st.markdown("---")
+    t1, t2, t3, t4 = st.columns(4)
+    use_ocr   = t1.checkbox("OCR if PDF text is empty", value=True,
+                            help="Try Tesseract when PDFs are scans.")
+    use_table = t2.checkbox("Extract tables", value=True,
+                            help="Use tabula to read embedded tables and index them.")
+    use_bm25  = t3.checkbox("BM25 boost", value=True,
+                            help="Lexical retriever for long clauses.")
+    use_sem   = t4.checkbox("Semantic embeddings", value=True,
+                            help="Use sentence-transformer embeddings if available")
+
+    run_btn = st.button("Analyze", type="primary")
+
+    if run_btn:
+        try:
+            spec_text = ""
+            if spec_file: spec_text = read_any(spec_file)
+            if spec_text_area: spec_text = (spec_text + "\n" + spec_text_area).strip()
+
+            sub_text = ""
+            if sub_file: sub_text = read_any(sub_file)
+            if sub_text_area: sub_text = (sub_text + "\n" + sub_text_area).strip()
+
+            if not spec_text: st.warning("Provide spec text or upload a spec file."); st.stop()
+            if not sub_text: st.warning("Provide submittal text or upload a submittal file."); st.stop()
+
+            spec_text = clean_text(spec_text); sub_text = clean_text(sub_text)
+            spec_chunks = split_into_chunks(spec_text)
+            sub_chunks = split_into_chunks(sub_text)
+
+            # lexical + semantic(optional)
+            try:
+                from sentence_transformers import SentenceTransformer
+                model = SentenceTransformer("all-MiniLM-L6-v2")
+                emb_spec = model.encode(spec_chunks, show_progress_bar=False, normalize_embeddings=True)
+                emb_sub  = model.encode(sub_chunks, show_progress_bar=False, normalize_embeddings=True)
+                use_sem = True
+            except Exception:
+                use_sem = False
+
+            def section_of(s: str) -> str:
+                m = re.search(r"(WARRANTY|SUBMITTALS?|SHOP DRAWINGS|PRODUCT DATA|TESTS?)", s, re.I)
+                return (m.group(1).upper() if m else "")
+
+            must = [w.strip() for w in st.session_state["kw_must"].split(",") if w.strip()]
+            nice = [w.strip() for w in st.session_state["kw_nice"].split(",") if w.strip()]
+            forbid = [w.strip() for w in st.session_state["kw_forbid"].split(",") if w.strip()]
+
+            rows = []
+            for i, s in enumerate(spec_chunks):
+                s_norm = s.lower()
+                sec_s = section_of(s)
+                best_rf = -1.0; best_sem = 0.0; best_sec = 0.0
+                best_chunk = ""
+                for j, t in enumerate(sub_chunks):
+                    t_norm = t.lower()
+                    rf = float(fuzz.token_set_ratio(s_norm, t_norm)) / 100.0
+                    sem = float(np.dot(emb_spec[i], emb_sub[j])) if use_sem else 0.0
+                    sec_bonus = ε if (sec_s and sec_s == section_of(t)) else 0.0
+                    score = α*rf + β*sem + sec_bonus
+                    ref = α*best_rf + β*best_sem + best_sec
+                    if score > ref:
+                        best_rf, best_sem, best_sec, best_chunk = rf, sem, sec_bonus, t
+
+                # coverage / forbid
+                t_use = best_chunk.lower()
+                must_hits = sum(1 for w in must if w.lower() in t_use)
+                nice_hits = sum(1 for w in nice if w.lower() in t_use)
+                forb_hits = sum(1 for w in forbid if w.lower() in t_use)
+                must_cov = (must_hits / max(1, len(must))) if must else 0.0
+                nice_cov = (nice_hits / max(1, len(nice))) if nice else 0.0
+                coverage = 0.7*must_cov + 0.3*nice_cov
+
+                hybrid = α*best_rf + β*(best_sem if use_sem else 0.0) + γ*coverage + best_sec - δ*forb_hits
+                hybrid = max(0.0, min(1.0, hybrid))
+                exact_like = (s_norm in t_use) or (best_rf >= 0.97)
+                pass_logic = (exact_like or (hybrid*100 >= threshold)) and (must_hits == len(must)) and (forb_hits == 0)
+                decision = "PASS" if pass_logic else "REVIEW"
+
+                def hl(text: str, words: List[str], color: str) -> str:
+                    out = text
+                    for w in sorted(words, key=len, reverse=True):
+                        if not w: continue
+                        out = re.sub(rf"({re.escape(w)})", rf"<mark style='background:{color};padding:0 2px'>\1</mark>", out, flags=re.I)
+                    return out
+
+                best_chunk_html = hl(best_chunk, must, "#d1ffd1")
+                best_chunk_html = hl(best_chunk_html, nice, "#d1e8ff")
+                best_chunk_html = hl(best_chunk_html, forbid, "#ffd6d6")
+
+                rows.append({
+                    "Concept": " ".join(re.findall(r"[A-Za-z0-9-/]+", s)[:10]),
+                    "Spec Item": s,
+                    "Best Match": best_chunk,
+                    "Hybrid_Score": round(hybrid, 3),
+                    "Lexical": round(best_rf, 3),
+                    "Semantic": round(best_sem if use_sem else 0.0, 3),
+                    "Coverage": round(coverage, 3),
+                    "Must_hits": must_hits,
+                    "Nice_hits": nice_hits,
+                    "Forbidden_hits": forb_hits,
+                    "Section_bonus": round(best_sec, 3),
+                    "Exact_like": exact_like,
+                    "Decision": decision,
+                    "_best_chunk_html": best_chunk_html,
+                })
+
+            df = pd.DataFrame(rows)
+            pass_rate = (df["Decision"]=="PASS").mean() if not df.empty else 0.0
+
+            m1,m2,m3 = st.columns(3)
+            m1.metric("Coverage (PASS)", f"{pass_rate*100:.0f}%")
+            m2.metric("Threshold", threshold)
+            m3.metric("Items", len(df))
+
+            st.markdown("### Results")
+            df_show = df.drop(columns=["_best_chunk_html"])
+            df_fullwidth(df_show, hide_index=True, height=rows_to_height(len(df_show)+5))
+
+            st.markdown("### Best-match highlights")
+            for _, r in df.iterrows():
+                with st.expander(r["Concept"][:80] or r["Spec Item"][:80]):
+                    st.write("**Spec:** ", r["Spec Item"])
+                    st.write("**Decision:** ", r["Decision"], " — Hybrid: ", r["Hybrid_Score"])
+                    st.markdown(r["_best_chunk_html"], unsafe_allow_html=True)
+
+            csv_bytes = df_show.to_csv(index=False).encode()
+            st.download_button("Download results CSV", csv_bytes, "submittal_checker_results.csv", "text/csv")
+
+            # Memory Bank save
+            st.markdown("---")
+            st.subheader("Save to Memory Bank")
+            pass_count = int((df["Decision"]=="PASS").sum())
+            review_count = int((df["Decision"]=="REVIEW").sum())
+            meta_weights = {"alpha":α,"beta":β,"gamma":γ,"delta":δ,"epsilon":ε}
+
+            with st.form("save_run"):
+                c1,c2,c3 = st.columns(3)
+                company = c1.text_input("Company", "")
+                client  = c2.text_input("Client", "")
+                project = c3.text_input("Project", "")
+                c4,c5,c6 = st.columns(3)
+                date_submitted = c4.date_input("Date submitted", value=date.today())
+                quote = c5.number_input("Quote (if any)", min_value=0.0, value=0.0, step=1000.0)
+                notes = c6.text_input("Notes", "")
+                submit = st.form_submit_button("Save run")
+                if submit:
+                    if not company or not project:
+                        st.warning("Company and Project required.")
+                    else:
+                        run_id = db_save_submittal(
+                            backend,
+                            {
+                                "company":company,"client":client,"project":project,
+                                "date_submitted":str(date_submitted),"quote":float(quote),"notes":notes,
+                                "threshold":int(threshold),"weights":meta_weights,
+                                "must":",".join(must),"nice":",".join(nice),"forbid":",".join(forbid),
+                                "pass_count":pass_count,"review_count":review_count,"pass_rate":float(pass_rate),
+                            },
+                            csv_bytes,
+                            spec_text[:2000],
+                            sub_text[:2000],
+                        )
+                        st.success(f"Saved run #{run_id} ({company} – {project})")
+
+            st.subheader("Memory Bank")
+            bank = db_list_submittals(backend)
+            if bank.empty:
+                st.info("No saved runs yet.")
             else:
-                st.info("Click once to create/find your OneDrive workbook used for storage.")
-                if st.button("Initialize OneDrive workbook", use_container_width=True):
-                    try:
-                        b = get_backend(BACKEND_MS_OAUTH)
-                        if hasattr(b, "init_workbook"):
-                            b.init_workbook()
+                fc1,fc2,fc3,fc4 = st.columns(4)
+                f_company = fc1.selectbox("Company", ["All"] + sorted(bank["company"].dropna().unique().tolist()))
+                f_project = fc2.selectbox("Project", ["All"] + sorted(bank["project"].dropna().unique().tolist()))
+                f_client  = fc3.selectbox("Client",  ["All"] + sorted(bank["client"].dropna().unique().tolist()))
+                sort_by   = fc4.selectbox("Sort by", ["created_at (new→old)","pass_rate (high→low)","date_submitted (new→old)"])
+                view = bank.copy()
+                if f_company!="All": view = view[view["company"]==f_company]
+                if f_project!="All": view = view[view["project"]==f_project]
+                if f_client!="All":  view = view[view]["client"]==f_client
+                if sort_by.startswith("pass_rate"): view = view.sort_values("pass_rate", ascending=False)
+                elif sort_by.startswith("date_submitted"): view = view.sort_values("date_submitted", ascending=False)
+                else: view = view.sort_values("created_at", ascending=False)
+                df_fullwidth(view.assign(PassPct=(view["pass_rate"]*100).round(1)).rename(columns={"PassPct":"Pass %"}),
+                             hide_index=True, height=rows_to_height(len(view)+5))
+                st.markdown("##### Inspect / Download a saved run")
+                sid = st.number_input("Run ID", min_value=0, step=1)
+                a,b,c = st.columns(3)
+                if a.button("View details"):
+                    rec = db_get_submittal(backend, int(sid))
+                    if not rec: st.warning("No such run.")
+                    else:
+                        st.json({k: rec.get(k) for k in ["id","company","client","project","date_submitted","quote","pass_count","review_count","pass_rate","threshold","created_at"]})
+                        st.code(rec.get("spec_excerpt") or "—", language="text")
+                        st.code(rec.get("submittal_excerpt") or "—", language="text")
+                        if "result_csv" in rec:  # SQLite path
+                            st.download_button("Download results CSV", rec["result_csv"], f"submittal_run_{rec['id']}.csv", "text/csv")
                         else:
-                            # Fallback: old behavior
-                            _ = b._ensure_workbook()  # type: ignore
-                        st.success("Initialized workbook.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Init failed: {e}")
+                            st.caption("For Google/Microsoft backends, open the workspace to fetch results.")
+                        url = db_open_url_hint(backend, rec)
+                        if url: st.markdown(f"[Open in workspace]({url})")
+                if b.button("Delete"):
+                    db_delete_submittal(backend, int(sid)); st.success(f"Deleted run #{int(sid)}"); st.rerun()
 
-    st.sidebar.divider()
-    if active_page:
-        st.sidebar.caption(f"Page: {active_page}")
+        except Exception as e:
+            st.exception(e)
+
+# =========================
+# Schedule What-Ifs (page)
+# =========================
+def schedule_whatifs_page():
+    backend = get_backend_choice()
+    st.header("Schedule What-Ifs — Floats + Calendar")
+
+    REQUIRED = ["Task","Duration","Predecessors","Normal_Cost_per_day","Crash_Cost_per_day"]
+    ALIASES: Dict[str,str] = {
+        "task":"Task","activity":"Task","name":"Task",
+        "duration":"Duration","duration_days":"Duration","duration_(days)":"Duration","dur":"Duration",
+        "predecessors":"Predecessors","pred":"Predecessors","predecessor":"Predecessors",
+        "normal_cost_per_day":"Normal_Cost_per_day","normal/day":"Normal_Cost_per_day","normal_cost/day":"Normal_Cost_per_day",
+        "normal_cost":"Normal_Cost_per_day","normal_cost_usd":"Normal_Cost_per_day",
+        "crash_cost_per_day":"Crash_Cost_per_day","crash/day":"Crash_Cost_per_day","crash_cost/day":"Crash_Cost_per_day",
+        "crash_cost":"Crash_Cost_per_day","crash_cost_usd":"Crash_Cost_per_day",
+        "min_duration":"Min_Duration","min_dur":"Min_Duration","min":"Min_Duration",
+        "crash_duration":"Min_Duration","crash_duration_days":"Min_Duration","crash_dur":"Min_Duration",
+        "overlap_ok":"Overlap_OK","overlap?":"Overlap_OK","allow_overlap":"Overlap_OK",
+    }
+
+    def norm_col(s: str) -> str:
+        s = str(s).strip().lower()
+        s = re.sub(r"[^a-z0-9]+","_", s)
+        return re.sub(r"_+","_", s).strip("_")
+
+    def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+        raw_to_norm = {c: norm_col(c) for c in df.columns}
+        rename_map = {}
+        for raw, norm in raw_to_norm.items():
+            if norm in ALIASES:
+                rename_map[raw] = ALIASES[norm]
+        return df.rename(columns=rename_map)
+
+    def load_csv(uploaded) -> Tuple[pd.DataFrame, List[str]]:
+        warnings: List[str] = []
+        raw = uploaded.getvalue()
+        df = pd.read_csv(io.BytesIO(raw))
+        df = canonicalize_columns(df)
+        if "Min_Duration" not in df.columns and "Duration" in df.columns:
+            df["Min_Duration"] = df["Duration"]; warnings.append("Min_Duration not provided; defaulting to Duration.")
+        if "Overlap_OK" not in df.columns:
+            df["Overlap_OK"] = False; warnings.append("Overlap_OK not provided; defaulting to False.")
+        for col in ["Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]:
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "Overlap_OK" in df.columns:
+            df["Overlap_OK"] = df["Overlap_OK"].astype(str).str.strip().str.lower().map(
+                {"1":True,"0":False,"true":True,"false":False,"yes":True,"no":False,"y":True,"n":False}
+            ).fillna(False)
+        if "Task" in df.columns: df["Task"] = df["Task"].astype(str)
+        if "Predecessors" in df.columns: df["Predecessors"] = df["Predecessors"].fillna("").astype(str)
+        if {"Duration","Min_Duration"} <= set(df.columns):
+            mask = df["Min_Duration"] > df["Duration"]
+            if mask.any():
+                warnings.append("Some rows have Min_Duration > Duration; clamping to Duration.")
+                df.loc[mask,"Min_Duration"] = df.loc[mask,"Duration"]
+        return df, warnings
+
+    # CPM with lags: FS/SS/FF + integer lag (±)
+    @dataclass
+    class CPMNode:
+        task: str
+        dur: int
+        preds: List[Tuple[str,str,int]]  # (pred, rel, lag)
+        es: int=0; ef: int=0; ls: int=0; lf: int=0; tf: int=0
+
+    def parse_predecessors(s: str) -> List[Tuple[str,str,int]]:
+        """
+        Accepts: "A", "A FS+0", "B SS+2; C FF-1"
+        Returns list of (pred_task, REL, lag_days)
+        """
+        if not s: return []
+        out = []
+        parts = [p.strip() for p in re.split(r"[;,]", s) if p.strip()]
+        for p in parts:
+            m = re.match(r"^(.+?)\s*(FS|SS|FF)?\s*([+\-]\d+)?$", p, re.I)
+            if m:
+                pred = m.group(1).strip()
+                rel  = (m.group(2) or "FS").upper()
+                lag  = int(m.group(3)) if m.group(3) else 0
+                out.append((pred, rel, lag))
+            else:
+                out.append((p, "FS", 0))
+        return out
+
+    def topological_order(nodes: Dict[str, CPMNode]) -> List[str]:
+        indeg = {k: 0 for k in nodes}
+        for n in nodes.values():
+            for p,_,_ in n.preds:
+                if p in indeg:
+                    indeg[n.task] += 1
+        Q = [k for k,d in indeg.items() if d==0]
+        order = []
+        while Q:
+            v = Q.pop(0); order.append(v)
+            for w in nodes:
+                if any(v==pp for pp,_,_ in nodes[w].preds):
+                    indeg[w]-=1
+                    if indeg[w]==0: Q.append(w)
+        if len(order)!=len(nodes):
+            raise ValueError("Dependency cycle detected. Check Predecessors.")
+        return order
+
+    def cpm_schedule(df: pd.DataFrame, overlap_frac: float=0.0, clamp_free_float: bool=True) -> Tuple[pd.DataFrame, int]:
+        nodes: Dict[str, CPMNode] = {}
+        for _, r in df.iterrows():
+            preds = parse_predecessors(r.get("Predecessors",""))
+            nodes[r["Task"]] = CPMNode(task=r["Task"], dur=int(max(0, r["Duration"])), preds=preds)
+
+        order = topological_order(nodes)
+
+        # Forward pass
+        for name in order:
+            node = nodes[name]
+            if not node.preds:
+                node.es = 0
+            else:
+                starts = []
+                for (p, rel, lag) in node.preds:
+                    if p not in nodes: raise ValueError(f"Unknown predecessor '{p}' for task '{name}'.")
+                    pred = nodes[p]
+                    if rel == "FS":
+                        base = pred.ef
+                        allow = bool(df.loc[df["Task"]==name, "Overlap_OK"].iloc[0]) if "Overlap_OK" in df.columns else False
+                        if allow and overlap_frac>0:
+                            base = max(0, pred.ef - int(round(overlap_frac*pred.dur)))
+                        starts.append(base + lag)
+                    elif rel == "SS":
+                        starts.append(pred.es + lag)
+                    elif rel == "FF":
+                        starts.append((pred.ef + lag) - node.dur)
+                    else:
+                        starts.append(pred.ef + lag)
+                node.es = max(starts)
+            node.ef = node.es + node.dur
+
+        project_duration = max((n.ef for n in nodes.values()), default=0)
+
+        # Successors
+        succs: Dict[str,List[str]] = {k:[] for k in nodes}
+        for t, n in nodes.items():
+            for (p,_,_) in n.preds:
+                if p in succs: succs[p].append(t)
+
+        # Backward pass
+        for name in reversed(order):
+            node = nodes[name]
+            succ_ls = [nodes[s].ls for s in succs[name]]
+            node.lf = min(succ_ls) if succ_ls else project_duration
+            node.ls = node.lf - node.dur
+            node.tf = node.ls - node.es
+
+        rows = []
+        for name in order:
+            n = nodes[name]
+            succ_es_min = min([nodes[s].es for s in succs[name]], default=project_duration)
+            free_raw = succ_es_min - n.ef
+            free_float = max(0, free_raw) if clamp_free_float else free_raw
+            max_pred_ef = 0
+            if n.preds:
+                max_pred_ef = max([
+                    nodes[p].ef if rel!="SS" else nodes[p].es
+                    for (p,rel,_) in n.preds if p in nodes
+                ], default=0)
+            indep = max(0, succ_es_min - max_pred_ef - n.dur)
+            interfering = n.tf - free_float
+            rows.append({
+                "Task": n.task, "Duration": n.dur,
+                "ES": n.es, "EF": n.ef, "LS": n.ls, "LF": n.lf,
+                "Total_Float": n.tf, "Slack": n.tf,
+                "Free_Float": free_float, "Free_Float_Raw": free_raw,
+                "Independent_Float": indep, "Interfering_Float": interfering,
+                "Critical": n.tf==0,
+            })
+        out = pd.DataFrame(rows).sort_values("ES", kind="stable")
+        return out, project_duration
+
+    # Calendar helpers
+    from pandas.tseries.offsets import CustomBusinessDay
+    def make_cbd(workdays: List[str], holidays: List[str]) -> CustomBusinessDay:
+        weekmask = " ".join(workdays)
+        hols = [pd.to_datetime(h).date() for h in holidays if h.strip()]
+        return CustomBusinessDay(weekmask=weekmask, holidays=hols)
+    def calendarize(schedule_df: pd.DataFrame, project_start: date, cbd: CustomBusinessDay) -> pd.DataFrame:
+        if schedule_df is None or schedule_df.empty: return schedule_df
+        out = schedule_df.copy()
+        start_ts = pd.to_datetime(project_start)
+        out["ES_date"] = start_ts + out["ES"].astype(int) * cbd
+        out["EF_date_excl"] = start_ts + out["EF"].astype(int) * cbd
+        out["Start_Date"] = out["ES_date"]
+        out["Finish_Date"] = out["EF_date_excl"] - 1 * cbd
+        return out
+    def gantt_chart(schedule_df: pd.DataFrame) -> alt.Chart:
+        if schedule_df is None or schedule_df.empty:
+            return alt.Chart(pd.DataFrame({"ES":[0],"EF":[0],"Task":["No tasks"]})).mark_bar()
+        data = schedule_df.copy()
+        data["Task"] = data["Task"].astype(str)
+        height = max(160, min(40*len(data), 1200))
+        if "ES_date" in data.columns and "EF_date_excl" in data.columns:
+            x = alt.X("ES_date:T", title="Start"); x2 = "EF_date_excl:T"
+        else:
+            x = alt.X("ES:Q", title="Day (project time)"); x2 = "EF:Q"
+        return (alt.Chart(data).mark_bar().encode(
+            x=x, x2=x2,
+            y=alt.Y("Task:N", sort=alt.SortField("ES", order="ascending")),
+            color=alt.condition("datum.Critical", alt.value("#d62728"), alt.value("#1f77b4")),
+            tooltip=["Task","Duration","ES","EF","LS","LF","Total_Float","Free_Float","Independent_Float","Interfering_Float",
+                     alt.Tooltip("Start_Date:T", title="Start Date", format="%Y-%m-%d"),
+                     alt.Tooltip("Finish_Date:T", title="Finish Date", format="%Y-%m-%d")],
+        ).properties(height=height))
+
+    # UI
+    st.subheader("Task Table")
+    uploaded = st.file_uploader("Upload tasks CSV", type=["csv"], accept_multiple_files=False)
+    with st.expander("CSV columns & example", expanded=False):
+        st.code(
+            "Task,Duration,Predecessors,Normal_Cost_per_day,Crash_Cost_per_day,Min_Duration,Overlap_OK\n"
+            "A - Site Prep,5,,1200,1800,3,TRUE\n"
+            "B - Foundations,10,\"A - Site Prep FS+0\",1600,2600,7,TRUE\n"
+            "C - Structure,12,\"B - Foundations SS+2\",1900,3000,9,TRUE\n"
+            "D - Enclosure,9,\"C - Structure FF+0\",1400,2300,7,FALSE\n",
+            language="csv"
+        )
+        st.caption("Predecessors accept lags like FS+2, SS-1, FF+0. Separate multiple predecessors by comma/semicolon.")
+
+    base_df = pd.DataFrame({
+        "Task":["A - Site Prep","B - Foundations","C - Structure","D - MEP Rough-In","E - Enclosure","F - Finishes"],
+        "Duration":[5,10,12,8,9,10],
+        "Predecessors":["","A - Site Prep FS+0","B - Foundations SS+2","C - Structure","C - Structure FF+0","D - MEP Rough-In, E - Enclosure"],
+        "Normal_Cost_per_day":[1200,1600,1900,1500,1400,1550],
+        "Crash_Cost_per_day":[1800,2600,3000,2400,2300,2550],
+        "Min_Duration":[3,7,9,6,7,8],
+        "Overlap_OK":[True, True, True, True, False, False],
+    })
+    if uploaded:
+        df, warns = load_csv(uploaded)
+    else:
+        df, warns = base_df.copy(), ["Using example table — upload your CSV to replace it."]
+
+    for w in warns: st.warning(w)
+    editor_height = rows_to_height(len(df)+5)
+    edited_df = editor_fullwidth(
+        df, hide_index=True, num_rows="dynamic",
+        column_config={
+            "Task": st.column_config.TextColumn("Task", required=True),
+            "Duration": st.column_config.NumberColumn("Duration", min_value=0, step=1),
+            "Predecessors": st.column_config.TextColumn(
+                "Predecessors",
+                help="Use FS/SS/FF with optional ±lag. e.g., A FS+0; B SS+2; C FF-1"
+            ),
+            "Normal_Cost_per_day": st.column_config.NumberColumn("Normal Cost / day", min_value=0),
+            "Crash_Cost_per_day": st.column_config.NumberColumn("Crash Cost / day", min_value=0),
+            "Min_Duration": st.column_config.NumberColumn("Min Duration", min_value=0, step=1),
+            "Overlap_OK": st.column_config.CheckboxColumn(
+                "Overlap OK", help="If enabled, FS successors may start earlier by a fraction of predecessor duration (see overlap control)."
+            ),
+        },
+        key="task_table", height=editor_height
+    )
+    # Coercions
+    edited_df["Task"] = edited_df["Task"].astype(str)
+    edited_df["Predecessors"] = edited_df["Predecessors"].fillna("").astype(str)
+    for c in ["Duration","Min_Duration"]: edited_df[c] = pd.to_numeric(edited_df[c], errors="coerce").fillna(0).astype(int).clip(lower=0)
+    for c in ["Normal_Cost_per_day","Crash_Cost_per_day"]: edited_df[c] = pd.to_numeric(edited_df[c], errors="coerce").fillna(0.0)
+    if "Overlap_OK" in edited_df.columns: edited_df["Overlap_OK"] = edited_df["Overlap_OK"].fillna(False).astype(bool)
+    else: edited_df["Overlap_OK"] = False
+
+    # Optional: apply schedule impacts from open RFIs
+    apply_rfi = st.checkbox("Apply open RFI schedule impacts", value=False, help="Adds Schedule_Impact_Days from open RFIs to linked tasks (Related_Tasks).")
+    edited_df_use = edited_df
+    if apply_rfi:
+        try:
+            rfis = db_list_rfis(backend, limit=5000)
+            if not rfis.empty:
+                impacts_src = rfis.copy()
+                impacts_src["schedule_impact_days"] = pd.to_numeric(impacts_src.get("schedule_impact_days", 0), errors="coerce").fillna(0).astype(int)
+                impacts_src["status"] = impacts_src.get("status", "").astype(str)
+                open_mask = ~impacts_src["status"].str.lower().isin(["closed", "cancelled"])
+                impacts_src = impacts_src[open_mask & (impacts_src["schedule_impact_days"] > 0)]
+                edited_df_use, impacts_applied = apply_rfi_impacts(edited_df, impacts_src)
+                if impacts_applied.empty:
+                    st.info("No open RFIs with schedule impact days to apply.")
+                else:
+                    st.success(f"Applied RFI impacts to {impacts_applied['Task'].nunique()} task(s).")
+                    df_fullwidth(impacts_applied, hide_index=True, height=rows_to_height(len(impacts_applied)+2))
+            else:
+                st.info("No RFIs found in the current storage backend.")
+        except Exception as e:
+            st.warning(f"Could not apply RFI impacts: {e}")
+
+    st.markdown("---")
+    left, right = st.columns([1,1])
+    with left:
+        target_days = st.number_input("Target project duration (days)", min_value=1, value=30, step=1,
+                                      help="Desired total project duration for crash analysis.")
+    with right:
+        overlap_frac = st.number_input("Fast-track overlap fraction", min_value=0.0, max_value=0.9, value=0.0, step=0.05,
+            help="When Overlap OK is true, FS successors may start earlier by this fraction of predecessor duration.")
+
+    c1, c2 = st.columns(2)
+    clamp_ff = c1.checkbox("Clamp Free Float at ≥ 0", value=True,
+                           help="Classic CPM reports Free Float as zero when negative. Uncheck to reveal negative FF caused by overlaps.")
+    cal_mode = c2.checkbox("Calendar mode (map to dates)", value=True,
+                           help="Convert ES/EF to working dates using your workweek and holidays.")
+    if cal_mode:
+        cw1, cw2 = st.columns([1,1])
+        with cw1:
+            proj_start = st.date_input("Project start date", value=date.today())
+        with cw2:
+            workdays = st.multiselect("Workdays", options=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+                                      default=["Mon","Tue","Wed","Thu","Fri"],
+                                      help="Working days for date conversion.")
+        holidays_text = st.text_area("Holidays (YYYY-MM-DD, one per line)", height=80, placeholder="2025-11-27\n2025-12-25",
+                                     help="Non-working dates to exclude.")
+        holidays = [ln.strip() for ln in holidays_text.splitlines() if ln.strip()]
+        cbd = make_cbd(workdays, holidays)
+
+    cA, cB = st.columns([1,1])
+    compute = cA.button("Compute CPM", type="secondary")
+    run_crash = cB.button("Crash to Target", type="primary")
+
+    if compute or run_crash:
+        try:
+            missing = [c for c in REQUIRED if c not in edited_df.columns]
+            if missing:
+                st.error(f"Missing required columns: {missing}"); st.stop()
+
+            base_schedule, base_days = cpm_schedule(edited_df_use, overlap_frac, clamp_ff)
+            if cal_mode: base_schedule = calendarize(base_schedule, proj_start, cbd)
+
+            # Cache results so we can export / save without recomputing on every rerun
+            st.session_state["__schedule_baseline_df__"] = base_schedule.copy()
+            st.session_state["__schedule_baseline_days__"] = int(base_days) if base_days is not None else None
+
+            st.success(f"Baseline duration: {base_days} days")
+            df_fullwidth(base_schedule, hide_index=True, height=rows_to_height(len(base_schedule)+5))
+            st.subheader("Gantt (Baseline)")
+            chart_fullwidth(gantt_chart(base_schedule))
+
+            # Simple greedy crash loop
+            def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
+                crit = schedule[schedule["Critical"]]
+                if crit.empty: return None
+                merged = crit.merge(
+                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
+                    on="Task", how="left", suffixes=("_sched","_cfg")
+                )
+                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
+                # After merge, pandas suffixes duplicate column names (e.g., Duration -> Duration_sched/Duration_cfg).
+                dur_col = "Duration_cfg" if "Duration_cfg" in merged.columns else "Duration"
+                merged[dur_col] = pd.to_numeric(merged[dur_col], errors="coerce")
+                merged["Min_Duration"] = pd.to_numeric(merged["Min_Duration"], errors="coerce")
+                can = merged[merged[dur_col] > merged["Min_Duration"]]
+                if can.empty: return None
+                can = can.sort_values(["slope","ES"], kind="stable")
+                return str(can.iloc[0]["Task"])
+
+            def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
+                new = df_cfg.copy()
+                new.loc[new["Task"]==task, "Duration"] = new.loc[new["Task"]==task, "Duration"] - 1
+                return new
+
+            def total_cost(df_cfg: pd.DataFrame) -> float:
+                baseline = (df_cfg["Normal_Cost_per_day"] * df_cfg["Duration"].round(0)).sum()
+                crashed_days = (df_cfg.get("_baseline_duration", df_cfg["Duration"]) - df_cfg["Duration"]).clip(lower=0)
+                slope = (df_cfg["Crash_Cost_per_day"] - df_cfg["Normal_Cost_per_day"]).clip(lower=0)
+                return float(baseline + (crashed_days * slope).sum())
+
+            if run_crash:
+                if target_days >= base_days:
+                    st.info("Target ≥ baseline; nothing to crash.")
+                else:
+                    df_cfg = edited_df_use.copy()
+                    df_cfg["_baseline_duration"] = df_cfg["Duration"]
+                    log = []
+                    schedule, cur = cpm_schedule(df_cfg, overlap_frac, clamp_ff)
+                    while cur > target_days:
+                        pick = crash_once(df_cfg, schedule)
+                        if pick is None: break
+                        df_cfg = apply_crash(df_cfg, pick)
+                        log.append(f"Shortened '{pick}' by 1 day.")
+                        schedule, cur = cpm_schedule(df_cfg, overlap_frac, clamp_ff)
+
+                    crashed_schedule, final_days = schedule, cur
+                    if cal_mode: crashed_schedule = calendarize(crashed_schedule, proj_start, cbd)
+                    edited_df_use["_baseline_duration"] = edited_df_use["Duration"]; base_cost = total_cost(edited_df_use)
+                    df_cfg["_baseline_duration"] = edited_df_use["Duration"]; crash_cost = total_cost(df_cfg)
+
+                    st.markdown("### Crashed Scenario")
+                    st.success(f"New duration: {final_days} days (target: {target_days})")
+                    # Cache latest crash scenario results for export / save
+                    st.session_state["__schedule_crashed_df__"] = final_schedule.copy()
+                    st.session_state["__schedule_crashed_days__"] = int(final_days) if final_days is not None else None
+                    st.session_state["__schedule_crash_log__"] = crash_log.copy() if isinstance(crash_log, list) else crash_log
+
+                    st.metric("Added cost (approx)", f"${crash_cost - base_cost:,.0f}")
+
+                    st.subheader("Crashed Schedule")
+                    df_fullwidth(crashed_schedule, hide_index=True, height=rows_to_height(len(crashed_schedule)+5))
+                    st.subheader("Gantt (Crashed)")
+                    chart_fullwidth(gantt_chart(crashed_schedule))
+                    st.subheader("Crash Log")
+                    if log:
+                        for line in log: st.write("•", line)
+                    else:
+                        st.write("No feasible crashes — target may be below theoretical minimum.")
+
+        except Exception as e:
+            st.exception(e)
 
 
+
+# =========================
+# RFI Manager (page)
+# =========================
+
+def rfi_manager_page():
+    st.header("RFI Manager")
+
+    backend = get_backend_choice()
+
+    # --- Create / Draft form ---
+    with st.expander("Create new RFI", expanded=True):
+        st.caption("Fields marked required: **Project**, **Subject**, **Question / Clarification needed**.")
+        with st.form("new_rfi_form"):
+            c1, c2, c3 = st.columns(3)
+            project = c1.text_input(
+                "Project *",
+                value="",
+                help="Your project/job identifier (e.g., 'LA River Rehab - Phase 2').",
+            )
+            discipline = c2.selectbox(
+                "Discipline",
+                ["General", "Civil", "Structural", "MEP", "Geotech", "Traffic", "Utilities", "Architectural"],
+                index=0,
+                help="Used for filtering and reporting.",
+            )
+            priority = c3.selectbox(
+                "Priority",
+                ["Low", "Normal", "High", "Urgent"],
+                index=1,
+                help="Used for triage and the aging dashboard.",
+            )
+
+            subject = st.text_input(
+                "Subject *",
+                help="Short title you would put in an email subject line.",
+            )
+            spec_section = st.text_input(
+                "Spec / Drawing Ref (optional)",
+                placeholder="e.g., 03 30 00 / S-201",
+                help="Reference the spec section, sheet, detail, or addendum item.",
+            )
+            question = st.text_area(
+                "Question / Clarification needed *",
+                height=160,
+                help="Write the actual question. Include assumptions and what decision you need.",
+            )
+
+            c4, c5, c6 = st.columns(3)
+            due_date = c4.date_input(
+                "Due date (optional)",
+                value=None,
+                help="When you need a response by (drives 'Overdue' logic).",
+            )
+            assignee_email = c5.text_input(
+                "Assignee (optional)",
+                placeholder="pm@company.com",
+                help="Internal owner responsible for follow-up.",
+            )
+            to_emails = c6.text_input(
+                "To (emails)",
+                placeholder="architect@firm.com; engineer@firm.com",
+                help="External recipients. Separate with commas or semicolons.",
+            )
+
+            cc_emails = st.text_input(
+                "CC (emails)",
+                placeholder="super@company.com",
+                help="Optional CC list. Separate with commas or semicolons.",
+            )
+
+            st.markdown("**Schedule impact (optional)**")
+            c7, c8, c9 = st.columns(3)
+            related_tasks = c7.text_input(
+                "Related schedule task(s)",
+                placeholder="B - Foundations; C - Structure",
+                help="Helps tie the RFI back to the schedule what-ifs.",
+            )
+            schedule_impact_days = c8.number_input(
+                "Potential delay (days)",
+                min_value=0,
+                step=1,
+                value=0,
+                help="Your best estimate if this is not resolved quickly.",
+            )
+            cost_impact = c9.number_input(
+                "Potential cost impact ($)",
+                min_value=0.0,
+                step=1000.0,
+                value=0.0,
+                help="Rough order-of-magnitude cost impact.",
+            )
+
+            thread_notes = st.text_area(
+                "Notes / Thread",
+                height=100,
+                help="Paste email snippets, meeting notes, and decisions as they happen.",
+            )
+
+            links_raw = st.text_area(
+                "Links (optional)",
+                height=90,
+                help="One link per line (plan room, BIM 360, Procore, Drive, etc.).",
+            )
+
+            attachments_files = st.file_uploader(
+                "Attachments (optional)",
+                type=["pdf", "csv", "docx", "doc", "txt"],
+                accept_multiple_files=True,
+                help=(
+                    "Upload supporting docs. For Google Docs, download as .docx or PDF first. "
+                    "Supported: PDF, CSV, Word (.doc/.docx), TXT."
+                ),
+            )
+
+            cbtn1, cbtn2 = st.columns(2)
+
+            save_draft = cbtn1.form_submit_button("Save draft", type="secondary", use_container_width=True)
+
+            submit_rfi = cbtn2.form_submit_button("Submit", type="primary", use_container_width=True)
+        if save_draft or submit_rfi:
+            if not project.strip() or not subject.strip() or not question.strip():
+                st.warning("Project, Subject, and Question are required.")
+            else:
+                new_status = "Draft" if save_draft else "Sent"
+                sent_at = datetime.utcnow().isoformat() if submit_rfi else None
+                rfi_id = db_upsert_rfi(
+                    backend,
+                    {
+                        "id": None,
+                        "created_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat(),
+                        "user_id": _current_user_label(),
+                        "project": project.strip(),
+                        "subject": subject.strip(),
+                        "question": question.strip(),
+                        "discipline": discipline,
+                        "spec_section": spec_section.strip() or None,
+                        "priority": priority,
+                        "status": new_status,
+                        "due_date": str(due_date) if due_date else None,
+                        "assignee_email": assignee_email.strip() or None,
+                        "to_emails": ";".join(parse_emails(to_emails)),
+                        "cc_emails": ";".join(parse_emails(cc_emails)),
+                        "related_tasks": related_tasks.strip() or None,
+                        "schedule_impact_days": int(schedule_impact_days or 0),
+                        "cost_impact": float(cost_impact or 0.0),
+                        "last_sent_at": sent_at,
+                        "last_reminded_at": None,
+                        "last_response_at": None,
+                        "thread_notes": thread_notes.strip() or None,
+                    },
+                )
+
+                links = [u.strip() for u in (links_raw or "").splitlines() if u.strip()]
+                if links:
+                    db_add_rfi_links(backend, rfi_id, links)
+
+                if attachments_files:
+                    db_add_rfi_attachments(backend, rfi_id, attachments_files)
+
+                st.success(f"{'Submitted' if submit_rfi else 'Saved draft'} RFI #{rfi_id}.")
+                st.rerun()
+
+    st.markdown("---")
+    st.subheader("RFI List")
+
+    rfis = db_list_rfis(backend)
+    if rfis.empty:
+        st.info("No RFIs yet. Create one above to start.")
+        return
+
+    # Filters
+    f1, f2, f3, f4 = st.columns([0.28, 0.24, 0.24, 0.24])
+    proj_opts = ["All"] + sorted([p for p in rfis.get("project", pd.Series(dtype=str)).dropna().unique().tolist() if str(p).strip()])
+    status_opts = ["All", "Draft", "Sent", "Answered", "Closed"]
+    prio_opts = ["All", "Low", "Normal", "High", "Urgent"]
+
+    f_project = f1.selectbox("Project", proj_opts, index=0)
+    f_status = f2.selectbox("Status", status_opts, index=0)
+    f_priority = f3.selectbox("Priority", prio_opts, index=0)
+    search = f4.text_input("Search", placeholder="subject / spec / keyword")
+
+    view = rfis.copy()
+    if f_project != "All":
+        view = view[view["project"] == f_project]
+    if f_status != "All":
+        view = view[view["status"] == f_status]
+    if f_priority != "All":
+        view = view[view["priority"] == f_priority]
+    if search.strip():
+        s = search.strip().lower()
+        for col in ["subject", "question", "spec_section", "thread_notes"]:
+            if col not in view.columns:
+                view[col] = ""
+        mask = (
+            view["subject"].fillna("").str.lower().str.contains(s)
+            | view["question"].fillna("").str.lower().str.contains(s)
+            | view["spec_section"].fillna("").str.lower().str.contains(s)
+            | view["thread_notes"].fillna("").str.lower().str.contains(s)
+        )
+        view = view[mask]
+
+    # Quick counts
+    today = date.today()
+    overdue = 0
+    for _, r in view.iterrows():
+        try:
+            if r.get("status") not in ("Answered", "Closed") and r.get("due_date"):
+                dd = date.fromisoformat(str(r.get("due_date")))
+                if dd < today:
+                    overdue += 1
+        except Exception:
+            pass
+
+    cA, cB, cC = st.columns(3)
+    cA.metric("Open RFIs", int((view["status"].fillna("") != "Closed").sum()))
+    cB.metric("Overdue", int(overdue))
+    cC.metric("Total", int(len(view)))
+
+    st.dataframe(
+        view[
+            [
+                "id",
+                "project",
+                "subject",
+                "status",
+                "priority",
+                "due_date",
+                "last_sent_at",
+                "last_response_at",
+                "schedule_impact_days",
+                "related_tasks",
+            ]
+        ].sort_values(by=["id"], ascending=False),
+        width='stretch',
+        hide_index=True,
+    )
+
+    st.markdown("---")
+    st.subheader("Open / Edit an RFI")
+
+    rfi_ids = view["id"].dropna().astype(int).tolist()
+    pick = st.selectbox("RFI ID", [0] + rfi_ids, index=0, help="Select an RFI to view/edit details.")
+    if not pick:
+        return
+
+    rfi = rfis[rfis["id"] == pick].iloc[0].to_dict()
+
+    with st.form("edit_rfi_form"):
+        c1, c2, c3 = st.columns(3)
+        status = c1.selectbox("Status", ["Draft", "Sent", "Answered", "Closed"], index=["Draft","Sent","Answered","Closed"].index(rfi.get("status","Draft")))
+        priority = c2.selectbox("Priority", ["Low", "Normal", "High", "Urgent"], index=["Low","Normal","High","Urgent"].index(rfi.get("priority","Normal")))
+        due = c3.date_input("Due date (optional)", value=date.fromisoformat(rfi["due_date"]) if rfi.get("due_date") else None)
+
+        subject = st.text_input("Subject", value=rfi.get("subject",""), help="Short title.")
+        spec_section = st.text_input("Spec / Drawing Ref (optional)", value=rfi.get("spec_section") or "")
+        question = st.text_area("Question / Clarification needed", value=rfi.get("question",""), height=160)
+
+        c4, c5, c6 = st.columns(3)
+        assignee_email = c4.text_input("Assignee (optional)", value=rfi.get("assignee_email") or "")
+        to_emails = c5.text_input("To (emails)", value=rfi.get("to_emails") or "")
+        cc_emails = c6.text_input("CC (emails)", value=rfi.get("cc_emails") or "")
+
+        st.markdown("**Schedule impact (optional)**")
+        c7, c8, c9 = st.columns(3)
+        related_tasks = c7.text_input("Related schedule task(s)", value=rfi.get("related_tasks") or "")
+        schedule_impact_days = c8.number_input("Potential delay (days)", min_value=0, step=1, value=int(rfi.get("schedule_impact_days") or 0))
+        cost_impact = c9.number_input("Potential cost impact ($)", min_value=0.0, step=1000.0, value=float(rfi.get("cost_impact") or 0.0))
+
+        thread_notes = st.text_area("Notes / Thread", value=rfi.get("thread_notes") or "", height=140)
+
+        save = st.form_submit_button("Save changes")
+
+    if save:
+        db_upsert_rfi(
+            backend,
+            {
+                **rfi,
+                "updated_at": datetime.utcnow().isoformat(),
+                "status": status,
+                "priority": priority,
+                "due_date": str(due) if due else None,
+                "subject": subject.strip(),
+                "spec_section": spec_section.strip() or None,
+                "question": question.strip(),
+                "assignee_email": assignee_email.strip() or None,
+                "to_emails": ";".join(parse_emails(to_emails)),
+                "cc_emails": ";".join(parse_emails(cc_emails)),
+                "related_tasks": related_tasks.strip() or None,
+                "schedule_impact_days": int(schedule_impact_days or 0),
+                "cost_impact": float(cost_impact or 0.0),
+                "thread_notes": thread_notes.strip() or None,
+            },
+        )
+        st.success("Saved.")
+        st.rerun()
+
+def aging_dashboard_page():
+    backend = get_backend_choice()
+    st.header("Aging Dashboard")
+    st.caption("Spot lagging submittals and RFIs. Use this as a lightweight 'PM pulse' panel.")
+
+    # Tunables
+    c1, c2, c3 = st.columns(3)
+    submittal_lag_days = c1.number_input("Flag submittals older than (days)", min_value=1, value=14, step=1)
+    rfi_remind_after = c2.number_input("Remind on RFIs after (days since last sent)", min_value=1, value=7, step=1)
+    rfi_overdue_grace = c3.number_input("Overdue grace (days)", min_value=0, value=0, step=1)
+
+    st.markdown("---")
+    st.subheader("Submittal Runs (Memory Bank)")
+
+    bank = db_list_submittals(backend)
+    if bank.empty:
+        st.info("No saved submittal runs yet.")
+    else:
+        # age from date_submitted if present, otherwise created_at
+        dt = pd.to_datetime(bank.get("date_submitted"), errors="coerce")
+        created = pd.to_datetime(bank.get("created_at"), errors="coerce")
+        base = dt.fillna(created)
+        bank = bank.copy()
+        bank["Age_days"] = (pd.Timestamp.utcnow() - base).dt.days
+        lag = bank[bank["Age_days"] >= int(submittal_lag_days)].copy()
+        st.metric("Lagging runs", len(lag))
+        df_fullwidth(lag.sort_values(["Age_days","created_at"], ascending=[False,False], kind="stable"), hide_index=True, height=rows_to_height(min(len(lag)+6, 50)))
+
+    st.markdown("---")
+    st.subheader("RFIs")
+    rfis = db_list_rfis(backend, limit=5000)
+    if rfis.empty:
+        st.info("No RFIs yet.")
+        return
+
+    rfis = rfis.copy()
+    rfis["created_at_dt"] = pd.to_datetime(rfis.get("created_at"), errors="coerce")
+    rfis["last_sent_at_dt"] = pd.to_datetime(rfis.get("last_sent_at"), errors="coerce")
+    rfis["due_dt"] = pd.to_datetime(rfis.get("due_date"), errors="coerce")
+
+    open_mask = rfis.get("status","").isin(["Draft","Sent","Answered"])  # treat Answered as open until Closed
+    open_rfis = rfis[open_mask].copy()
+
+    # derived ages
+    open_rfis["Age_days"] = (pd.Timestamp.utcnow() - open_rfis["created_at_dt"]).dt.days
+    open_rfis["Days_since_sent"] = (pd.Timestamp.utcnow() - open_rfis["last_sent_at_dt"]).dt.days
+
+    overdue_mask = open_rfis["due_dt"].notna() & ((open_rfis["due_dt"].dt.date + pd.to_timedelta(rfi_overdue_grace, unit='D')).dt.date < datetime.utcnow().date())
+    remind_mask = open_rfis["last_sent_at_dt"].notna() & (open_rfis["Days_since_sent"] >= int(rfi_remind_after))
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Open RFIs", len(open_rfis))
+    m2.metric("Overdue", int(overdue_mask.sum()))
+    m3.metric("Need reminder", int(remind_mask.sum()))
+
+    show = open_rfis.copy()
+    show["Overdue"] = overdue_mask
+    show["Needs_Reminder"] = remind_mask
+
+    show_cols = ["id","project","subject","status","priority","due_date","Age_days","Days_since_sent","Overdue","Needs_Reminder","assignee_email","to_emails"]
+    for c in show_cols:
+        if c not in show.columns:
+            show[c] = None
+    df_fullwidth(show[show_cols].sort_values(["Overdue","Needs_Reminder","Age_days"], ascending=[False,False,False], kind="stable"), hide_index=True, height=rows_to_height(min(len(show)+6, 70)))
+
+    st.markdown("### Reminder sending")
+    st.caption("Reminders send via your configured email provider (SendGrid/SMTP).")
+
+    attach_pdf = st.checkbox("Attach RFI PDF to reminders", value=False)
+    reminder_cc_owner = st.text_input("CC me (optional)", value="")
+
+    if st.button("Send reminders to flagged RFIs"):
+        if not remind_mask.any():
+            st.info("No RFIs currently meet the reminder rule.")
+        else:
+            sent = 0
+            failed = 0
+            for _, r in open_rfis[remind_mask].iterrows():
+                rfi = db_get_rfi(backend, int(r["id"])) or r.to_dict()
+                recips = parse_emails(rfi.get("to_emails") or "")
+                recips += parse_emails(rfi.get("cc_emails") or "")
+                recips += parse_emails(reminder_cc_owner)
+                recips = list(dict.fromkeys(recips))
+                if not recips:
+                    continue
+
+                subj = f"Reminder: RFI #{rfi.get('id')}: {rfi.get('subject') or ''}"
+                html = rfi_email_html(rfi) + "<p><i>Reminder:</i> Please respond when you can. Thank you.</p>"
+                atts = None
+                if attach_pdf:
+                    try:
+                        atts = [(f"RFI_{rfi.get('id')}.pdf", generate_rfi_pdf(rfi))]
+                    except Exception:
+                        atts = None
+
+                ok, msg = send_email(recips, subj, html, attachments=atts)
+                if ok:
+                    sent += 1
+                    rfi["last_reminded_at"] = datetime.utcnow().isoformat()
+                    rfi["updated_at"] = datetime.utcnow().isoformat()
+                    db_upsert_rfi(backend, rfi)
+                else:
+                    failed += 1
+            st.success(f"Reminders sent: {sent}. Failed: {failed}.")
