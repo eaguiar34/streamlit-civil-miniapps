@@ -27,9 +27,10 @@ import requests
 
 # ---- OAuth scopes (keep stable to avoid Google 'scope changed' errors) ----
 GOOGLE_SCOPES = [
+    # Keep these stable forever to avoid Google "scope changed" errors.
     'openid',
-    'https://www.googleapis.com/auth/userinfo.email',
-    'https://www.googleapis.com/auth/userinfo.profile',
+    'email',
+    'profile',
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive.file',
 ]
@@ -743,41 +744,43 @@ def _qp_value(params, key):
     return v
 
 def google_oauth_start():
-    import secrets as _secrets
-    from google_auth_oauthlib.flow import Flow
-
-    cfg = get_secret("google_oauth", {})
-    if not cfg:
-        st.error("Google OAuth not configured in secrets.")
+    """Start Google OAuth in a way that's stable on Streamlit (scopes must match callback)."""
+    try:
+        import streamlit as st
+        from google_auth_oauthlib.flow import Flow
+    except Exception as e:
+        st.error(f"Google OAuth unavailable (missing dependency): {e}")
         return
 
-    state = "g_" + _secrets.token_urlsafe(16)
+    cfg = st.secrets.get("google_oauth", {})
+    client_id = cfg.get("client_id", "")
+    client_secret = cfg.get("client_secret", "")
+    redirect_uri = cfg.get("redirect_uri", st.secrets.get("microsoft_oauth", {}).get("redirect_uri", ""))
+
+    if not client_id or not client_secret or not redirect_uri:
+        st.error("Google OAuth is not configured. Fill [google_oauth] client_id/client_secret/redirect_uri in Streamlit secrets.")
+        return
 
     flow = Flow.from_client_config(
         {
             "web": {
-                "client_id": cfg["client_id"],
-                "client_secret": cfg["client_secret"],
-                "redirect_uris": [cfg["redirect_uri"]],
+                "client_id": client_id,
+                "client_secret": client_secret,
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
             }
         },
         scopes=GOOGLE_SCOPES,
-        state=state,
+        redirect_uri=redirect_uri,
     )
-    flow.redirect_uri = cfg["redirect_uri"]
 
-    auth_url, _ = flow.authorization_url(
+    auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
         prompt="consent",
     )
-
-    # Best-effort CSRF protection (may be lost across redirects on Streamlit Cloud).
     st.session_state["__google_state__"] = state
-
     st.markdown(f"[Continue to Google]({auth_url})")
+
 def google_oauth_callback():
     """Handle the OAuth redirect back from Google."""
     from google_auth_oauthlib.flow import Flow
@@ -827,12 +830,18 @@ def google_oauth_callback():
     try:
         flow.fetch_token(code=code)
     except Exception as e:
-        msg = str(e)
-        # Common when you change requested scopes between deployments.
-        if "Scope has changed" in msg:
-            for k in ["__google_token__", "__google_user__", "__google_state__", "__google_code_verifier__"]:
-                st.session_state.pop(k, None)
-        raise
+    msg = str(e)
+    # Common when scopes or redirect URIs changed since the last consent.
+    if ("Scope has changed" in msg) or ("invalid_grant" in msg):
+        for k in ["__google_token__", "__google_user__", "__google_state__", "__google_code_verifier__"]:
+            st.session_state.pop(k, None)
+        # Make the error message actionable.
+        raise RuntimeError(
+            "Google OAuth callback failed (scope/consent mismatch). "
+            "Click **Sign out Google**, then in your Google Account → Security → Third‑party access "
+            "remove this app (FieldFlow), and try signing in again."
+        ) from e
+    raise
 
     creds = flow.credentials
     st.session_state["__google_token__"] = {
@@ -1231,63 +1240,112 @@ class MSExcelOAuth(StorageBackend):
 
     def _hed(self): return {"Authorization": f"Bearer {self.token}", "Content-Type":"application/json"}
 
-    def _get_workbook_id(self) -> str:
-        """Return workbook id (must be initialized once).
+    def _find_existing_workbook_id(self) -> str | None:
+        """Find an existing workbook in the user's OneDrive by searching for the app title.
 
-        We do **not** auto-create on every rerun because Streamlit reruns frequently and
-        Microsoft Graph can rate-limit workbook creation.
+        This avoids repeated 'create workbook' calls (which can trigger Graph quota errors).
         """
-        if self._workbook_id:
-            return self._workbook_id
-        # Prefer cached id set by the sidebar init button
         try:
-            self._workbook_id = st.session_state.get('__ms_workbook_id__')
-        except Exception:
-            self._workbook_id = None
-        if self._workbook_id:
-            return self._workbook_id
-        raise RuntimeError('OneDrive workbook not initialized. Open **Microsoft storage setup** in the sidebar and click **Initialize OneDrive workbook**.')
+            token = ms_access_token()
+            if not token:
+                return None
+            # Search can return many things; we'll pick the newest Excel file whose name matches the title.
+            q = self.title
+            url = f"{self.base}/me/drive/root/search(q='{q}')"
+            data = self._graph_get(url)
+            items = data.get("value", []) if isinstance(data, dict) else []
+            if not items:
+                return None
 
+            want = f"{self.title}.xlsx".lower()
+            candidates = []
+            for it in items:
+                name = str(it.get("name", "")).lower()
+                if not name.endswith(".xlsx"):
+                    continue
+                if (name == want) or name.startswith(self.title.lower()):
+                    candidates.append(it)
+
+            if not candidates:
+                return None
+
+            # Sort newest first
+            candidates.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+            return candidates[0].get("id")
+        except Exception:
+            return None
+
+    def _get_workbook_id(self) -> str:
+        """Return workbook id (auto-detect existing workbook; do NOT auto-create)."""
+        if "__ms_workbook_id__" in st.session_state:
+            return st.session_state["__ms_workbook_id__"]
+
+        wid = self._find_existing_workbook_id()
+        if wid:
+            st.session_state["__ms_workbook_id__"] = wid
+            return wid
+
+        raise RuntimeError(
+            "OneDrive workbook not initialized yet. "
+            "Open **Microsoft workbook (OneDrive)** in the sidebar and click **Initialize OneDrive workbook** once."
+        )
     def _ensure_workbook(self):
-        r_resp = requests.get(f"{self.base}/me/drive/root/children", headers=self._hed(), timeout=20)
-        try:
-            r = r_resp.json()
-        except Exception:
-            raise RuntimeError(f"Microsoft Graph returned non-JSON when listing Drive root (status {r_resp.status_code}).")
+        """Create the workbook only if it doesn't already exist."""
+        # First: if we can find an existing workbook, reuse it.
+        wid = st.session_state.get("__ms_workbook_id__") or self._find_existing_workbook_id()
+        if wid:
+            st.session_state["__ms_workbook_id__"] = wid
+            st.success("Workbook ready (reused existing OneDrive workbook).")
+            return
 
-        if isinstance(r, dict) and "error" in r:
-            err = r.get("error", {})
-            raise RuntimeError(f"Microsoft Graph error listing Drive root: {err.get('code','')} {err.get('message','')}")
-
-        wid = None
-        for item in r.get("value", []):
-            if item.get("name") == f"{self.title}.xlsx":
-                wid = item.get("id")
-                break
-
-        if not wid:
-            payload = {"name": f"{self.title}.xlsx", "file": {}}
-            c_resp = requests.post(
-                f"{self.base}/me/drive/root/children",
-                headers=self._hed(),
-                data=json.dumps(payload),
-                timeout=20,
+        # Avoid spamming create calls on reruns.
+        if st.session_state.get("__ms_workbook_create_attempted__"):
+            raise RuntimeError(
+                "Workbook creation already attempted and still not found. "
+                "If you see quota errors, wait a bit and try again, or delete extra FieldFlow workbooks in OneDrive."
             )
-            try:
-                created = c_resp.json()
-            except Exception:
-                raise RuntimeError(f"Microsoft Graph returned non-JSON when creating workbook (status {c_resp.status_code}).")
+        st.session_state["__ms_workbook_create_attempted__"] = True
 
-            if isinstance(created, dict) and "error" in created:
-                err = created.get("error", {})
-                raise RuntimeError(f"Microsoft Graph error creating workbook: {err.get('code','')} {err.get('message','')}")
+        token = ms_access_token()
+        if not token:
+            raise RuntimeError("Microsoft not signed in.")
 
-            wid = created.get("id")
-            if not wid:
-                raise RuntimeError(f"Workbook creation did not return an id (status {c_resp.status_code}). Response keys: {list(created.keys()) if isinstance(created, dict) else type(created)}")
+        name = f"{self.title}.xlsx"
+        url = f"{self.base}/me/drive/root:/{name}:/content"
+        try:
+            r = requests.put(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                },
+                data=b"",  # empty workbook
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                # Try one more time to find an existing workbook (in case it exists but wasn't returned previously).
+                msg = ""
+                try:
+                    msg = r.text
+                except Exception:
+                    pass
 
-        return wid
+                if "quotaLimitReached" in msg or "Quota limit reached" in msg:
+                    wid2 = self._find_existing_workbook_id()
+                    if wid2:
+                        st.session_state["__ms_workbook_id__"] = wid2
+                        st.success("Workbook ready (found existing workbook after quota error).")
+                        return
+                    raise RuntimeError("Microsoft Graph quotaLimitReached while creating workbook. Try again later.") from None
 
+                raise RuntimeError(f"Microsoft Graph error creating workbook: {r.status_code} {msg[:300]}")
+            item = r.json()
+            st.session_state["__ms_workbook_id__"] = item.get("id")
+            st.success("Workbook created in OneDrive.")
+        finally:
+            # allow future retries if it didn't actually work
+            if "__ms_workbook_id__" not in st.session_state:
+                st.session_state.pop("__ms_workbook_create_attempted__", None)
     def _ensure_worksheet(self, name: str, headers: list[str]):
         url_ws = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets"
         r = requests.get(url_ws, headers=self._hed()).json()
@@ -1601,7 +1659,18 @@ def get_backend_choice() -> StorageBackend:
     st.session_state["__backend_effective_kind__"] = effective_key
     return inst
 def db_save_preset(b: StorageBackend, name: str, payload: dict): return b.save_preset(name, payload)
-def db_load_presets(b: StorageBackend) -> dict: return b.load_presets()
+def db_load_presets(b: StorageBackend) -> dict:
+    """Load presets safely.
+
+    Cloud storage backends can fail if OAuth is signed in but the workbook/sheet isn't ready yet.
+    In that case we return an empty dict and let the page show a friendly prompt.
+    """
+    try:
+        return b.load_presets()
+    except Exception as e:
+        st.warning(f"Couldn't load presets from the selected storage yet: {e}")
+        return {}
+
 def db_delete_preset(b: StorageBackend, name: str): return b.delete_preset(name)
 def db_save_submittal(b: StorageBackend, meta: dict, csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
     return b.save_submittal(meta, csv_bytes, spec_excerpt, sub_excerpt)
@@ -1968,6 +2037,16 @@ def summarize_feedback(df: pd.DataFrame) -> dict:
 # =========================
 from pathlib import Path
 import streamlit as st
+
+# Tighter sidebar padding so the logo sits higher.
+st.markdown(
+    """
+<style>
+section[data-testid='stSidebar'] div.block-container { padding-top: 0.5rem; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 LOGO_PATH = Path(__file__).parent / "assets" / "FieldFlow_logo.png"
 
@@ -2965,7 +3044,7 @@ def schedule_whatifs_page():
                     st.markdown("### Crashed Scenario")
                     st.success(f"New duration: {final_days} days (target: {target_days})")
                     # Cache latest crash scenario results for export / save
-                    st.session_state["__schedule_crashed_df__"] = final_schedule.copy()
+                    st.session_state["__schedule_crashed_df__"] = crashed_schedule.copy()
                     st.session_state["__schedule_crashed_days__"] = int(final_days) if final_days is not None else None
                     st.session_state["__schedule_crash_log__"] = crash_log.copy() if isinstance(crash_log, list) else crash_log
 
