@@ -28,3 +28,7 @@ plotly>=5.18
 altair>=5.2
 
 python-dateutil>=2.8
+
+# Excel workbook creation
+openpyxl>=3.1
+
