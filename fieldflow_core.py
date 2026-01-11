@@ -830,18 +830,17 @@ def google_oauth_callback():
     try:
         flow.fetch_token(code=code)
     except Exception as e:
-    msg = str(e)
-    # Common when scopes or redirect URIs changed since the last consent.
-    if ("Scope has changed" in msg) or ("invalid_grant" in msg):
-        for k in ["__google_token__", "__google_user__", "__google_state__", "__google_code_verifier__"]:
-            st.session_state.pop(k, None)
+        msg = str(e)
+        # Common when scopes or redirect URIs changed since the last consent.
+        if ("Scope has changed" in msg) or ("invalid_grant" in msg):
+            for k in ["__google_token__", "__google_user__", "__google_state__", "__google_code_verifier__"]:
+                st.session_state.pop(k, None)
         # Make the error message actionable.
         raise RuntimeError(
             "Google OAuth callback failed (scope/consent mismatch). "
             "Click **Sign out Google**, then in your Google Account → Security → Third‑party access "
             "remove this app (FieldFlow), and try signing in again."
         ) from e
-    raise
 
     creds = flow.credentials
     st.session_state["__google_token__"] = {
@@ -2135,6 +2134,22 @@ def render_sidebar(active_page: str = "Home"):
     """Shared sidebar: logo + storage selection + OAuth sign-in + basic help.
     Call this at the top of every page.
     """
+    # Keep sidebar padding tight so the logo sits closer to the top
+    st.markdown("""
+    <style>
+      [data-testid="stSidebar"] > div:first-child { padding-top: 0.5rem; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Optional security layer (only if a local security.py exists)
+    try:
+        import security  # local module
+        security.require_passcode()
+        security.secure_mode_banner()
+        security.purge_button()
+    except Exception:
+        pass
+
     # --- Logo (make it robust to filename case/extension) ---
     assets_dir = _Path(__file__).parent / 'assets'
     logo_candidates = [
@@ -2386,7 +2401,14 @@ def submittal_checker_page():
     with st.expander("Reviewer policy, keywords & weights", expanded=False):
         # Presets
         row1 = st.columns([0.35,0.2,0.2,0.25])
-        presets = db_load_presets(backend)
+        try:
+            presets = db_load_presets(backend)
+        except RuntimeError as e:
+            st.warning(str(e))
+            presets = {}
+        except Exception as e:
+            st.warning(f"Could not load presets: {e}")
+            presets = {}
         with row1[0]:
             sel = st.selectbox("Load preset", ["—"] + sorted(presets.keys()))
         with row1[1]:
@@ -3046,7 +3068,7 @@ def schedule_whatifs_page():
                     # Cache latest crash scenario results for export / save
                     st.session_state["__schedule_crashed_df__"] = crashed_schedule.copy()
                     st.session_state["__schedule_crashed_days__"] = int(final_days) if final_days is not None else None
-                    st.session_state["__schedule_crash_log__"] = crash_log.copy() if isinstance(crash_log, list) else crash_log
+                    st.session_state["__schedule_crash_log__"] = log.copy() if isinstance(log, list) else log
 
                     st.metric("Added cost (approx)", f"${crash_cost - base_cost:,.0f}")
 
@@ -3466,3 +3488,1907 @@ def aging_dashboard_page():
                 else:
                     failed += 1
             st.success(f"Reminders sent: {sent}. Failed: {failed}.")
+
+# -----------------------------------------------------------------------------
+# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
+#
+# Policy:
+# 1) Try stored workbook ID (persisted in user's OneDrive approot as a small JSON file)
+# 2) If missing, scan approot for any workbook with FieldFlow marker
+# 3) If still missing, search by name (FieldFlow) as last resort
+# 4) If none found, create workbook, add marker, and store its ID
+#
+# This class overrides only the workbook-id lifecycle and preset loading to avoid
+# Graph quotaLimitReached due to Streamlit rerun storms.
+# -----------------------------------------------------------------------------
+
+_MSExcelOAuthBase = MSExcelOAuth
+
+class MSExcelOAuth(_MSExcelOAuthBase):
+    _POINTER_FILENAME = ".fieldflow_workbook.json"
+    _MARKER_SHEET = "_fieldflow_meta"
+    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
+
+    def _graph_headers(self, extra: dict | None = None) -> dict:
+        h = {"Authorization": f"Bearer {self.token}"}
+        if extra:
+            h.update(extra)
+        return h
+
+    def _graph_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict | None = None,
+        json_body=None,
+        data=None,
+        timeout: int = 30,
+        max_retries: int = 5,
+    ) -> requests.Response:
+        """Graph request with backoff for 429/503/504 and quotaLimitReached."""
+        h = self._graph_headers(headers)
+        last = None
+        for attempt in range(max_retries):
+            try:
+                r = requests.request(method, url, headers=h, json=json_body, data=data, timeout=timeout)
+                last = r
+            except Exception:
+                time.sleep(min(2 ** attempt, 20))
+                continue
+
+            err_code = None
+            try:
+                if r.status_code >= 400:
+                    j = r.json()
+                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
+                        err_code = j["error"].get("code")
+            except Exception:
+                pass
+
+            throttled = r.status_code in (429, 503, 504) or (err_code == "quotaLimitReached")
+            if throttled and attempt < max_retries - 1:
+                ra = r.headers.get("Retry-After")
+                if ra and str(ra).isdigit():
+                    wait = int(ra)
+                else:
+                    wait = min(2 ** attempt, 30)
+                time.sleep(wait)
+                continue
+
+            return r
+
+        return last if last is not None else requests.Response()
+
+    @staticmethod
+    def _safe_json(r: requests.Response) -> dict:
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
+    # ---------- persistent pointer file (approot) ----------
+
+    def _pointer_content_url(self) -> str:
+        # /me/drive/special/approot:/<path>:/content
+        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
+
+    def _read_pointer(self) -> dict | None:
+        url = self._pointer_content_url()
+        r = self._graph_request("GET", url, timeout=20, max_retries=2)
+        if r.status_code == 404:
+            return None
+        if r.status_code >= 400:
+            return None
+        try:
+            # content endpoint returns bytes; try json
+            return json.loads(r.content.decode("utf-8"))
+        except Exception:
+            return None
+
+    def _write_pointer(self, workbook_id: str) -> None:
+        payload = {
+            "workbook_id": workbook_id,
+            "updated_at": datetime.utcnow().isoformat(),
+            "title": self.title,
+        }
+        url = self._pointer_content_url()
+        self._graph_request(
+            "PUT",
+            url,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload).encode("utf-8"),
+            timeout=30,
+            max_retries=3,
+        )
+
+    def _validate_workbook_id(self, workbook_id: str) -> bool:
+        if not workbook_id:
+            return False
+        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
+        r = self._graph_request("GET", url, timeout=15, max_retries=2)
+        return 200 <= r.status_code < 300
+
+    # ---------- marker inside workbook ----------
+
+    def _worksheet_exists(self, workbook_id: str, ws_name: str) -> bool:
+        url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        if r.status_code >= 400:
+            return False
+        data = self._safe_json(r)
+        names = [w.get("name") for w in data.get("value", []) if isinstance(w, dict)]
+        return ws_name in names
+
+    def _ensure_marker(self, workbook_id: str) -> None:
+        # Ensure sheet exists
+        if not self._worksheet_exists(workbook_id, self._MARKER_SHEET):
+            url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
+            r = self._graph_request("POST", url, json_body={"name": self._MARKER_SHEET}, timeout=25, max_retries=3)
+            if r.status_code >= 400:
+                # If we can't add, just stop (don't crash the app)
+                return
+
+        # Write marker value into A1
+        url = (
+            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/"
+            f"{urllib.parse.quote(self._MARKER_SHEET)}/range(address='A1:A3')"
+        )
+        values = [[self._MARKER_VALUE], [self.title], [datetime.utcnow().isoformat()]]
+        self._graph_request("PATCH", url, headers={"Content-Type": "application/json"}, json_body={"values": values}, timeout=25, max_retries=3)
+
+    def _has_marker(self, workbook_id: str) -> bool:
+        url = (
+            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/"
+            f"{urllib.parse.quote(self._MARKER_SHEET)}/range(address='A1')"
+        )
+        r = self._graph_request("GET", url, timeout=20, max_retries=2)
+        if r.status_code >= 400:
+            return False
+        data = self._safe_json(r)
+        try:
+            v = data.get("values", [[""]])[0][0]
+            return str(v).strip() == self._MARKER_VALUE
+        except Exception:
+            return False
+
+    # ---------- discovery helpers ----------
+
+    def _list_approot_children(self) -> list[dict]:
+        url = f"{self.base}/me/drive/special/approot/children?$select=id,name,lastModifiedDateTime&$top=200"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        if r.status_code >= 400:
+            return []
+        data = self._safe_json(r)
+        return data.get("value", []) if isinstance(data, dict) else []
+
+    def _search_drive(self, q: str) -> list[dict]:
+        q_esc = q.replace("'", "\\'")
+        url = f"{self.base}/me/drive/root/search(q='{q_esc}')?$select=id,name,lastModifiedDateTime&$top=50"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        if r.status_code >= 400:
+            return []
+        data = self._safe_json(r)
+        return data.get("value", []) if isinstance(data, dict) else []
+
+    def _pick_latest(self, items: list[dict]) -> dict | None:
+        if not items:
+            return None
+        items = [it for it in items if isinstance(it, dict)]
+        items.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+        return items[0] if items else None
+
+    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
+        # Cache first
+        cached = st.session_state.get("__ms_workbook_id__")
+        if cached and self._validate_workbook_id(cached):
+            return cached
+
+        # 1) Pointer file
+        ptr = self._read_pointer()
+        if isinstance(ptr, dict):
+            wid = ptr.get("workbook_id")
+            if wid and self._validate_workbook_id(str(wid)):
+                st.session_state["__ms_workbook_id__"] = str(wid)
+                return str(wid)
+
+        # 2) Scan approot for marker
+        approot = [it for it in self._list_approot_children() if str(it.get("name", "")).lower().endswith(".xlsx")]
+        # Try marker check first (few items in approot typically)
+        for it in approot:
+            wid = it.get("id")
+            if wid and self._validate_workbook_id(str(wid)) and self._has_marker(str(wid)):
+                st.session_state["__ms_workbook_id__"] = str(wid)
+                self._write_pointer(str(wid))
+                return str(wid)
+
+        # 3) Search by name (last resort)
+        hits = [it for it in self._search_drive("FieldFlow") if str(it.get("name", "")).lower().endswith(".xlsx")]
+        # Prefer exact/starts-with title
+        want = f"{self.title}.xlsx".lower()
+        preferred = [it for it in hits if (str(it.get("name", "")).lower() == want) or str(it.get("name", "")).lower().startswith(self.title.lower())]
+        candidates = preferred or hits
+
+        # If any candidate already has marker, use it
+        for it in candidates:
+            wid = it.get("id")
+            if wid and self._validate_workbook_id(str(wid)) and self._has_marker(str(wid)):
+                st.session_state["__ms_workbook_id__"] = str(wid)
+                self._write_pointer(str(wid))
+                return str(wid)
+
+        # If we found name matches but no marker, adopt the newest candidate
+        newest = self._pick_latest(candidates)
+        if newest and newest.get("id") and self._validate_workbook_id(str(newest["id"])):
+            wid = str(newest["id"])
+            # Best effort: add marker so we can recognize it next time
+            try:
+                self._ensure_marker(wid)
+            except Exception:
+                pass
+            st.session_state["__ms_workbook_id__"] = wid
+            self._write_pointer(wid)
+            return wid
+
+        # 4) Create new if allowed
+        if not create_if_missing:
+            return None
+
+        return self._create_and_register_workbook()
+
+    def _create_and_register_workbook(self) -> str:
+        # Cooldown gate to avoid rerun spam
+        now = time.time()
+        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
+        if now < next_ok:
+            raise RuntimeError("Microsoft is throttling workbook creation. Please wait ~30 seconds and try again.")
+
+        name = f"{self.title}.xlsx"
+
+        # Build minimal workbook bytes
+        try:
+            from openpyxl import Workbook
+            import io as _io
+            wb = Workbook()
+            buf = _io.BytesIO()
+            wb.save(buf)
+            content = buf.getvalue()
+        except Exception:
+            content = b"PK\x03\x04"  # fallback ZIP header (not ideal but prevents crash)
+
+        url = f"{self.base}/me/drive/special/approot:/{name}:/content"
+        r = self._graph_request(
+            "PUT",
+            url,
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            data=content,
+            timeout=60,
+            max_retries=5,
+        )
+
+        if r.status_code >= 400:
+            data = self._safe_json(r)
+            code = None
+            msg = None
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                code = data["error"].get("code")
+                msg = data["error"].get("message")
+            if code == "quotaLimitReached" or r.status_code in (429, 503, 504):
+                st.session_state["__ms_next_create_ok__"] = time.time() + 30
+                raise RuntimeError("Microsoft Graph quotaLimitReached. Please wait ~30 seconds and try again.")
+            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or r.status_code} {msg or ''}")
+
+        # Determine workbook id by listing approot
+        wid = None
+        for it in self._list_approot_children():
+            if str(it.get("name", "")).lower() == name.lower() and it.get("id"):
+                wid = str(it["id"])
+                break
+        if not wid:
+            # fallback to response json
+            try:
+                wid = str(self._safe_json(r).get("id") or "")
+            except Exception:
+                wid = ""
+        if not wid or not self._validate_workbook_id(wid):
+            raise RuntimeError("Workbook created but could not resolve its ID. Please refresh and try again.")
+
+        # Mark + persist
+        try:
+            self._ensure_marker(wid)
+        except Exception:
+            pass
+        self._write_pointer(wid)
+        st.session_state["__ms_workbook_id__"] = wid
+        return wid
+
+    # ---------- override public/parent methods ----------
+
+    def _find_existing_workbook_id(self) -> str | None:
+        # Keep a simple compatibility path for any callers
+        return self._resolve_workbook_id(create_if_missing=False)
+
+    def _get_workbook_id(self) -> str:
+        wid = self._resolve_workbook_id(create_if_missing=True)
+        if not wid:
+            raise RuntimeError(
+                "No OneDrive workbook found yet. Please sign in and try saving again. "
+                "(If this is your first time, FieldFlow will create a workbook in your OneDrive App Folder.)"
+            )
+        return wid
+
+    def _ensure_workbook(self):
+        # Compatibility with the Settings button if present
+        wid = self._resolve_workbook_id(create_if_missing=True)
+        if wid:
+            st.success("OneDrive workbook ready.")
+
+    def load_presets(self) -> dict:
+        """Load presets WITHOUT creating a workbook during normal page loads."""
+        try:
+            wid = self._resolve_workbook_id(create_if_missing=False)
+            if not wid:
+                return {}
+
+            ws = "presets"
+            url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+            r = self._graph_request("GET", url, timeout=20, max_retries=3)
+            if r.status_code >= 400:
+                return {}
+            data = self._safe_json(r)
+            vals = data.get("values", []) if isinstance(data, dict) else []
+            out = {}
+            for row in vals[1:]:
+                if len(row) >= 2:
+                    try:
+                        out[str(row[0])] = json.loads(row[1])
+                    except Exception:
+                        pass
+            return out
+        except Exception:
+            return {}
+
+# -----------------------------------------------------------------------------
+# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
+# -----------------------------------------------------------------------------
+#
+# This overrides the earlier MSExcelOAuth class with a safer, production-style
+# workbook lookup/creation strategy.
+#
+# Policy:
+# 1) Try stored workbook ID (persisted in the user's OneDrive approot as JSON)
+# 2) If missing, scan approot for any workbook with a FieldFlow marker sheet
+# 3) If still missing, search by name (FieldFlow) as last resort
+# 4) If none found, create one and store its ID
+#
+# The persisted pointer file makes this robust even if the user renames the
+# workbook.
+
+try:
+    _OldMSExcelOAuth = MSExcelOAuth  # type: ignore
+except Exception:
+    _OldMSExcelOAuth = object  # type: ignore
+
+
+class MSExcelOAuth(_OldMSExcelOAuth):  # type: ignore
+    """Microsoft 365 Excel backend with robust workbook discovery.
+
+    Note: this class is intentionally defined at the end of the module to
+    override any earlier MSExcelOAuth definition.
+    """
+
+    _POINTER_FILENAME = ".fieldflow_workbook.json"
+    _MARKER_SHEET = "_fieldflow_meta"
+    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
+
+    # ---- Graph helpers
+    def _graph_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body=None,
+        data=None,
+        headers=None,
+        timeout: int = 30,
+        max_retries: int = 6,
+    ):
+        """Graph request with throttling/backoff.
+
+        Retries on 429/503/504 and Graph error code quotaLimitReached.
+        """
+        base_headers = {"Authorization": f"Bearer {self.token}"}
+        if headers:
+            base_headers.update(headers)
+        if json_body is not None and "Content-Type" not in base_headers:
+            base_headers["Content-Type"] = "application/json"
+
+        last = None
+        for attempt in range(max_retries):
+            try:
+                r = requests.request(
+                    method,
+                    url,
+                    headers=base_headers,
+                    json=json_body,
+                    data=data,
+                    timeout=timeout,
+                )
+                last = r
+            except Exception:
+                time.sleep(min(2 ** attempt, 20))
+                continue
+
+            err_code = None
+            retry_after = None
+            try:
+                retry_after = r.headers.get("Retry-After")
+            except Exception:
+                pass
+            try:
+                if r.status_code >= 400:
+                    j = r.json()
+                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
+                        err_code = j["error"].get("code")
+            except Exception:
+                pass
+
+            throttled = (r.status_code in (429, 503, 504)) or (err_code == "quotaLimitReached")
+            if throttled and attempt < max_retries - 1:
+                if retry_after and str(retry_after).isdigit():
+                    wait = int(retry_after)
+                else:
+                    wait = min(2 ** attempt, 30)
+                time.sleep(wait)
+                continue
+
+            return r
+
+        return last
+
+    def _graph_json(self, r):
+        try:
+            return r.json() if r is not None else {}
+        except Exception:
+            return {}
+
+    # ---- Pointer file helpers (persistent across sessions)
+    def _pointer_url(self) -> str:
+        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
+
+    def _read_pointer(self) -> dict | None:
+        r = self._graph_request("GET", self._pointer_url(), timeout=20, max_retries=3)
+        if r is None or r.status_code == 404:
+            return None
+        if r.status_code >= 400:
+            return None
+        try:
+            return json.loads(r.content.decode("utf-8"))
+        except Exception:
+            return None
+
+    def _write_pointer(self, workbook_id: str, *, drive_id: str | None = None) -> None:
+        payload = {
+            "workbook_id": workbook_id,
+            "drive_id": drive_id or "me",
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        self._graph_request(
+            "PUT",
+            self._pointer_url(),
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload).encode("utf-8"),
+            timeout=30,
+            max_retries=4,
+        )
+
+    def _validate_workbook_id(self, workbook_id: str) -> bool:
+        if not workbook_id:
+            return False
+        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        return bool(r is not None and r.status_code < 400)
+
+    # ---- Marker helpers
+    def _marker_range_url(self, workbook_id: str, address: str = "A1") -> str:
+        ws = urllib.parse.quote(self._MARKER_SHEET)
+        addr = urllib.parse.quote(address)
+        return (
+            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/{ws}"
+            f"/range(address='{addr}')"
+        )
+
+    def _has_marker(self, workbook_id: str) -> bool:
+        r = self._graph_request("GET", self._marker_range_url(workbook_id, "A1"), timeout=20, max_retries=2)
+        if r is None or r.status_code >= 400:
+            return False
+        data = self._graph_json(r)
+        vals = data.get("values") if isinstance(data, dict) else None
+        try:
+            return bool(vals and vals[0] and str(vals[0][0]).strip() == self._MARKER_VALUE)
+        except Exception:
+            return False
+
+    def _ensure_marker(self, workbook_id: str) -> None:
+        # Ensure marker sheet exists
+        url_ws = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
+        r = self._graph_request("GET", url_ws, timeout=20, max_retries=3)
+        names = []
+        try:
+            names = [w.get("name") for w in self._graph_json(r).get("value", [])]
+        except Exception:
+            names = []
+        if self._MARKER_SHEET not in names:
+            add_url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
+            self._graph_request("POST", add_url, json_body={"name": self._MARKER_SHEET}, timeout=20, max_retries=3)
+
+        # Write marker values
+        values = [[self._MARKER_VALUE], ["v1"], [datetime.utcnow().isoformat()]]
+        # Use a range that spans A1:A3
+        ws = urllib.parse.quote(self._MARKER_SHEET)
+        url = (
+            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/{ws}"
+            "/range(address='A1:A3')"
+        )
+        self._graph_request("PATCH", url, json_body={"values": values}, timeout=20, max_retries=3)
+
+    # ---- Discovery
+    def _list_approot_children(self) -> list[dict]:
+        url = f"{self.base}/me/drive/special/approot/children?$select=id,name,lastModifiedDateTime,file&$top=200"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._graph_json(r)
+        return data.get("value", []) if isinstance(data, dict) else []
+
+    def _search_drive(self, q: str) -> list[dict]:
+        # Search in root (Graph search is scoped to a folder; root is good enough fallback)
+        url = f"{self.base}/me/drive/root/search(q='{q}')?$select=id,name,lastModifiedDateTime,file&$top=50"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._graph_json(r)
+        return data.get("value", []) if isinstance(data, dict) else []
+
+    def _create_workbook_in_approot(self) -> str:
+        # Gate repeated create attempts on reruns
+        now = time.time()
+        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
+        if now < next_ok:
+            raise RuntimeError("Microsoft is throttling workbook creation. Please wait a bit and try again.")
+
+        name = f"{self.title}.xlsx"
+
+        # Build a minimal valid XLSX
+        content = None
+        try:
+            from openpyxl import Workbook
+            import io
+            wb = Workbook()
+            buf = io.BytesIO()
+            wb.save(buf)
+            content = buf.getvalue()
+        except Exception:
+            # Fallback: (should still be valid enough for OneDrive upload)
+            content = b"PK\x03\x04"
+
+        url = f"{self.base}/me/drive/special/approot:/{name}:/content"
+        r = self._graph_request(
+            "PUT",
+            url,
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            data=content,
+            timeout=60,
+            max_retries=6,
+        )
+
+        if r is None or r.status_code >= 400:
+            data = self._graph_json(r)
+            code = None
+            msg = None
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                code = data["error"].get("code")
+                msg = data["error"].get("message")
+            # Cooldown if throttled
+            if (code == "quotaLimitReached") or (r is not None and r.status_code in (429, 503, 504)):
+                st.session_state["__ms_next_create_ok__"] = time.time() + 30
+                raise RuntimeError("Microsoft Graph is throttling requests (quotaLimitReached). Try again in ~30 seconds.")
+            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or (r.status_code if r else 'unknown')} {msg or ''}")
+
+        # Prefer id from response; if missing, resolve via approot listing
+        wid = None
+        try:
+            j = self._graph_json(r)
+            wid = j.get("id") if isinstance(j, dict) else None
+        except Exception:
+            wid = None
+        if not wid:
+            # Resolve by exact name
+            for it in self._list_approot_children():
+                if str(it.get("name", "")).lower() == name.lower():
+                    wid = it.get("id")
+                    break
+        if not wid:
+            raise RuntimeError("Workbook upload succeeded but could not resolve workbook id.")
+
+        # Mark + persist
+        self._ensure_marker(wid)
+        self._write_pointer(wid)
+        return wid
+
+    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
+        # Session cache
+        wid = st.session_state.get("__ms_workbook_id__")
+        if wid and self._validate_workbook_id(wid):
+            return wid
+
+        # 1) Pointer file
+        ptr = self._read_pointer() or {}
+        ptr_wid = ptr.get("workbook_id") if isinstance(ptr, dict) else None
+        if ptr_wid and self._validate_workbook_id(ptr_wid):
+            st.session_state["__ms_workbook_id__"] = ptr_wid
+            return ptr_wid
+
+        # 2) Scan approot for marker
+        approot_items = self._list_approot_children()
+        xlsx_items = [it for it in approot_items if str(it.get("name", "")).lower().endswith(".xlsx")]
+        # Newest first
+        xlsx_items.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+        for it in xlsx_items:
+            wid2 = it.get("id")
+            if not wid2:
+                continue
+            if self._has_marker(wid2):
+                st.session_state["__ms_workbook_id__"] = wid2
+                self._write_pointer(wid2)
+                return wid2
+
+        # 3) Name search fallback
+        items = self._search_drive("FieldFlow")
+        candidates = [it for it in items if str(it.get("name", "")).lower().endswith(".xlsx")]
+        candidates.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+        for it in candidates:
+            wid3 = it.get("id")
+            if not wid3:
+                continue
+            if self._has_marker(wid3):
+                st.session_state["__ms_workbook_id__"] = wid3
+                self._write_pointer(wid3)
+                return wid3
+
+        # If we found candidates but none had marker, adopt newest as last resort
+        if candidates:
+            wid4 = candidates[0].get("id")
+            if wid4 and self._validate_workbook_id(wid4):
+                try:
+                    self._ensure_marker(wid4)
+                except Exception:
+                    pass
+                st.session_state["__ms_workbook_id__"] = wid4
+                self._write_pointer(wid4)
+                return wid4
+
+        # 4) Create
+        if create_if_missing:
+            wid5 = self._create_workbook_in_approot()
+            st.session_state["__ms_workbook_id__"] = wid5
+            return wid5
+
+        return None
+
+    # Override: keep signature used by parent methods
+    def _get_workbook_id(self, create_if_missing: bool = True) -> str:
+        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
+        if wid:
+            return wid
+        raise RuntimeError(
+            "No FieldFlow workbook found for this Microsoft account yet. "
+            "Try saving once (the app will create a workbook), or create a workbook then retry."
+        )
+
+    # Override: creation entrypoint used by sidebar button
+    def _ensure_workbook(self):
+        wid = self._resolve_workbook_id(create_if_missing=True)
+        if wid:
+            st.session_state["__ms_workbook_id__"] = wid
+            try:
+                st.success("OneDrive workbook ready.")
+            except Exception:
+                pass
+
+    # Override: avoid creating workbook just to load presets
+    def load_presets(self) -> dict:
+        try:
+            wid = self._resolve_workbook_id(create_if_missing=False)
+            if not wid:
+                return {}
+            ws = "presets"
+            url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+            r = self._graph_request("GET", url, timeout=20, max_retries=3)
+            if r is None or r.status_code >= 400:
+                return {}
+            vals = self._graph_json(r).get("values", [])
+            out = {}
+            for row in vals[1:]:
+                if len(row) >= 2:
+                    try:
+                        out[str(row[0])] = json.loads(row[1])
+                    except Exception:
+                        pass
+            return out
+        except Exception:
+            return {}
+
+
+# -----------------------------------------------------------------------------
+# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
+# -----------------------------------------------------------------------------
+#
+# This module originally defined MSExcelOAuth earlier. We redefine it here as a
+# subclass that overrides only the workbook discovery/creation logic.
+#
+# Policy:
+# 1) Try stored workbook ID (best, rename-proof)
+# 2) If missing, look in OneDrive app folder (approot) for any workbook that
+#    contains the FieldFlow marker
+# 3) If still missing, search by name ('FieldFlow') as a last resort
+# 4) If none found, create one, add marker, and store its ID
+
+_MSEXCEL_OAUTH_BASE = MSExcelOAuth  # keep the original implementation for data ops
+
+
+class MSExcelOAuth(_MSEXCEL_OAUTH_BASE):
+    """Microsoft Excel backend with robust workbook discovery.
+
+    Stores a small pointer file in the user's OneDrive *app folder* (approot):
+    `.fieldflow_workbook.json`, which contains the workbook driveItem id.
+
+    This makes the integration resilient to:
+    - workbook renames
+    - workbook moves (within the same drive)
+    - Streamlit reruns (prevents repeated create calls)
+    """
+
+    _POINTER_FILENAME = ".fieldflow_workbook.json"
+    _MARKER_SHEET = "_fieldflow_meta"
+    _MARKER_CELL = "A1"
+    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
+
+    # ---- Graph helpers
+    def _graph_headers(self, extra: dict | None = None) -> dict:
+        h = {"Authorization": f"Bearer {self.token}"}
+        if extra:
+            h.update(extra)
+        return h
+
+    def _graph_request(self, method: str, url: str, *, json_body=None, data=None, headers=None, timeout: int = 30, max_retries: int = 6) -> requests.Response:
+        """Graph request with backoff for throttling/quota.
+
+        Retries on:
+        - 429, 503, 504
+        - Graph error code: quotaLimitReached
+
+        Uses Retry-After when available.
+        """
+        h = self._graph_headers(headers)
+        last = None
+        for attempt in range(max_retries):
+            try:
+                r = requests.request(method, url, headers=h, json=json_body, data=data, timeout=timeout)
+                last = r
+            except Exception:
+                time.sleep(min(2 ** attempt, 30))
+                continue
+
+            err_code = None
+            try:
+                if r.status_code >= 400:
+                    j = r.json()
+                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
+                        err_code = j["error"].get("code")
+            except Exception:
+                pass
+
+            throttled = r.status_code in (429, 503, 504) or (err_code == "quotaLimitReached")
+            if throttled and attempt < max_retries - 1:
+                ra = r.headers.get("Retry-After")
+                if ra and str(ra).isdigit():
+                    wait = int(ra)
+                else:
+                    wait = min(2 ** attempt, 30)
+                time.sleep(wait)
+                continue
+
+            return r
+
+        return last if last is not None else requests.Response()
+
+    @staticmethod
+    def _safe_json(r: requests.Response) -> dict:
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
+    # ---- Pointer file in approot
+    def _pointer_content_url(self) -> str:
+        # Using approot so the file isn't littering Drive root.
+        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
+
+    def _read_pointer(self) -> str | None:
+        url = self._pointer_content_url()
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        if r.status_code == 404:
+            return None
+        if r.status_code >= 400:
+            return None
+        try:
+            obj = json.loads(r.content.decode("utf-8"))
+            wid = obj.get("workbook_id") if isinstance(obj, dict) else None
+            return str(wid) if wid else None
+        except Exception:
+            return None
+
+    def _write_pointer(self, workbook_id: str) -> None:
+        url = self._pointer_content_url()
+        payload = json.dumps({"workbook_id": workbook_id, "updated_at": datetime.utcnow().isoformat()}).encode("utf-8")
+        _ = self._graph_request(
+            "PUT",
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=20,
+            max_retries=3,
+        )
+
+    # ---- Workbook verification + listing
+    def _workbook_exists(self, workbook_id: str) -> bool:
+        if not workbook_id:
+            return False
+        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
+        r = self._graph_request("GET", url, timeout=15, max_retries=2)
+        return 200 <= r.status_code < 300
+
+    def _list_approot_children(self) -> list[dict]:
+        url = f"{self.base}/me/drive/special/approot/children?$select=id,name,lastModifiedDateTime,file&$top=200"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._safe_json(r)
+        items = data.get("value", []) if isinstance(data, dict) else []
+        return items if isinstance(items, list) else []
+
+    def _search_drive(self, q: str) -> list[dict]:
+        q_esc = str(q).replace("'", "")
+        url = f"{self.base}/me/drive/root/search(q='{q_esc}')?$select=id,name,lastModifiedDateTime,file&$top=50"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._safe_json(r)
+        items = data.get("value", []) if isinstance(data, dict) else []
+        return items if isinstance(items, list) else []
+
+    # ---- Marker sheet
+    def _marker_range_url(self, workbook_id: str, ws_name: str, address: str) -> str:
+        return (
+            f"{self.base}/me/drive/items/{workbook_id}"
+            f"/workbook/worksheets/{urllib.parse.quote(ws_name)}/range(address='{address}')"
+        )
+
+    def _worksheet_names(self, workbook_id: str) -> list[str]:
+        url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        if r.status_code >= 400:
+            return []
+        data = self._safe_json(r)
+        vals = data.get("value", []) if isinstance(data, dict) else []
+        return [w.get("name") for w in vals if isinstance(w, dict) and w.get("name")]
+
+    def _has_marker(self, workbook_id: str) -> bool:
+        try:
+            names = self._worksheet_names(workbook_id)
+            if self._MARKER_SHEET not in names:
+                return False
+
+            url = self._marker_range_url(workbook_id, self._MARKER_SHEET, self._MARKER_CELL)
+            r = self._graph_request("GET", url, timeout=20, max_retries=3)
+            if r.status_code >= 400:
+                return False
+            data = self._safe_json(r)
+            vals = data.get("values") if isinstance(data, dict) else None
+            if not vals or not isinstance(vals, list) or not vals[0] or not isinstance(vals[0], list):
+                return False
+            return str(vals[0][0]).strip() == self._MARKER_VALUE
+        except Exception:
+            return False
+
+    def _ensure_marker(self, workbook_id: str) -> None:
+        """Ensure the FieldFlow marker exists in the workbook."""
+        names = self._worksheet_names(workbook_id)
+        if self._MARKER_SHEET not in names:
+            url_ws = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
+            r = self._graph_request("POST", url_ws, json_body={"name": self._MARKER_SHEET}, timeout=20, max_retries=3)
+            if r.status_code >= 400:
+                # If we can't add it, we don't fail the whole app.
+                return
+
+        url = self._marker_range_url(workbook_id, self._MARKER_SHEET, "A1:A3")
+        _ = self._graph_request(
+            "PATCH",
+            url,
+            json_body={"values": [[self._MARKER_VALUE], ["version"], ["created_at:" + datetime.utcnow().isoformat()]]},
+            timeout=20,
+            max_retries=3,
+        )
+
+    # ---- Core policy resolver
+    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
+        # Cache
+        cached = st.session_state.get("__ms_workbook_id__")
+        if cached and self._workbook_exists(cached):
+            return cached
+
+        # 1) Pointer file
+        wid = self._read_pointer()
+        if wid and self._workbook_exists(wid):
+            st.session_state["__ms_workbook_id__"] = wid
+            return wid
+
+        # 2) Scan approot for marker
+        approot_items = self._list_approot_children()
+        xlsx_items = [it for it in approot_items if str(it.get("name", "")).lower().endswith(".xlsx")]
+        # Prefer ones that look like ours
+        xlsx_items.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+        for it in xlsx_items:
+            cand = it.get("id")
+            if cand and self._has_marker(cand):
+                st.session_state["__ms_workbook_id__"] = cand
+                self._write_pointer(cand)
+                return cand
+
+        # 3) Search by name (last resort)
+        hits = self._search_drive("FieldFlow")
+        hits = [it for it in hits if str(it.get("name", "")).lower().endswith(".xlsx")]
+        hits.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+        for it in hits:
+            cand = it.get("id")
+            if cand and self._has_marker(cand):
+                st.session_state["__ms_workbook_id__"] = cand
+                self._write_pointer(cand)
+                return cand
+
+        # If we have name hits but no marker, adopt the newest one (still last-resort)
+        if hits:
+            cand = hits[0].get("id")
+            if cand and self._workbook_exists(cand):
+                # Install marker + pointer to make future runs rename-proof
+                self._ensure_marker(cand)
+                self._write_pointer(cand)
+                st.session_state["__ms_workbook_id__"] = cand
+                return cand
+
+        if not create_if_missing:
+            return None
+
+        # 4) Create
+        return self._create_workbook_in_approot()
+
+    def _create_workbook_in_approot(self) -> str:
+        # Prevent rerun spam
+        now = time.time()
+        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
+        if now < next_ok:
+            raise RuntimeError("Microsoft is throttling workbook creation. Please wait ~30 seconds and try again.")
+
+        # Create a minimal valid workbook (Excel) and upload to approot
+        name = f"{self.title}.xlsx"
+        try:
+            from openpyxl import Workbook
+            import io as _io
+            wb = Workbook()
+            buf = _io.BytesIO()
+            wb.save(buf)
+            content = buf.getvalue()
+        except Exception:
+            # last-resort (should still create a file, but may not be valid excel)
+            content = b"PK\x03\x04"
+
+        url = f"{self.base}/me/drive/special/approot:/{name}:/content"
+        r = self._graph_request(
+            "PUT",
+            url,
+            data=content,
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            timeout=60,
+            max_retries=6,
+        )
+
+        if r.status_code >= 400:
+            data = self._safe_json(r)
+            code = None
+            msg = None
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                code = data["error"].get("code")
+                msg = data["error"].get("message")
+            if code == "quotaLimitReached" or r.status_code in (429, 503, 504):
+                st.session_state["__ms_next_create_ok__"] = time.time() + 30
+                raise RuntimeError("Microsoft is throttling requests (quotaLimitReached). Please wait ~30 seconds and try again.")
+            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or r.status_code} {msg or ''}")
+
+        # Find it in approot to get id
+        wid = None
+        try:
+            for it in self._list_approot_children():
+                if str(it.get("name", "")) == name and str(it.get("id")):
+                    wid = str(it.get("id"))
+                    break
+        except Exception:
+            wid = None
+
+        if not wid:
+            # Some responses include id; try to use it
+            data = self._safe_json(r)
+            wid = data.get("id") if isinstance(data, dict) else None
+
+        if not wid:
+            raise RuntimeError("Workbook created but could not resolve its id. Please try again.")
+
+        # Install marker and pointer
+        self._ensure_marker(wid)
+        self._write_pointer(wid)
+        st.session_state["__ms_workbook_id__"] = wid
+        return wid
+
+    # ---- Overridden entrypoints used by the rest of the app
+    def _find_existing_workbook_id(self) -> str | None:  # compatibility
+        return self._resolve_workbook_id(create_if_missing=False)
+
+    def _get_workbook_id(self, create_if_missing: bool = True) -> str:
+        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
+        if wid:
+            return wid
+        raise RuntimeError(
+            "No FieldFlow workbook found in your OneDrive yet. "
+            "Try saving once (the app will create it), or use the Settings page to initialize."
+        )
+
+    def _ensure_workbook(self):
+        _ = self._get_workbook_id(create_if_missing=True)
+
+    def load_presets(self) -> dict:
+        """Load presets without creating a workbook during normal reruns."""
+        wid = self._resolve_workbook_id(create_if_missing=False)
+        if not wid:
+            return {}
+        ws = "presets"
+        url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        if r.status_code >= 400:
+            return {}
+        data = self._safe_json(r)
+        vals = data.get("values", []) if isinstance(data, dict) else []
+        out = {}
+        for row in vals[1:]:
+            if len(row) >= 2:
+                try:
+                    out[str(row[0])] = json.loads(row[1])
+                except Exception:
+                    pass
+        return out
+
+
+# -----------------------------------------------------------------------------
+# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
+# -----------------------------------------------------------------------------
+#
+# This file originally defines MSExcelOAuth above. We redefine it here as a
+# subclass that keeps all existing worksheet/table logic, but replaces the
+# workbook lookup/creation to avoid Graph quota issues and to survive renames.
+#
+# Policy:
+# 1) Try stored workbook ID (persisted in the user's OneDrive approot as a JSON file)
+# 2) If missing, scan approot for any workbook with a FieldFlow marker
+# 3) If still missing, search by name "FieldFlow" (last resort)
+# 4) If none found, create a workbook and store its ID
+
+_OLD_MSExcelOAuth = MSExcelOAuth
+
+class MSExcelOAuth(_OLD_MSExcelOAuth):
+    """Microsoft Excel backend with rename-proof workbook lookup.
+
+    We persist the workbook id in OneDrive's *app folder* (approot) in a small
+    JSON file so the workbook can be renamed without breaking the app.
+    """
+
+    _POINTER_FILENAME = ".fieldflow_workbook.json"
+    _MARKER_SHEET = "_fieldflow_meta"
+    _MARKER_CELL = "A1"
+    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
+
+    # ---- Graph helpers (throttle aware)
+    def _graph_request(self, method: str, url: str, *, headers: dict | None = None,
+                       json_body=None, data=None, timeout: int = 30, max_retries: int = 6) -> requests.Response:
+        base_headers = {"Authorization": f"Bearer {self.token}"}
+        if headers:
+            base_headers.update(headers)
+
+        last = None
+        for attempt in range(max_retries):
+            try:
+                r = requests.request(method, url, headers=base_headers, json=json_body, data=data, timeout=timeout)
+                last = r
+            except Exception:
+                # transient network-ish
+                time.sleep(min(2 ** attempt, 20))
+                continue
+
+            # Determine throttling
+            err_code = None
+            try:
+                if r.status_code >= 400:
+                    j = r.json()
+                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
+                        err_code = j["error"].get("code")
+            except Exception:
+                pass
+
+            throttled = r.status_code in (429, 503, 504) or err_code == "quotaLimitReached"
+            if throttled and attempt < max_retries - 1:
+                ra = r.headers.get("Retry-After")
+                if ra and str(ra).isdigit():
+                    wait = int(ra)
+                else:
+                    wait = min(2 ** attempt, 30)
+                time.sleep(wait)
+                continue
+
+            return r
+
+        return last if last is not None else requests.Response()
+
+    def _graph_json(self, r: requests.Response) -> dict:
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
+    # ---- Pointer file (persist workbook id in user's OneDrive approot)
+    def _pointer_url(self) -> str:
+        # Read/write raw content of a file in approot.
+        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
+
+    def _read_pointer(self) -> dict | None:
+        r = self._graph_request("GET", self._pointer_url(), timeout=20, max_retries=3)
+        if r is None or getattr(r, "status_code", 0) == 404:
+            return None
+        if getattr(r, "status_code", 0) >= 400:
+            return None
+        try:
+            return json.loads(r.content.decode("utf-8"))
+        except Exception:
+            return None
+
+    def _write_pointer(self, workbook_id: str) -> None:
+        payload = {
+            "workbook_id": workbook_id,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "app": "FieldFlow",
+        }
+        content = json.dumps(payload, indent=2).encode("utf-8")
+        r = self._graph_request(
+            "PUT",
+            self._pointer_url(),
+            headers={"Content-Type": "application/json"},
+            data=content,
+            timeout=30,
+            max_retries=5,
+        )
+        # ignore errors; pointer is a convenience
+        _ = r
+
+    def _validate_workbook_id(self, workbook_id: str) -> bool:
+        if not workbook_id:
+            return False
+        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        return getattr(r, "status_code", 0) < 400
+
+    # ---- Marker sheet (lets us confirm a workbook is truly ours)
+    def _marker_read(self, workbook_id: str) -> str | None:
+        url = (
+            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/"
+            f"{urllib.parse.quote(self._MARKER_SHEET)}/range(address='{self._MARKER_CELL}')"
+        )
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        if getattr(r, "status_code", 0) >= 400:
+            return None
+        data = self._graph_json(r)
+        vals = data.get("values")
+        try:
+            return str(vals[0][0])
+        except Exception:
+            return None
+
+    def _has_marker(self, workbook_id: str) -> bool:
+        try:
+            return self._marker_read(workbook_id) == self._MARKER_VALUE
+        except Exception:
+            return False
+
+    def _update_range_by_id(self, workbook_id: str, ws_name: str, start_cell: str, values_2d: list[list]):
+        # Same as parent _update_range, but allows specifying workbook id.
+        m2 = re.match(r"^([A-Z]+)(\d+)$", str(start_cell).upper().strip())
+        if not m2:
+            raise ValueError(f"Bad start_cell: {start_cell}")
+        col_letters, row_str = m2.group(1), m2.group(2)
+        start_row = int(row_str)
+
+        nrows = max(1, len(values_2d))
+        ncols = max(1, max((len(r) for r in values_2d), default=1))
+
+        start_col_num = 0
+        for ch in col_letters:
+            start_col_num = start_col_num * 26 + (ord(ch) - 64)
+
+        def _col_name(n: int) -> str:
+            name = ""
+            while n > 0:
+                n, rr = divmod(n - 1, 26)
+                name = chr(65 + rr) + name
+            return name
+
+        end_col_num = start_col_num + ncols - 1
+        end_row = start_row + nrows - 1
+        end_cell = f"{_col_name(end_col_num)}{end_row}"
+        address = f"{col_letters}{start_row}:{end_cell}"
+
+        url = (
+            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/"
+            f"{urllib.parse.quote(ws_name)}/range(address='{address}')"
+        )
+        self._graph_request(
+            "PATCH",
+            url,
+            headers={"Content-Type": "application/json"},
+            json_body={"values": values_2d},
+            timeout=30,
+            max_retries=4,
+        )
+
+    def _ensure_marker(self, workbook_id: str) -> None:
+        # Ensure the marker sheet exists and set A1.
+        url_ws = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
+        r = self._graph_request("GET", url_ws, timeout=20, max_retries=3)
+        if getattr(r, "status_code", 0) >= 400:
+            return
+        data = self._graph_json(r)
+        names = [w.get("name") for w in data.get("value", []) if isinstance(w, dict)]
+        if self._MARKER_SHEET not in names:
+            add_url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
+            self._graph_request(
+                "POST",
+                add_url,
+                headers={"Content-Type": "application/json"},
+                json_body={"name": self._MARKER_SHEET},
+                timeout=30,
+                max_retries=4,
+            )
+        # Set marker value
+        try:
+            self._update_range_by_id(workbook_id, self._MARKER_SHEET, "A1", [[self._MARKER_VALUE], ["v1"], [datetime.utcnow().isoformat() + "Z"]])
+        except Exception:
+            pass
+
+    # ---- Step 2 helpers
+    def _approot_children(self) -> list[dict]:
+        url = f"{self.base}/me/drive/special/approot/children?$select=id,name,lastModifiedDateTime,file&$top=200"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._graph_json(r)
+        return data.get("value", []) if isinstance(data, dict) else []
+
+    def _search_drive(self, q: str) -> list[dict]:
+        url = f"{self.base}/me/drive/root/search(q='{q}')?$select=id,name,lastModifiedDateTime,file&$top=50"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._graph_json(r)
+        return data.get("value", []) if isinstance(data, dict) else []
+
+    def _create_workbook_in_approot(self) -> str:
+        # Gate creation (Streamlit reruns)
+        now = time.time()
+        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
+        if now < next_ok:
+            raise RuntimeError("Microsoft is throttling workbook creation. Please wait a moment and try again.")
+
+        # Create a minimal valid workbook bytes
+        try:
+            from openpyxl import Workbook
+            import io
+            wb = Workbook()
+            buf = io.BytesIO()
+            wb.save(buf)
+            content = buf.getvalue()
+        except Exception:
+            content = b"PK\x03\x04"
+
+        name = f"{self.title}.xlsx"
+        url = f"{self.base}/me/drive/special/approot:/{name}:/content"
+        r = self._graph_request(
+            "PUT",
+            url,
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            data=content,
+            timeout=60,
+            max_retries=6,
+        )
+        if getattr(r, "status_code", 0) >= 400:
+            # Set a cooldown and provide a human message
+            st.session_state["__ms_next_create_ok__"] = time.time() + 30
+            data = self._graph_json(r)
+            code = None
+            msg = None
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                code = data["error"].get("code")
+                msg = data["error"].get("message")
+            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or r.status_code} {msg or ''}".strip())
+
+        # Resolve id (upload usually returns it, but we also fall back to listing approot)
+        try:
+            item = r.json()
+            wid = item.get("id")
+            if wid:
+                return wid
+        except Exception:
+            pass
+
+        # Fallback: list approot and find by name
+        want = name.lower()
+        items = self._approot_children()
+        for it in items:
+            if str(it.get("name", "")).lower() == want:
+                return str(it.get("id"))
+        raise RuntimeError("Workbook upload succeeded but workbook id could not be resolved.")
+
+    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
+        # Cache
+        wid = st.session_state.get("__ms_workbook_id__")
+        if wid and self._validate_workbook_id(wid):
+            return wid
+
+        # Step 1: pointer file
+        p = self._read_pointer()
+        if isinstance(p, dict):
+            pwid = p.get("workbook_id")
+            if isinstance(pwid, str) and self._validate_workbook_id(pwid):
+                st.session_state["__ms_workbook_id__"] = pwid
+                return pwid
+
+        # Step 2: scan approot for marker
+        approot = self._approot_children()
+        xlsx = [it for it in approot if str(it.get("name", "")).lower().endswith(".xlsx")]
+        # newest first
+        xlsx.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+        for it in xlsx:
+            cid = str(it.get("id", ""))
+            if cid and self._has_marker(cid):
+                st.session_state["__ms_workbook_id__"] = cid
+                try:
+                    self._write_pointer(cid)
+                except Exception:
+                    pass
+                return cid
+
+        # Step 3: name search (last resort)
+        hits = self._search_drive("FieldFlow")
+        candidates = []
+        for it in hits:
+            name = str(it.get("name", ""))
+            if not name.lower().endswith(".xlsx"):
+                continue
+            candidates.append(it)
+        candidates.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+
+        for it in candidates:
+            cid = str(it.get("id", ""))
+            if cid and self._has_marker(cid):
+                st.session_state["__ms_workbook_id__"] = cid
+                try:
+                    self._write_pointer(cid)
+                except Exception:
+                    pass
+                return cid
+
+        # If we found name-matches but no marker, we can *adopt* the newest one.
+        if candidates:
+            cid = str(candidates[0].get("id", ""))
+            if cid and self._validate_workbook_id(cid):
+                try:
+                    self._ensure_marker(cid)
+                    self._write_pointer(cid)
+                except Exception:
+                    pass
+                st.session_state["__ms_workbook_id__"] = cid
+                return cid
+
+        # None found
+        if not create_if_missing:
+            return None
+
+        # Create + mark + persist
+        wid_new = self._create_workbook_in_approot()
+        try:
+            self._ensure_marker(wid_new)
+        except Exception:
+            pass
+        try:
+            self._write_pointer(wid_new)
+        except Exception:
+            pass
+        st.session_state["__ms_workbook_id__"] = wid_new
+        return wid_new
+
+    # --- Override: workbook id getter used by parent methods
+    def _get_workbook_id(self, create_if_missing: bool = True) -> str:
+        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
+        if wid:
+            return wid
+        raise RuntimeError(
+            "No FieldFlow workbook found in your OneDrive yet. "
+            "Try saving once (the app will create it), or use the Settings page to initialize."
+        )
+
+    # --- Override: workbook initializer button should reuse the same policy
+    def _ensure_workbook(self):
+        wid = self._resolve_workbook_id(create_if_missing=True)
+        if not wid:
+            raise RuntimeError("Failed to create or resolve OneDrive workbook.")
+        # Friendly UI
+        try:
+            st.success("Workbook ready in OneDrive (auto-detected / reused).")
+        except Exception:
+            pass
+
+    # --- Override: presets read should NOT create workbooks during page load
+    def load_presets(self) -> dict:
+        wid = self._resolve_workbook_id(create_if_missing=False)
+        if not wid:
+            return {}
+        ws = "presets"
+        url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        if getattr(r, "status_code", 0) >= 400:
+            return {}
+        data = self._graph_json(r)
+        vals = data.get("values", []) if isinstance(data, dict) else []
+        out: dict = {}
+        for row in vals[1:]:
+            if len(row) >= 2:
+                try:
+                    out[str(row[0])] = json.loads(row[1])
+                except Exception:
+                    pass
+        return out
+
+    # Ensure we don't create the workbook just to check worksheets during read paths.
+    def _ensure_worksheet(self, name: str, headers: list[str], create_if_missing: bool = True):
+        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
+        if not wid:
+            raise RuntimeError("OneDrive workbook not initialized.")
+        url_ws = f"{self.base}/me/drive/items/{wid}/workbook/worksheets"
+        r = self._graph_request("GET", url_ws, timeout=20, max_retries=3)
+        data = self._graph_json(r)
+        names = [w.get("name") for w in data.get("value", []) if isinstance(w, dict)]
+        if name not in names and create_if_missing:
+            add_url = url_ws + "/add"
+            self._graph_request(
+                "POST",
+                add_url,
+                headers={"Content-Type": "application/json"},
+                json_body={"name": name},
+                timeout=30,
+                max_retries=4,
+            )
+            # Write headers
+            try:
+                self._update_range_by_id(wid, name, "A1", [headers])
+            except Exception:
+                pass
+        # Keep feedback sheet for feedback operations when we are in create mode
+        if create_if_missing and name != "feedback":
+            try:
+                if "feedback" not in names:
+                    self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"], create_if_missing=True)
+            except Exception:
+                pass
+
+
+# -----------------------------------------------------------------------------
+# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
+# -----------------------------------------------------------------------------
+#
+# This file originally defines MSExcelOAuth above. We redefine it here as a
+# subclass that keeps all existing worksheet storage logic, but replaces the
+# workbook lookup/creation to avoid Graph `quotaLimitReached` and to remain
+# stable even if the user renames the workbook.
+#
+# Policy:
+#  1) Try a stored workbook ID (persisted in the user's OneDrive App Folder).
+#  2) If missing, scan the App Folder for a workbook with a FieldFlow marker.
+#  3) If still missing, search the drive by name as a last resort.
+#  4) If none found, create a new workbook and store its ID.
+
+try:
+    _MSExcelOAuth_BASE = MSExcelOAuth  # type: ignore
+except Exception:
+    _MSExcelOAuth_BASE = object  # pragma: no cover
+
+
+class MSExcelOAuth(_MSExcelOAuth_BASE):  # type: ignore
+    _POINTER_FILENAME = ".fieldflow_workbook.json"
+    _MARKER_SHEET = "_fieldflow_meta"
+    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
+    _CREATE_COOLDOWN_SEC = 30
+
+    # -----------------------------
+    # Graph helpers (retry/backoff)
+    # -----------------------------
+    def _graph_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body=None,
+        data=None,
+        headers: dict | None = None,
+        timeout: int = 30,
+        max_retries: int = 5,
+    ):
+        base_headers = {"Authorization": f"Bearer {self.token}"}
+        if headers:
+            base_headers.update(headers)
+        if "Content-Type" not in base_headers and json_body is not None:
+            base_headers["Content-Type"] = "application/json"
+
+        last = None
+        for attempt in range(max_retries):
+            try:
+                r = requests.request(
+                    method,
+                    url,
+                    headers=base_headers,
+                    json=json_body,
+                    data=data,
+                    timeout=timeout,
+                )
+                last = r
+            except Exception:
+                time.sleep(min(2 ** attempt, 20))
+                continue
+
+            err_code = None
+            retry_after = None
+            try:
+                retry_after = r.headers.get("Retry-After")
+            except Exception:
+                pass
+            try:
+                if r.status_code >= 400:
+                    j = r.json()
+                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
+                        err_code = j["error"].get("code")
+            except Exception:
+                pass
+
+            throttled = r.status_code in (429, 503, 504) or err_code == "quotaLimitReached"
+            if throttled and attempt < max_retries - 1:
+                if retry_after and str(retry_after).isdigit():
+                    wait = int(retry_after)
+                else:
+                    wait = min(2 ** attempt, self._CREATE_COOLDOWN_SEC)
+                time.sleep(wait)
+                continue
+
+            return r
+
+        return last
+
+    @staticmethod
+    def _graph_json(r) -> dict:
+        try:
+            return r.json() if r is not None else {}
+        except Exception:
+            return {}
+
+    # -----------------------------
+    # OneDrive pointer file (persist workbook id across sessions)
+    # -----------------------------
+    def _pointer_content_url(self) -> str:
+        # App Folder path-based access
+        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
+
+    def _read_pointer(self) -> dict | None:
+        r = self._graph_request("GET", self._pointer_content_url(), timeout=20, max_retries=3)
+        if r is None or r.status_code in (404, 403):
+            return None
+        if r.status_code >= 400:
+            return None
+        try:
+            return json.loads(r.text)
+        except Exception:
+            return None
+
+    def _write_pointer(self, workbook_id: str, *, source: str) -> None:
+        payload = {
+            "workbook_id": workbook_id,
+            "source": source,
+            "updated_at": datetime.utcnow().isoformat(),
+            "app": "FieldFlow",
+        }
+        data = json.dumps(payload).encode("utf-8")
+        self._graph_request(
+            "PUT",
+            self._pointer_content_url(),
+            headers={"Content-Type": "application/json"},
+            data=data,
+            timeout=30,
+            max_retries=3,
+        )
+
+    def _validate_workbook_id(self, workbook_id: str) -> bool:
+        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
+        r = self._graph_request("GET", url, timeout=20, max_retries=2)
+        return bool(r is not None and r.status_code < 400)
+
+    # -----------------------------
+    # Marker sheet helpers
+    # -----------------------------
+    def _worksheet_names(self, workbook_id: str) -> list[str]:
+        url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
+        r = self._graph_request("GET", url, timeout=20, max_retries=2)
+        data = self._graph_json(r)
+        vals = data.get("value", []) if isinstance(data, dict) else []
+        return [str(v.get("name")) for v in vals if isinstance(v, dict) and v.get("name")]
+
+    def _has_marker(self, workbook_id: str) -> bool:
+        # Fast-path: check marker sheet A1
+        sheet = urllib.parse.quote(self._MARKER_SHEET)
+        url = (
+            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/{sheet}"
+            f"/range(address='A1')"
+        )
+        r = self._graph_request("GET", url, timeout=20, max_retries=2)
+        if r is None or r.status_code >= 400:
+            return False
+        data = self._graph_json(r)
+        try:
+            values = data.get("values")
+            if values and values[0] and str(values[0][0]).strip() == self._MARKER_VALUE:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _ensure_marker(self, workbook_id: str) -> None:
+        names = self._worksheet_names(workbook_id)
+        if self._MARKER_SHEET not in names:
+            url_add = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
+            r = self._graph_request("POST", url_add, json_body={"name": self._MARKER_SHEET}, timeout=20, max_retries=3)
+            if r is None or r.status_code >= 400:
+                # If we can't create marker, just give up silently (don't break app)
+                return
+
+        # Write marker values
+        sheet = urllib.parse.quote(self._MARKER_SHEET)
+        url_range = (
+            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/{sheet}"
+            f"/range(address='A1:A3')"
+        )
+        vals = [[self._MARKER_VALUE], ["v1"], [datetime.utcnow().isoformat()]]
+        self._graph_request("PATCH", url_range, json_body={"values": vals}, timeout=20, max_retries=3)
+
+    # -----------------------------
+    # Workbook discovery (3-step policy)
+    # -----------------------------
+    def _list_approot_children(self) -> list[dict]:
+        url = (
+            f"{self.base}/me/drive/special/approot/children"
+            f"?$select=id,name,lastModifiedDateTime,file&$top=200"
+        )
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._graph_json(r)
+        return data.get("value", []) if isinstance(data, dict) else []
+
+    def _search_drive_by_name(self, query: str) -> list[dict]:
+        q = urllib.parse.quote(query)
+        url = f"{self.base}/me/drive/root/search(q='{q}')?$select=id,name,lastModifiedDateTime,file&$top=50"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._graph_json(r)
+        return data.get("value", []) if isinstance(data, dict) else []
+
+    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
+        # 1) pointer file
+        ptr = self._read_pointer()
+        if isinstance(ptr, dict):
+            wid = str(ptr.get("workbook_id") or "").strip()
+            if wid and self._validate_workbook_id(wid):
+                return wid
+
+        # 2) approot scan for marker
+        candidates = []
+        for it in self._list_approot_children():
+            name = str(it.get("name", ""))
+            if not name.lower().endswith(".xlsx"):
+                continue
+            if not isinstance(it.get("file"), dict):
+                continue
+            candidates.append(it)
+
+        # newest first
+        candidates.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+        for it in candidates:
+            wid = it.get("id")
+            if wid and self._has_marker(wid):
+                try:
+                    self._write_pointer(str(wid), source="approot_marker")
+                except Exception:
+                    pass
+                return str(wid)
+
+        # 3) last resort: name search
+        name_hits = []
+        for it in self._search_drive_by_name("FieldFlow"):
+            name = str(it.get("name", ""))
+            if not name.lower().endswith(".xlsx"):
+                continue
+            if not isinstance(it.get("file"), dict):
+                continue
+            name_hits.append(it)
+        name_hits.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+
+        # Prefer marker matches
+        for it in name_hits:
+            wid = it.get("id")
+            if wid and self._has_marker(wid):
+                try:
+                    self._write_pointer(str(wid), source="drive_search_marker")
+                except Exception:
+                    pass
+                return str(wid)
+
+        # If we found something named like FieldFlow but without marker, adopt newest
+        if name_hits:
+            wid = str(name_hits[0].get("id") or "").strip()
+            if wid:
+                try:
+                    self._ensure_marker(wid)
+                    self._write_pointer(wid, source="drive_search_adopted")
+                except Exception:
+                    pass
+                return wid
+
+        if not create_if_missing:
+            return None
+
+        # 4) create
+        return self._create_workbook_and_persist()
+
+    def _create_workbook_and_persist(self) -> str:
+        # Guard against Streamlit rerun spam
+        now = time.time()
+        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
+        if now < next_ok:
+            raise RuntimeError(
+                "Microsoft is throttling workbook creation. Please wait a bit and try again."
+            )
+
+        # Create minimal valid XLSX
+        content = None
+        try:
+            from openpyxl import Workbook
+            import io as _io
+            wb = Workbook()
+            buf = _io.BytesIO()
+            wb.save(buf)
+            content = buf.getvalue()
+        except Exception:
+            content = b"PK\x03\x04"  # minimal zip header fallback
+
+        filename = f"{self.title}.xlsx"
+        url = f"{self.base}/me/drive/special/approot:/{urllib.parse.quote(filename)}:/content"
+        r = self._graph_request(
+            "PUT",
+            url,
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            data=content,
+            timeout=60,
+            max_retries=5,
+        )
+        if r is None or r.status_code >= 400:
+            data = self._graph_json(r)
+            code = None
+            msg = None
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                code = data["error"].get("code")
+                msg = data["error"].get("message")
+            if code == "quotaLimitReached" or (r is not None and r.status_code in (429, 503, 504)):
+                st.session_state["__ms_next_create_ok__"] = time.time() + self._CREATE_COOLDOWN_SEC
+                raise RuntimeError(
+                    "Microsoft Graph is rate limiting workbook creation (quotaLimitReached). "
+                    "Wait ~30 seconds and try again."
+                )
+            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or (r.status_code if r else 'unknown')} {msg or ''}")
+
+        # Find new workbook id by listing approot
+        wid = None
+        for it in self._list_approot_children():
+            if str(it.get("name", "")).lower() == filename.lower():
+                wid = it.get("id")
+                break
+        if not wid:
+            # fallback: try search
+            hits = self._search_drive_by_name(self.title)
+            for it in hits:
+                if str(it.get("name", "")).lower() == filename.lower():
+                    wid = it.get("id")
+                    break
+        if not wid:
+            raise RuntimeError("Workbook created but could not locate it in OneDrive. Please try again.")
+
+        wid = str(wid)
+        try:
+            self._ensure_marker(wid)
+        except Exception:
+            pass
+        try:
+            self._write_pointer(wid, source="created")
+        except Exception:
+            pass
+        return wid
+
+    # -----------------------------
+    # Overrides that parent pages call
+    # -----------------------------
+    def _get_workbook_id(self, create_if_missing: bool = True) -> str:
+        # Session cache
+        if "__ms_workbook_id__" in st.session_state:
+            wid = str(st.session_state["__ms_workbook_id__"])
+            if wid and self._validate_workbook_id(wid):
+                return wid
+            st.session_state.pop("__ms_workbook_id__", None)
+
+        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
+        if wid:
+            st.session_state["__ms_workbook_id__"] = wid
+            return wid
+
+        raise RuntimeError(
+            "No FieldFlow workbook found yet in OneDrive. "
+            "Try saving once to create it (or use the Settings page to initialize)."
+        )
+
+    def _ensure_workbook(self):
+        # Kept for compatibility with the sidebar button
+        wid = self._resolve_workbook_id(create_if_missing=True)
+        if wid:
+            st.session_state["__ms_workbook_id__"] = wid
+            st.success("Workbook ready in OneDrive.")
+
+    def load_presets(self) -> dict:
+        """Load presets without creating the workbook as a side-effect."""
+        try:
+            wid = self._resolve_workbook_id(create_if_missing=False)
+            if not wid:
+                return {}
+            ws = "presets"
+            url = (
+                f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}"
+                f"/usedRange(valuesOnly=true)"
+            )
+            r = self._graph_request("GET", url, timeout=20, max_retries=2)
+            if r is None or r.status_code >= 400:
+                return {}
+            data = self._graph_json(r)
+            vals = data.get("values", []) if isinstance(data, dict) else []
+            out = {}
+            for row in vals[1:]:
+                if len(row) >= 2:
+                    try:
+                        out[str(row[0])] = json.loads(row[1])
+                    except Exception:
+                        pass
+            # Cache wid so later writes are fast
+            st.session_state["__ms_workbook_id__"] = wid
+            return out
+        except Exception:
+            return {}
