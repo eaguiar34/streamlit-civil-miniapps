@@ -935,7 +935,7 @@ def google_oauth_start():
         redirect_uri=redirect_uri,
     )
 
-    import secrets as _secrets
+import secrets as _secrets
     state = "g_" + _secrets.token_urlsafe(16)
     auth_url, _ = flow.authorization_url(
     access_type="offline",
