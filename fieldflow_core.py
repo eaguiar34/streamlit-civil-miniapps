@@ -298,7 +298,7 @@ con.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
     csv TEXT NOT NULL
 )""")
 con.commit()
-    self.con = con
+self.con = con
 
     def save_preset(self, name: str, payload: dict) -> None:
         self.con.execute(
