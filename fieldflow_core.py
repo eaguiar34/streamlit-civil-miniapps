@@ -288,7 +288,16 @@ class SQLiteBackend(StorageBackend):
             FOREIGN KEY (rfi_id) REFERENCES rfis(id) ON DELETE CASCADE
         )""")
 
-        con.commit()
+        
+con.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    company TEXT, client TEXT, project TEXT, scenario TEXT, kind TEXT,
+    baseline_days INTEGER, crashed_days INTEGER,
+    meta_json TEXT NOT NULL,
+    csv TEXT NOT NULL
+)""")
+con.commit()
         self.con = con
 
     def save_preset(self, name: str, payload: dict) -> None:
@@ -473,6 +482,58 @@ class SQLiteBackend(StorageBackend):
         con.execute("DELETE FROM rfi_attachments WHERE id=?", (attachment_id,))
         con.commit()
 
+
+# ---- Schedule Runs (full save/browse/download)
+
+def save_schedule_run(self, meta: dict, df: pd.DataFrame) -> str:
+    con = self._conn()
+    run_id = meta.get("run_id") or f"sched_{int(time.time()*1000)}"
+    created_at = meta.get("created_at") or _utc_now()
+    meta_json = json.dumps(meta, ensure_ascii=False)
+    csv_text = df.to_csv(index=False)
+    con.execute(
+        """INSERT OR REPLACE INTO schedule_runs
+           (id, created_at, company, client, project, scenario, kind, baseline_days, crashed_days, meta_json, csv)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            run_id,
+            created_at,
+            meta.get("company",""),
+            meta.get("client",""),
+            meta.get("project",""),
+            meta.get("scenario",""),
+            meta.get("kind",""),
+            int(meta.get("baseline_days") or 0) if meta.get("baseline_days") is not None else None,
+            int(meta.get("crashed_days") or 0) if meta.get("crashed_days") is not None else None,
+            meta_json,
+            csv_text,
+        ),
+    )
+    con.commit()
+    return run_id
+
+def list_schedule_runs(self) -> pd.DataFrame:
+    con = self._conn()
+    rows = con.execute(
+        """SELECT id, created_at, company, client, project, scenario, kind, baseline_days, crashed_days
+           FROM schedule_runs ORDER BY created_at DESC"""
+    ).fetchall()
+    return pd.DataFrame(rows, columns=["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days"])
+
+def load_schedule_run(self, run_id: str) -> tuple[dict, pd.DataFrame]:
+    con = self._conn()
+    row = con.execute("SELECT meta_json, csv FROM schedule_runs WHERE id=?", (run_id,)).fetchone()
+    if not row:
+        raise KeyError("Schedule run not found")
+    meta = json.loads(row[0]) if row[0] else {}
+    df = pd.read_csv(io.StringIO(row[1])) if row[1] else pd.DataFrame()
+    return meta, df
+
+def delete_schedule_run(self, run_id: str) -> None:
+    con = self._conn()
+    con.execute("DELETE FROM schedule_runs WHERE id=?", (run_id,))
+    con.commit()
+
     def open_url_hint(self, rec: dict) -> str | None:
         return None
 
@@ -528,6 +589,7 @@ class GoogleSheetsSA(StorageBackend):
             "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"
         ])
         self._ensure_ws("feedback", ["created_at","user_id","page","rating","categories","email","message"])
+        self._ensure_ws("schedule_runs", ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name","meta_json"])
         self._ensure_ws("rfis", ["id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"])
 
 
@@ -731,6 +793,105 @@ class GoogleSheetsSA(StorageBackend):
                 continue
 
 
+
+# ---- Schedule Runs (full save/browse/download)
+
+def save_schedule_run(self, meta: dict, df: pd.DataFrame) -> str:
+    ws_index = self.ss.worksheet("schedule_runs")
+    run_id = meta.get("run_id") or f"sched_{int(time.time()*1000)}"
+    created_at = meta.get("created_at") or _utc_now()
+
+    tab = self._sanitize_tab(f"sched_{run_id}_{meta.get('project','')}_{meta.get('kind','')}")
+    try:
+        old = self.ss.worksheet(tab)
+        self.ss.del_worksheet(old)
+    except Exception:
+        pass
+
+    w = self.ss.add_worksheet(title=tab, rows=max(1000, len(df)+10), cols=max(20, len(df.columns)+5))
+    w.update([df.columns.tolist()] + df.fillna("").astype(str).values.tolist())
+
+    row = [
+        run_id,
+        created_at,
+        meta.get("company",""),
+        meta.get("client",""),
+        meta.get("project",""),
+        meta.get("scenario",""),
+        meta.get("kind",""),
+        str(meta.get("baseline_days","") or ""),
+        str(meta.get("crashed_days","") or ""),
+        tab,
+        json.dumps(meta, ensure_ascii=False),
+    ]
+    ws_index.append_row(row)
+    return run_id
+
+def list_schedule_runs(self) -> pd.DataFrame:
+    ws = self.ss.worksheet("schedule_runs")
+    vals = ws.get_all_values()
+    headers = vals[0] if vals else []
+    rows = vals[1:] if len(vals) > 1 else []
+    if not headers:
+        return pd.DataFrame(columns=["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"])
+    df = pd.DataFrame(rows, columns=headers)
+    keep = ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"]
+    for k in keep:
+        if k not in df.columns:
+            df[k] = ""
+    return df[keep].sort_values("created_at", ascending=False)
+
+def load_schedule_run(self, run_id: str) -> tuple[dict, pd.DataFrame]:
+    ws = self.ss.worksheet("schedule_runs")
+    vals = ws.get_all_values()
+    if len(vals) <= 1:
+        raise KeyError("Schedule run not found")
+    headers = vals[0]
+    for row in vals[1:]:
+        if len(row) >= 1 and str(row[0]) == str(run_id):
+            rec = dict(zip(headers, row))
+            tab = rec.get("sheet_name")
+            meta = {}
+            try:
+                meta = json.loads(rec.get("meta_json","") or "{}")
+            except Exception:
+                meta = {}
+            if not tab:
+                raise KeyError("Schedule run sheet missing")
+            w = self.ss.worksheet(tab)
+            values = w.get_all_values()
+            if len(values) <= 1:
+                return meta, pd.DataFrame()
+            df = pd.DataFrame(values[1:], columns=values[0])
+            return meta, df
+    raise KeyError("Schedule run not found")
+
+def delete_schedule_run(self, run_id: str) -> None:
+    ws = self.ss.worksheet("schedule_runs")
+    vals = ws.get_all_values()
+    if len(vals) <= 1:
+        return
+    headers = vals[0]
+    kept = [headers]
+    tab_to_delete = None
+    for row in vals[1:]:
+        if len(row) >= 1 and str(row[0]) == str(run_id):
+            try:
+                rec = dict(zip(headers, row))
+                tab_to_delete = rec.get("sheet_name")
+            except Exception:
+                pass
+            continue
+        kept.append(row)
+    ws.clear()
+    ws.update(kept)
+    if tab_to_delete:
+        try:
+            w = self.ss.worksheet(tab_to_delete)
+            self.ss.del_worksheet(w)
+        except Exception:
+            pass
+
     def open_url_hint(self, rec: dict) -> str | None:
         try: return self.ss.url
         except: return None
@@ -774,11 +935,14 @@ def google_oauth_start():
         redirect_uri=redirect_uri,
     )
 
-    auth_url, state = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-    )
-    st.session_state["__google_state__"] = state
+    import secrets as _secrets
+state = "g_" + _secrets.token_urlsafe(16)
+auth_url, _ = flow.authorization_url(
+    access_type="offline",
+    prompt="consent",
+    state=state,
+)
+st.session_state["__google_state__"] = state
     st.markdown(f"[Continue to Google]({auth_url})")
 
 def google_oauth_callback():
@@ -927,6 +1091,7 @@ class GoogleSheetsOAuth(StorageBackend):
             "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"
         ])
         self._ensure_ws("feedback", ["created_at","user_id","page","rating","categories","email","message"])
+        self._ensure_ws("schedule_runs", ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name","meta_json"])
         self._ensure_ws("rfis", [
             "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
             "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
@@ -1111,6 +1276,105 @@ class GoogleSheetsOAuth(StorageBackend):
                     return
             except Exception:
                 continue
+
+
+# ---- Schedule Runs (full save/browse/download)
+
+def save_schedule_run(self, meta: dict, df: pd.DataFrame) -> str:
+    ws_index = self.ss.worksheet("schedule_runs")
+    run_id = meta.get("run_id") or f"sched_{int(time.time()*1000)}"
+    created_at = meta.get("created_at") or _utc_now()
+
+    tab = self._sanitize_tab(f"sched_{run_id}_{meta.get('project','')}_{meta.get('kind','')}")
+    try:
+        old = self.ss.worksheet(tab)
+        self.ss.del_worksheet(old)
+    except Exception:
+        pass
+
+    w = self.ss.add_worksheet(title=tab, rows=max(1000, len(df)+10), cols=max(20, len(df.columns)+5))
+    w.update([df.columns.tolist()] + df.fillna("").astype(str).values.tolist())
+
+    row = [
+        run_id,
+        created_at,
+        meta.get("company",""),
+        meta.get("client",""),
+        meta.get("project",""),
+        meta.get("scenario",""),
+        meta.get("kind",""),
+        str(meta.get("baseline_days","") or ""),
+        str(meta.get("crashed_days","") or ""),
+        tab,
+        json.dumps(meta, ensure_ascii=False),
+    ]
+    ws_index.append_row(row)
+    return run_id
+
+def list_schedule_runs(self) -> pd.DataFrame:
+    ws = self.ss.worksheet("schedule_runs")
+    vals = ws.get_all_values()
+    headers = vals[0] if vals else []
+    rows = vals[1:] if len(vals) > 1 else []
+    if not headers:
+        return pd.DataFrame(columns=["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"])
+    df = pd.DataFrame(rows, columns=headers)
+    keep = ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"]
+    for k in keep:
+        if k not in df.columns:
+            df[k] = ""
+    return df[keep].sort_values("created_at", ascending=False)
+
+def load_schedule_run(self, run_id: str) -> tuple[dict, pd.DataFrame]:
+    ws = self.ss.worksheet("schedule_runs")
+    vals = ws.get_all_values()
+    if len(vals) <= 1:
+        raise KeyError("Schedule run not found")
+    headers = vals[0]
+    for row in vals[1:]:
+        if len(row) >= 1 and str(row[0]) == str(run_id):
+            rec = dict(zip(headers, row))
+            tab = rec.get("sheet_name")
+            meta = {}
+            try:
+                meta = json.loads(rec.get("meta_json","") or "{}")
+            except Exception:
+                meta = {}
+            if not tab:
+                raise KeyError("Schedule run sheet missing")
+            w = self.ss.worksheet(tab)
+            values = w.get_all_values()
+            if len(values) <= 1:
+                return meta, pd.DataFrame()
+            df = pd.DataFrame(values[1:], columns=values[0])
+            return meta, df
+    raise KeyError("Schedule run not found")
+
+def delete_schedule_run(self, run_id: str) -> None:
+    ws = self.ss.worksheet("schedule_runs")
+    vals = ws.get_all_values()
+    if len(vals) <= 1:
+        return
+    headers = vals[0]
+    kept = [headers]
+    tab_to_delete = None
+    for row in vals[1:]:
+        if len(row) >= 1 and str(row[0]) == str(run_id):
+            try:
+                rec = dict(zip(headers, row))
+                tab_to_delete = rec.get("sheet_name")
+            except Exception:
+                pass
+            continue
+        kept.append(row)
+    ws.clear()
+    ws.update(kept)
+    if tab_to_delete:
+        try:
+            w = self.ss.worksheet(tab_to_delete)
+            self.ss.del_worksheet(w)
+        except Exception:
+            pass
 
     def open_url_hint(self, rec): 
         try: return self.ss.url
@@ -2647,7 +2911,7 @@ def submittal_checker_page():
                 view = bank.copy()
                 if f_company!="All": view = view[view["company"]==f_company]
                 if f_project!="All": view = view[view["project"]==f_project]
-                if f_client!="All":  view = view[view]["client"]==f_client
+                if f_client!="All":  view = view[view["client"]==f_client]
                 if sort_by.startswith("pass_rate"): view = view.sort_values("pass_rate", ascending=False)
                 elif sort_by.startswith("date_submitted"): view = view.sort_values("date_submitted", ascending=False)
                 else: view = view.sort_values("created_at", ascending=False)
@@ -3081,6 +3345,87 @@ def schedule_whatifs_page():
                         for line in log: st.write("•", line)
                     else:
                         st.write("No feasible crashes — target may be below theoretical minimum.")
+
+
+        # -------------------------
+        # Save / Download / Browse
+        # -------------------------
+        st.markdown("---")
+        st.subheader("Save, download, and browse schedule runs")
+
+        base_df = st.session_state.get("__schedule_baseline_df__")
+        crash_df = st.session_state.get("__schedule_crashed_df__")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if isinstance(base_df, pd.DataFrame) and not base_df.empty:
+                st.download_button(
+                    "Download baseline CSV",
+                    data=base_df.to_csv(index=False).encode("utf-8"),
+                    file_name="fieldflow_schedule_baseline.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+        with c2:
+            if isinstance(crash_df, pd.DataFrame) and not crash_df.empty:
+                st.download_button(
+                    "Download crashed CSV",
+                    data=crash_df.to_csv(index=False).encode("utf-8"),
+                    file_name="fieldflow_schedule_crashed.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+        with st.expander("Save this schedule run (to your selected backend)", expanded=False):
+            kind = st.radio("Which result do you want to save?", ["baseline","crashed"], horizontal=True)
+            df_to_save = base_df if kind == "baseline" else crash_df
+            if not isinstance(df_to_save, pd.DataFrame) or df_to_save.empty:
+                st.info("Run a baseline (and optionally a crash) above first — then you can save it here.")
+            else:
+                company = st.text_input("Company", value=str(st.session_state.get("company_name","")))
+                client = st.text_input("Client", value=str(st.session_state.get("client_name","")))
+                project = st.text_input("Project", value=str(st.session_state.get("project_name","")))
+                scenario = st.text_input("Scenario label", value="What-if run")
+                baseline_days = st.session_state.get("__schedule_baseline_days__")
+                crashed_days = st.session_state.get("__schedule_crashed_days__")
+                if st.button("Save schedule run", use_container_width=True):
+                    meta = {
+                        "company": company,
+                        "client": client,
+                        "project": project,
+                        "scenario": scenario,
+                        "kind": kind,
+                        "baseline_days": baseline_days,
+                        "crashed_days": crashed_days,
+                    }
+                    rid = backend.save_schedule_run(meta, df_to_save)
+                    st.success(f"Saved. Run ID: {rid}")
+
+        with st.expander("Saved schedule runs", expanded=True):
+            runs = backend.list_schedule_runs()
+            if runs is None or runs.empty:
+                st.info("No saved schedule runs yet (in the currently selected backend).")
+            else:
+                df_fullwidth(runs, hide_index=True, height=rows_to_height(len(runs)+5))
+                run_ids = [str(x) for x in runs["run_id"].tolist()] if "run_id" in runs.columns else []
+                pick = st.selectbox("Open a saved run", options=[""] + run_ids)
+                if pick:
+                    meta, df_run = backend.load_schedule_run(pick)
+                    st.markdown("**Metadata**")
+                    st.json(meta)
+                    st.markdown("**Schedule**")
+                    df_fullwidth(df_run, hide_index=True, height=rows_to_height(len(df_run)+8))
+                    st.download_button(
+                        "Download this run as CSV",
+                        data=df_run.to_csv(index=False).encode("utf-8"),
+                        file_name=f"fieldflow_schedule_{pick}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                    if st.button("Delete this saved run", use_container_width=True):
+                        backend.delete_schedule_run(pick)
+                        st.success("Deleted. Refreshing…")
+                        st.rerun()
 
         except Exception as e:
             st.exception(e)
@@ -3748,11 +4093,17 @@ class MSExcelOAuth(_MSExcelOAuthBase):
         # Build minimal workbook bytes
         try:
             from openpyxl import Workbook
-            import io as _io
-            wb = Workbook()
-            buf = _io.BytesIO()
-            wb.save(buf)
-            content = buf.getvalue()
+import io as _io
+wb = Workbook()
+try:
+    ws_meta = wb.create_sheet(self._MARKER_SHEET)
+    ws_meta["A1"] = self._MARKER_VALUE
+    ws_meta.sheet_state = "hidden"
+except Exception:
+    pass
+buf = _io.BytesIO()
+wb.save(buf)
+content = buf.getvalue()
         except Exception:
             content = b"PK\x03\x04"  # fallback ZIP header (not ideal but prevents crash)
 
@@ -3808,22 +4159,27 @@ class MSExcelOAuth(_MSExcelOAuthBase):
         # Keep a simple compatibility path for any callers
         return self._resolve_workbook_id(create_if_missing=False)
 
-    def _get_workbook_id(self) -> str:
-        wid = self._resolve_workbook_id(create_if_missing=True)
-        if not wid:
-            raise RuntimeError(
-                "No OneDrive workbook found yet. Please sign in and try saving again. "
-                "(If this is your first time, FieldFlow will create a workbook in your OneDrive App Folder.)"
-            )
-        return wid
+def _get_workbook_id(self, create_if_missing: bool = True) -> str:
+    """Return workbook id. If create_if_missing is False, returns '' if unavailable."""
+    wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
+    if not wid:
+        if not create_if_missing:
+            return ""
+        raise RuntimeError(
+            "No OneDrive workbook found yet. Please sign in and try saving again. "
+            "(If this is your first time, FieldFlow will create a workbook in your OneDrive App Folder.)"
+        )
+    return wid
 
-    def _ensure_workbook(self):
-        # Compatibility with the Settings button if present
-        wid = self._resolve_workbook_id(create_if_missing=True)
-        if wid:
-            st.success("OneDrive workbook ready.")
-
-    def load_presets(self) -> dict:
+def _ensure_workbook(self):
+    """Create/find workbook and return its id (for Settings button)."""
+    wid = self._resolve_workbook_id(create_if_missing=True)
+    if wid:
+        st.session_state["__ms_workbook_id__"] = str(wid)
+        st.success("OneDrive workbook ready.")
+        return str(wid)
+    return None
+def load_presets(self) -> dict:
         """Load presets WITHOUT creating a workbook during normal page loads."""
         try:
             wid = self._resolve_workbook_id(create_if_missing=False)
@@ -5392,3 +5748,138 @@ class MSExcelOAuth(_MSExcelOAuth_BASE):  # type: ignore
             return out
         except Exception:
             return {}
+
+# ---- Schedule Runs (full save/browse/download)
+
+def save_schedule_run(self, meta: dict, df: pd.DataFrame) -> str:
+    run_id = meta.get("run_id") or f"sched_{int(time.time()*1000)}"
+    created_at = meta.get("created_at") or _utc_now()
+    meta = dict(meta)
+    meta["run_id"] = run_id
+    meta["created_at"] = created_at
+
+    wid = self._resolve_workbook_id(create_if_missing=True)
+    if not wid:
+        raise RuntimeError("Unable to create/find OneDrive workbook.")
+
+    ws_index = "schedule_runs"
+    headers = ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name","meta_json"]
+    self._ensure_worksheet(ws_index, headers)
+
+    sheet_name = self._sanitize_ws_name(f"sched_{run_id}")
+    self._delete_worksheet_if_exists(sheet_name)
+    self._ensure_worksheet(sheet_name, df.columns.tolist())
+    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+    self._update_range(sheet_name, "A1", values)
+
+    row = [
+        run_id, created_at,
+        meta.get("company",""), meta.get("client",""), meta.get("project",""),
+        meta.get("scenario",""), meta.get("kind",""),
+        str(meta.get("baseline_days","") or ""),
+        str(meta.get("crashed_days","") or ""),
+        sheet_name,
+        json.dumps(meta, ensure_ascii=False),
+    ]
+    self._append_rows(ws_index, [row])
+    self._write_pointer(wid)
+    st.session_state["__ms_workbook_id__"] = wid
+    return run_id
+
+def list_schedule_runs(self) -> pd.DataFrame:
+    wid = self._resolve_workbook_id(create_if_missing=False)
+    headers = ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"]
+    if not wid:
+        return pd.DataFrame(columns=headers)
+    ws = "schedule_runs"
+    try:
+        self._ensure_worksheet(ws, ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name","meta_json"])
+        url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+        r = self._graph_request("GET", url, timeout=20, max_retries=3)
+        data = self._graph_json(r)
+        vals = data.get("values", []) if isinstance(data, dict) else []
+        if len(vals) <= 1:
+            return pd.DataFrame(columns=headers)
+        df = pd.DataFrame(vals[1:], columns=vals[0])
+        for c in headers:
+            if c not in df.columns:
+                df[c] = ""
+        return df[headers].sort_values("created_at", ascending=False)
+    except Exception:
+        return pd.DataFrame(columns=headers)
+
+def load_schedule_run(self, run_id: str) -> tuple[dict, pd.DataFrame]:
+    wid = self._resolve_workbook_id(create_if_missing=False)
+    if not wid:
+        raise KeyError("No workbook yet.")
+    ws = "schedule_runs"
+    url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+    r = self._graph_request("GET", url, timeout=20, max_retries=3)
+    vals = self._graph_json(r).get("values", [])
+    if len(vals) <= 1:
+        raise KeyError("Schedule run not found")
+    headers = vals[0]
+    rec = None
+    for row in vals[1:]:
+        if row and str(row[0]) == str(run_id):
+            rec = dict(zip(headers, row))
+            break
+    if not rec:
+        raise KeyError("Schedule run not found")
+    meta = {}
+    try:
+        meta = json.loads(rec.get("meta_json","") or "{}")
+    except Exception:
+        meta = {}
+    sheet_name = rec.get("sheet_name") or f"sched_{run_id}"
+    url2 = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(sheet_name)}/usedRange(valuesOnly=true)"
+    r2 = self._graph_request("GET", url2, timeout=30, max_retries=3)
+    vals2 = self._graph_json(r2).get("values", [])
+    if len(vals2) <= 1:
+        return meta, pd.DataFrame()
+    df = pd.DataFrame(vals2[1:], columns=vals2[0])
+    return meta, df
+
+def delete_schedule_run(self, run_id: str) -> None:
+    wid = self._resolve_workbook_id(create_if_missing=False)
+    if not wid:
+        return
+    df = self.list_schedule_runs()
+    if df.empty:
+        return
+    row = df[df["run_id"].astype(str) == str(run_id)]
+    sheet_name = str(row.iloc[0]["sheet_name"]) if (not row.empty and "sheet_name" in row.columns) else None
+    if sheet_name:
+        self._delete_worksheet_if_exists(sheet_name)
+
+    ws = "schedule_runs"
+    url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
+    r = self._graph_request("GET", url, timeout=20, max_retries=3)
+    vals = self._graph_json(r).get("values", [])
+    if not vals:
+        return
+    headers = vals[0]
+    kept = [headers] + [rr for rr in vals[1:] if not (rr and str(rr[0]) == str(run_id))]
+    self._update_range(ws, "A1", kept)
+
+def _sanitize_ws_name(self, name: str) -> str:
+    bad = ':\\/?*[]'
+    out = ''.join('_' if c in bad else c for c in str(name))
+    out = out.strip()[:31] or "sched"
+    return out
+
+def _delete_worksheet_if_exists(self, ws_name: str) -> None:
+    wid = self._resolve_workbook_id(create_if_missing=False)
+    if not wid:
+        return
+    url_ws = f"{self.base}/me/drive/items/{wid}/workbook/worksheets?$select=id,name"
+    r = self._graph_request("GET", url_ws, timeout=20, max_retries=3)
+    data = self._graph_json(r)
+    for w in data.get("value", []) if isinstance(data, dict) else []:
+        if str(w.get("name","")) == str(ws_name):
+            wsid = w.get("id")
+            if wsid:
+                del_url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{wsid}"
+                self._graph_request("DELETE", del_url, timeout=20, max_retries=2)
+            return
+
