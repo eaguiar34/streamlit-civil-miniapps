@@ -290,12 +290,12 @@ class SQLiteBackend(StorageBackend):
 
         
         con.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
-            id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            company TEXT, client TEXT, project TEXT, scenario TEXT, kind TEXT,
-            baseline_days INTEGER, crashed_days INTEGER,
-            meta_json TEXT NOT NULL,
-            csv TEXT NOT NULL
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        company TEXT, client TEXT, project TEXT, scenario TEXT, kind TEXT,
+        baseline_days INTEGER, crashed_days INTEGER,
+        meta_json TEXT NOT NULL,
+        csv TEXT NOT NULL
         )""")
         con.commit()
         self.con = con
@@ -936,14 +936,14 @@ def google_oauth_start():
     )
 
     import secrets as _secrets
-state = "g_" + _secrets.token_urlsafe(16)
-auth_url, _ = flow.authorization_url(
+    state = "g_" + _secrets.token_urlsafe(16)
+    auth_url, _ = flow.authorization_url(
     access_type="offline",
     prompt="consent",
     state=state,
-)
-st.session_state["__google_state__"] = state
-st.markdown(f"[Continue to Google]({auth_url})")
+    )
+    st.session_state["__google_state__"] = state
+    st.markdown(f"[Continue to Google]({auth_url})")
 
 def google_oauth_callback():
     """Handle the OAuth redirect back from Google."""
@@ -2747,7 +2747,6 @@ def submittal_checker_page():
     run_btn = st.button("Analyze", type="primary")
 
     if run_btn:
-        try:
             spec_text = ""
             if spec_file: spec_text = read_any(spec_file)
             if spec_text_area: spec_text = (spec_text + "\n" + spec_text_area).strip()
@@ -2935,9 +2934,6 @@ def submittal_checker_page():
                         if url: st.markdown(f"[Open in workspace]({url})")
                 if b.button("Delete"):
                     db_delete_submittal(backend, int(sid)); st.success(f"Deleted run #{int(sid)}"); st.rerun()
-
-        except Exception as e:
-            st.exception(e)
 
 # =========================
 # Schedule What-Ifs (page)
@@ -3346,10 +3342,11 @@ def schedule_whatifs_page():
                     else:
                         st.write("No feasible crashes — target may be below theoretical minimum.")
 
-
         except Exception as e:
-            st.error(f"Schedule computation failed: {e}")
+            st.error(f"Schedule analysis failed: {e}")
             st.exception(e)
+            return
+
 
         # -------------------------
         # Save / Download / Browse
@@ -3430,7 +3427,6 @@ def schedule_whatifs_page():
                         backend.delete_schedule_run(pick)
                         st.success("Deleted. Refreshing…")
                         st.rerun()
-
 
 
 
