@@ -289,16 +289,16 @@ class SQLiteBackend(StorageBackend):
         )""")
 
         
-con.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
-    id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    company TEXT, client TEXT, project TEXT, scenario TEXT, kind TEXT,
-    baseline_days INTEGER, crashed_days INTEGER,
-    meta_json TEXT NOT NULL,
-    csv TEXT NOT NULL
-)""")
-con.commit()
-self.con = con
+        con.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            company TEXT, client TEXT, project TEXT, scenario TEXT, kind TEXT,
+            baseline_days INTEGER, crashed_days INTEGER,
+            meta_json TEXT NOT NULL,
+            csv TEXT NOT NULL
+        )""")
+        con.commit()
+        self.con = con
 
     def save_preset(self, name: str, payload: dict) -> None:
         self.con.execute(
@@ -943,7 +943,7 @@ auth_url, _ = flow.authorization_url(
     state=state,
 )
 st.session_state["__google_state__"] = state
-    st.markdown(f"[Continue to Google]({auth_url})")
+st.markdown(f"[Continue to Google]({auth_url})")
 
 def google_oauth_callback():
     """Handle the OAuth redirect back from Google."""
@@ -3347,6 +3347,10 @@ def schedule_whatifs_page():
                         st.write("No feasible crashes — target may be below theoretical minimum.")
 
 
+        except Exception as e:
+            st.error(f"Schedule computation failed: {e}")
+            st.exception(e)
+
         # -------------------------
         # Save / Download / Browse
         # -------------------------
@@ -3427,8 +3431,6 @@ def schedule_whatifs_page():
                         st.success("Deleted. Refreshing…")
                         st.rerun()
 
-        except Exception as e:
-            st.exception(e)
 
 
 
@@ -4093,17 +4095,17 @@ class MSExcelOAuth(_MSExcelOAuthBase):
         # Build minimal workbook bytes
         try:
             from openpyxl import Workbook
-import io as _io
-wb = Workbook()
-try:
-    ws_meta = wb.create_sheet(self._MARKER_SHEET)
-    ws_meta["A1"] = self._MARKER_VALUE
-    ws_meta.sheet_state = "hidden"
-except Exception:
-    pass
-buf = _io.BytesIO()
-wb.save(buf)
-content = buf.getvalue()
+            import io as _io
+            wb = Workbook()
+            try:
+                ws_meta = wb.create_sheet(self._MARKER_SHEET)
+                ws_meta["A1"] = self._MARKER_VALUE
+                ws_meta.sheet_state = "hidden"
+            except Exception:
+                pass
+            buf = _io.BytesIO()
+            wb.save(buf)
+            content = buf.getvalue()
         except Exception:
             content = b"PK\x03\x04"  # fallback ZIP header (not ideal but prevents crash)
 
