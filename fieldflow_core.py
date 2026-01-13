@@ -1,5883 +1,1057 @@
-# fieldflow_core.py
-# Auto-generated modular core from your monolithic app.py
-
-
-# app.py
-# FieldFlow: Submittal Checker + Schedule What-Ifs
-# - Sidebar pages
-# - Hybrid submittal scoring (lexical + semantic + coverage + penalties + section boost)
-# - Reviewer keyword presets + memory bank
-# - Storage backends: SQLite (local), Google Sheets (Service/OAuth), Microsoft Excel (OAuth)
-# - Schedule What-Ifs: CPM with FS/SS/FF lags, overlap, floats, calendar mode, crash-to-target
-# - Width shims + auto-heights; safe secrets loader; OAuth helpers
-# - Make sure you set secrets (see README snippet at end of this file)
 
 from __future__ import annotations
 
-import os, io, re, json, time, urllib.parse, sqlite3
+import base64
+import datetime as _dt
+import io
+import json
+import os
+import sqlite3
+import time
+import uuid
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
-from datetime import datetime, date
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
-import streamlit as st
-import altair as alt
 import requests
+import streamlit as st
 
-# ---- OAuth scopes (keep stable to avoid Google 'scope changed' errors) ----
-GOOGLE_SCOPES = [
-    # Keep these stable forever to avoid Google "scope changed" errors.
-    'openid',
-    'email',
-    'profile',
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive.file',
+# ----------------------------
+# Constants / UI
+# ----------------------------
+BACKEND_SQLITE = "Local (SQLite)"
+BACKEND_GDRIVE = "Google Drive (OAuth) — files"
+BACKEND_ONEDRIVE = "Microsoft OneDrive (OAuth) — files"
+
+BACKEND_CHOICES = [BACKEND_SQLITE, BACKEND_GDRIVE, BACKEND_ONEDRIVE]
+
+APP_NAME = "FieldFlow"
+FOLDER_NAME = "FieldFlow"
+
+LOGO_CANDIDATES = [
+    Path(__file__).parent / "assets" / "FieldFlow_logo.png",
+    Path(__file__).parent / "assets" / "fieldflow_logo.png",
 ]
 
-MS_SCOPES = 'openid profile email offline_access Files.ReadWrite User.Read'
+# Google scopes
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.appdata",
+]
 
-# ==== Robust PDF/OCR/Table extraction helpers (add after imports) ====
-import hashlib
+# Microsoft scopes
+MS_SCOPES = [
+    "offline_access",
+    "User.Read",
+    "Files.ReadWrite",
+]
 
-def _hash_list(xs: list[str]) -> str:
-    h = hashlib.sha256()
-    for s in xs:
-        h.update((s or "").encode("utf-8"))
-    return h.hexdigest()
+# ----------------------------
+# Small session helpers
+# ----------------------------
+def _ss_get(k: str, default=None):
+    return st.session_state.get(k, default)
 
-def _try_import(modname):
+def _ss_set(k: str, v):
+    st.session_state[k] = v
+
+def _ss_del(k: str):
+    if k in st.session_state:
+        del st.session_state[k]
+
+def _now_iso() -> str:
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def _clear_query_params():
+    # streamlit>=1.31: st.query_params exists
     try:
-        return __import__(modname)
+        st.query_params.clear()
     except Exception:
-        return None
+        try:
+            st.experimental_set_query_params()
+        except Exception:
+            pass
 
-_pytesseract = _try_import("pytesseract")
-_pdf2image  = _try_import("pdf2image")
-_PIL        = _try_import("PIL")
-_tabula     = _try_import("tabula")  # tabula-py
-
-def ocr_pdf_to_text(uploaded_file) -> str:
-    """Fallback: rasterize pages and OCR."""
-    if not (_pytesseract and _pdf2image and _PIL):
-        return ""
+def _rerun():
     try:
-        # pdf2image convert_from_bytes
-        pages = _pdf2image.convert_from_bytes(uploaded_file.getvalue(), dpi=200)
-        texts = []
-        for im in pages:
-            texts.append(_pytesseract.image_to_string(im))
-        return "\n".join(texts)
+        st.rerun()
     except Exception:
-        return ""
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
 
-def tabula_tables_to_text(uploaded_file) -> str:
-    """Extract tables via tabula and linearize as text."""
-    if not _tabula:
-        return ""
+# ----------------------------
+# Secrets helpers
+# ----------------------------
+def get_secret(path: str, default: str = "") -> str:
+    """Fetch from st.secrets using dotted path, fallback to env."""
+    # dotted: "google_oauth.client_id"
+    parts = path.split(".")
+    cur: Any = st.secrets
     try:
-        dfs = _tabula.read_pdf(uploaded_file, pages="all", multiple_tables=True, lattice=True)
-        parts = []
-        for df in dfs:
-            parts.append("\n".join([" ".join(map(str, row)) for row in df.fillna("").values.tolist()]))
-        return "\n\n".join(parts)
+        for p in parts:
+            cur = cur[p]
+        if isinstance(cur, str):
+            return cur
+        return str(cur)
     except Exception:
-        return ""
+        env_key = path.upper().replace(".", "_")
+        return os.getenv(env_key, default)
 
-@st.cache_resource
-def get_embedder():
-    try:
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer("all-MiniLM-L6-v2")
-    except Exception:
-        return None
-
-@st.cache_data(show_spinner=False)
-def cached_embeddings(chunks: list[str]):
-    model = get_embedder()
-    if not model:
-        return None
-    # normalize embeddings so cosine is a dot product
-    emb = model.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
-    return emb
-
-def bm25_scores(query: str, docs: list[str]) -> list[float]:
-    try:
-        from rank_bm25 import BM25Okapi
-    except Exception:
-        return [0.0]*len(docs)
-    # simple tokenization
-    def tok(s): return re.findall(r"[a-z0-9]+", s.lower())
-    corpus = [tok(d) for d in docs]
-    bm = BM25Okapi(corpus)
-    q = tok(query)
-    scores = bm.get_scores(q)
-    if not scores.size:
-        return [0.0]*len(docs)
-    # min-max normalize to [0,1]
-    mn, mx = float(scores.min()), float(scores.max())
-    if mx <= mn:
-        return [0.0]*len(docs)
-    return [(float(s)-mn)/(mx-mn) for s in scores]
-
-
-# =========================
-# App bootstrap
-# =========================
-
-# ---------- Width shims (handles Streamlit deprecations gracefully)
-def df_fullwidth(df, **kwargs):
-    try:
-        return st.dataframe(df, width='stretch', **kwargs)
-    except TypeError:
-        return st.dataframe(df, **kwargs)
-
-def editor_fullwidth(df, **kwargs):
-    try:
-        return st.data_editor(df, width='stretch', **kwargs)
-    except TypeError:
-        return st.data_editor(df, **kwargs)
-
-def chart_fullwidth(chart, **kwargs):
-    try:
-        return st.altair_chart(chart, width='stretch', **kwargs)
-    except TypeError:
-        return st.altair_chart(chart, **kwargs)
-
-_DEF_ROW = 32
-_DEF_HEADER = 38
-def rows_to_height(n_rows: int, row_px: int=_DEF_ROW, header_px: int=_DEF_HEADER, max_height: int=1400) -> int:
-    n = max(1, int(n_rows))
-    return min(max_height, header_px + row_px * n)
-
-# ---------- Secrets loader (works with st.secrets or env vars)
-def get_secret(path: str, default=None):
-    # Streamlit secrets
-    try:
-        node = st.secrets
-        for key in path.split("."):
-            if key in node:
-                node = node[key]
-            else:
-                node = None; break
-        if node is not None:
-            return node
-    except Exception:
-        pass
-    # Env fallback (supports JSON or plain)
-    env_key = path.upper().replace(".", "__")
-    val = os.getenv(env_key)
-    if not val:
-        return default
-    try:
-        return json.loads(val)
-    except Exception:
-        return val
-
-# =========================
-# Pluggable Storage Backends
-# =========================
-BACKEND_SQLITE = "Local (SQLite)"
-BACKEND_GS_SERVICE = "Google Sheets (Service Account)"
-BACKEND_GS_OAUTH = "Google Sheets (OAuth)"
-BACKEND_MS_OAUTH = "Microsoft 365 Excel (OAuth)"
-BACKEND_CHOICES = [BACKEND_SQLITE, BACKEND_GS_SERVICE, BACKEND_GS_OAUTH, BACKEND_MS_OAUTH]
-
-def _ensure_ss(key, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-    return st.session_state[key]
-
+# ----------------------------
+# Storage backend interface
+# ----------------------------
 class StorageBackend:
-    def save_preset(self, name: str, payload: dict) -> None: ...
-    def load_presets(self) -> dict: ...
-    def delete_preset(self, name: str) -> None: ...
-    def save_submittal(self, meta: dict, result_csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int: ...
-    def list_submittals(self) -> pd.DataFrame: ...
-    def get_submittal(self, id_: int) -> dict: ...
-    def delete_submittal(self, id_: int) -> None: ...
-    def open_url_hint(self, rec: dict) -> str | None: ...
+    name: str = "Base"
 
-    # NEW
-    def save_feedback(self, row: dict) -> None: ...
-    def list_feedback(self, limit: int = 50) -> pd.DataFrame: ...
+    # presets (optional, can be no-op for file backends)
+    def load_presets(self) -> Dict[str, Any]:
+        return {}
 
+    def save_preset(self, name: str, payload: Dict[str, Any]) -> None:
+        return None
 
-    # RFI Manager
-    def upsert_rfi(self, row: dict) -> int: ...
-    def list_rfis(self, limit: int = 5000) -> 'pd.DataFrame': ...
-    def get_rfi(self, id_: int) -> dict: ...
-    def delete_rfi(self, id_: int) -> None: ...
+    def delete_preset(self, name: str) -> None:
+        return None
 
+    # submittal checks
+    def save_submittal_check(self, payload: Dict[str, Any]) -> str:
+        raise NotImplementedError
 
-# ---- SQLite Backend
+    def list_submittal_checks(self) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def load_submittal_check(self, check_id: str) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def delete_submittal_check(self, check_id: str) -> None:
+        raise NotImplementedError
+
+    # schedule runs
+    def save_schedule_run(self, meta: Dict[str, Any], baseline_df: pd.DataFrame, crashed_df: pd.DataFrame) -> str:
+        raise NotImplementedError
+
+    def list_schedule_runs(self) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def get_schedule_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def delete_schedule_run(self, run_id: str) -> None:
+        raise NotImplementedError
+
+# ----------------------------
+# SQLite backend (reliable fallback)
+# ----------------------------
 class SQLiteBackend(StorageBackend):
-    def __init__(self, db_path: str):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        con = sqlite3.connect(db_path, check_same_thread=False)
-        con.execute("PRAGMA journal_mode=WAL;")
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS presets (
-            name TEXT PRIMARY KEY,
-            json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )""")
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS submittals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            company TEXT, client TEXT, project TEXT,
-            date_submitted TEXT, quote NUMERIC, notes TEXT,
-            threshold INT, weights_json TEXT,
-            must TEXT, nice TEXT, forbid TEXT,
-            pass_count INT, review_count INT, pass_rate REAL,
-            result_csv BLOB, spec_excerpt TEXT, submittal_excerpt TEXT,
-            created_at TEXT NOT NULL
-        )""")
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            user_id TEXT,
-            page TEXT,
-            rating INT,
-            categories TEXT,
-            email TEXT,
-            message TEXT
-        )""")
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS rfis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            user_id TEXT,
-            project TEXT,
-            subject TEXT,
-            question TEXT,
-            discipline TEXT,
-            spec_section TEXT,
-            priority TEXT,
-            status TEXT,
-            due_date TEXT,
-            assignee_email TEXT,
-            recipient_emails TEXT,
-            cc_emails TEXT,
-            related_tasks TEXT,
-            schedule_impact_days INT,
-            cost_impact REAL,
-            last_sent_at TEXT,
-            last_reminded_at TEXT,
-            last_response_at TEXT,
-            response_text TEXT,
-            notes TEXT
-        )""")
-        # RFI links + attachments (stored in DB for Local/Streamlit Cloud).
-        con.execute("""CREATE TABLE IF NOT EXISTS rfi_links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rfi_id INTEGER NOT NULL,
-            url TEXT NOT NULL,
-            created_at TEXT,
-            FOREIGN KEY (rfi_id) REFERENCES rfis(id) ON DELETE CASCADE
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS rfi_attachments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rfi_id INTEGER NOT NULL,
-            filename TEXT NOT NULL,
-            mime TEXT,
-            data BLOB NOT NULL,
-            uploaded_at TEXT,
-            FOREIGN KEY (rfi_id) REFERENCES rfis(id) ON DELETE CASCADE
-        )""")
+    name = "SQLite"
 
-        
-        con.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        company TEXT, client TEXT, project TEXT, scenario TEXT, kind TEXT,
-        baseline_days INTEGER, crashed_days INTEGER,
-        meta_json TEXT NOT NULL,
-        csv TEXT NOT NULL
-        )""")
-        con.commit()
-        self.con = con
+    def __init__(self, path: str = "fieldflow.db"):
+        self.path = path
+        self._init_db()
 
-    def save_preset(self, name: str, payload: dict) -> None:
-        self.con.execute(
-            "REPLACE INTO presets(name, json, updated_at) VALUES(?,?,?)",
-            (name, json.dumps(payload), datetime.utcnow().isoformat()),
-        )
-        self.con.commit()
+    def _conn(self):
+        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    def load_presets(self) -> dict:
-        rows = self.con.execute("SELECT name, json FROM presets").fetchall()
-        return {name: json.loads(js) for (name, js) in rows}
+    def _init_db(self):
+        with self._conn() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS submittal_checks (
+                id TEXT PRIMARY KEY,
+                created_at TEXT,
+                payload_json TEXT
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
+                id TEXT PRIMARY KEY,
+                created_at TEXT,
+                meta_json TEXT,
+                baseline_csv TEXT,
+                crashed_csv TEXT
+            )""")
+            conn.commit()
 
-    def delete_preset(self, name: str) -> None:
-        self.con.execute("DELETE FROM presets WHERE name=?", (name,))
-        self.con.commit()
-
-    def save_submittal(self, meta: dict, result_csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
-        cur = self.con.cursor()
-        cur.execute("""
-        INSERT INTO submittals
-        (company, client, project, date_submitted, quote, notes,
-         threshold, weights_json, must, nice, forbid,
-         pass_count, review_count, pass_rate,
-         result_csv, spec_excerpt, submittal_excerpt, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
-            meta.get("company"), meta.get("client"), meta.get("project"),
-            meta.get("date_submitted"), meta.get("quote"), meta.get("notes"),
-            meta.get("threshold"), json.dumps(meta.get("weights", {})),
-            meta.get("must"), meta.get("nice"), meta.get("forbid"),
-            meta.get("pass_count"), meta.get("review_count"), meta.get("pass_rate"),
-            result_csv_bytes, spec_excerpt, sub_excerpt, datetime.utcnow().isoformat()
-        ))
-        self.con.commit()
-        return int(cur.lastrowid)
-
-    def list_submittals(self) -> pd.DataFrame:
-        return pd.read_sql_query("""
-            SELECT id, company, client, project, date_submitted, quote,
-                   pass_count, review_count, pass_rate, threshold, created_at
-            FROM submittals
-            ORDER BY company, project, date_submitted DESC, created_at DESC
-        """, self.con)
-
-    def get_submittal(self, id_: int) -> dict:
-        cur = self.con.execute("SELECT * FROM submittals WHERE id=?", (id_,))
-        row = cur.fetchone()
-        if not row: return {}
-        cols = [d[1] for d in self.con.execute("PRAGMA table_info(submittals)")]
-        return dict(zip(cols, row))
-
-    def delete_submittal(self, id_: int) -> None:
-        self.con.execute("DELETE FROM submittals WHERE id=?", (id_,))
-        self.con.commit()
-
-    def save_feedback(self, row: dict) -> None:
-        self.con.execute(
-            "INSERT INTO feedback(created_at,user_id,page,rating,categories,email,message) VALUES(?,?,?,?,?,?,?)",
-            (
-                row.get("created_at"),
-                row.get("user_id"),
-                row.get("page"),
-                int(row.get("rating") or 0),
-                ",".join(row.get("categories") or []),
-                row.get("email"),
-                row.get("message"),
-            ),
-        )
-        self.con.commit()
-
-    def list_feedback(self, limit: int = 50) -> pd.DataFrame:
-        return pd.read_sql_query(
-            "SELECT * FROM feedback ORDER BY id DESC LIMIT ?",
-            self.con,
-            params=(int(limit),),
-        )
-
-    # ---- RFIs
-    def upsert_rfi(self, row: dict) -> int:
-        """Insert or update an RFI. Returns the RFI id."""
-        now = row.get("updated_at") or __import__("datetime").datetime.utcnow().isoformat()
-        rid = row.get("id")
-        fields = [
-            "user_id","project","subject","question","discipline","spec_section","priority",
-            "status","due_date","assignee_email","to_emails","cc_emails",
-            "related_tasks","schedule_impact_days","cost_impact",
-            "last_sent_at","last_reminded_at","last_response_at","thread_notes",
-        ]
-        vals = [row.get(f) for f in fields]
-        if rid:
-            self.con.execute(
-                """UPDATE rfis SET
-                    updated_at=?,
-                    user_id=?, project=?, subject=?, question=?, discipline=?, spec_section=?, priority=?,
-                    status=?, due_date=?, assignee_email=?, to_emails=?, cc_emails=?,
-                    related_tasks=?, schedule_impact_days=?, cost_impact=?,
-                    last_sent_at=?, last_reminded_at=?, last_response_at=?, thread_notes=?
-                WHERE id=?""",
-                [now] + vals + [int(rid)],
+    def save_submittal_check(self, payload: Dict[str, Any]) -> str:
+        cid = uuid.uuid4().hex
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO submittal_checks (id, created_at, payload_json) VALUES (?,?,?)",
+                (cid, _now_iso(), json.dumps(payload)),
             )
-            self.con.commit()
-            return int(rid)
+            conn.commit()
+        return cid
 
-        cur = self.con.cursor()
-        cur.execute(
-            """INSERT INTO rfis(
-                created_at, updated_at,
-                user_id, project, subject, question, discipline, spec_section, priority,
-                status, due_date, assignee_email, to_emails, cc_emails,
-                related_tasks, schedule_impact_days, cost_impact,
-                last_sent_at, last_reminded_at, last_response_at, thread_notes
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [row.get("created_at") or __import__("datetime").datetime.utcnow().isoformat(), now] + vals,
-        )
-        self.con.commit()
-        return int(cur.lastrowid)
-
-    def list_rfis(self, limit: int = 5000) -> pd.DataFrame:
-        return pd.read_sql_query(
-            "SELECT * FROM rfis ORDER BY id DESC LIMIT ?",
-            self.con,
-            params=(int(limit),),
-        )
-
-    def get_rfi(self, id_: int) -> dict:
-        cur = self.con.execute("SELECT * FROM rfis WHERE id=?", (int(id_),))
-        row = cur.fetchone()
-        if not row:
-            return {}
-        cols = [d[1] for d in self.con.execute("PRAGMA table_info(rfis)")]
-        return dict(zip(cols, row))
-
-    def delete_rfi(self, id_: int) -> None:
-        self.con.execute("DELETE FROM rfis WHERE id=?", (int(id_),))
-        self.con.commit()
-
-
-    def add_rfi_links(self, rfi_id: int, urls: list[str]):
-        urls = [u.strip() for u in urls if str(u).strip()]
-        if not urls:
-            return
-        con = self._conn()
-        now = datetime.utcnow().isoformat()
-        for u in urls:
-            con.execute("INSERT INTO rfi_links (rfi_id, url, created_at) VALUES (?, ?, ?)", (rfi_id, u, now))
-        con.commit()
-
-    def list_rfi_links(self, rfi_id: int) -> list[dict]:
-        con = self._conn()
-        rows = con.execute("SELECT id, url, created_at FROM rfi_links WHERE rfi_id=? ORDER BY id DESC", (rfi_id,)).fetchall()
-        return [{"id": r[0], "url": r[1], "created_at": r[2]} for r in rows]
-
-    def delete_rfi_link(self, link_id: int):
-        con = self._conn()
-        con.execute("DELETE FROM rfi_links WHERE id=?", (link_id,))
-        con.commit()
-
-    def add_rfi_attachments(self, rfi_id: int, files: list[dict]):
-        """files: [{"filename": str, "mime": str|None, "data": bytes}]"""
-        if not files:
-            return
-        con = self._conn()
-        now = datetime.utcnow().isoformat()
-        for f in files:
-            con.execute("INSERT INTO rfi_attachments (rfi_id, filename, mime, data, uploaded_at) VALUES (?, ?, ?, ?, ?)", (rfi_id, f.get('filename') or 'attachment', f.get('mime'), f.get('data') or b'', now))
-        con.commit()
-
-    def list_rfi_attachments(self, rfi_id: int) -> list[dict]:
-        con = self._conn()
-        rows = con.execute("SELECT id, filename, mime, uploaded_at, length(data) FROM rfi_attachments WHERE rfi_id=? ORDER BY id DESC", (rfi_id,)).fetchall()
-        return [{"id": r[0], "filename": r[1], "mime": r[2], "uploaded_at": r[3], "size": r[4]} for r in rows]
-
-    def get_rfi_attachment_data(self, attachment_id: int) -> tuple[str, str, bytes]:
-        con = self._conn()
-        row = con.execute("SELECT filename, COALESCE(mime, ''), data FROM rfi_attachments WHERE id=?", (attachment_id,)).fetchone()
-        if not row:
-            raise KeyError("Attachment not found")
-        return row[0], row[1], row[2]
-
-    def delete_rfi_attachment(self, attachment_id: int):
-        con = self._conn()
-        con.execute("DELETE FROM rfi_attachments WHERE id=?", (attachment_id,))
-        con.commit()
-
-
-# ---- Schedule Runs (full save/browse/download)
-
-def save_schedule_run(self, meta: dict, df: pd.DataFrame) -> str:
-    con = self._conn()
-    run_id = meta.get("run_id") or f"sched_{int(time.time()*1000)}"
-    created_at = meta.get("created_at") or _utc_now()
-    meta_json = json.dumps(meta, ensure_ascii=False)
-    csv_text = df.to_csv(index=False)
-    con.execute(
-        """INSERT OR REPLACE INTO schedule_runs
-           (id, created_at, company, client, project, scenario, kind, baseline_days, crashed_days, meta_json, csv)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            run_id,
-            created_at,
-            meta.get("company",""),
-            meta.get("client",""),
-            meta.get("project",""),
-            meta.get("scenario",""),
-            meta.get("kind",""),
-            int(meta.get("baseline_days") or 0) if meta.get("baseline_days") is not None else None,
-            int(meta.get("crashed_days") or 0) if meta.get("crashed_days") is not None else None,
-            meta_json,
-            csv_text,
-        ),
-    )
-    con.commit()
-    return run_id
-
-def list_schedule_runs(self) -> pd.DataFrame:
-    con = self._conn()
-    rows = con.execute(
-        """SELECT id, created_at, company, client, project, scenario, kind, baseline_days, crashed_days
-           FROM schedule_runs ORDER BY created_at DESC"""
-    ).fetchall()
-    return pd.DataFrame(rows, columns=["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days"])
-
-def load_schedule_run(self, run_id: str) -> tuple[dict, pd.DataFrame]:
-    con = self._conn()
-    row = con.execute("SELECT meta_json, csv FROM schedule_runs WHERE id=?", (run_id,)).fetchone()
-    if not row:
-        raise KeyError("Schedule run not found")
-    meta = json.loads(row[0]) if row[0] else {}
-    df = pd.read_csv(io.StringIO(row[1])) if row[1] else pd.DataFrame()
-    return meta, df
-
-def delete_schedule_run(self, run_id: str) -> None:
-    con = self._conn()
-    con.execute("DELETE FROM schedule_runs WHERE id=?", (run_id,))
-    con.commit()
-
-    def open_url_hint(self, rec: dict) -> str | None:
-        return None
-
-# ---- Google Sheets (Service Account) Backend
-class GoogleSheetsSA(StorageBackend):
-    def __init__(self, title: str):
-        try:
-            import gspread
-            from google.oauth2.service_account import Credentials
-        except Exception:
-            st.error("Missing Google Sheets deps. Install: gspread, google-auth")
-            raise
-        self.gspread = gspread
-        self.Credentials = Credentials
-        self.title = title
-        self.scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        self.client = self._client()
-        self.ss = self._open_or_create_spreadsheet(self.client)
-        self._ensure_tabs()
-
-    @st.cache_resource
-    def _client(_self=None):
-        creds_info = get_secret("gcp_service_account")
-        if not creds_info:
-            raise RuntimeError("No service account in secrets.")
-        creds = _self.Credentials.from_service_account_info(creds_info, scopes=_self.scopes)
-        return _self.gspread.authorize(creds)
-
-    def _open_or_create_spreadsheet(self, client):
-        try:
-            return client.open(self.title)
-        except self.gspread.SpreadsheetNotFound:
-            return client.create(self.title)
-
-    def _ensure_ws(self, title, headers):
-        try:
-            ws = self.ss.worksheet(title)
-        except self.gspread.WorksheetNotFound:
-            ws = self.ss.add_worksheet(title=title, rows=1000, cols=max(20, len(headers)))
-            ws.append_row(headers)
-            return ws
-        if ws.row_values(1) != headers:
-            ws.resize(rows=1)
-            ws.update([headers])
-        return ws
-
-    def _ensure_tabs(self):
-        self._ensure_ws("presets", ["name","json","updated_at"])
-        self._ensure_ws("submittals", [
-            "id","company","client","project","date_submitted","quote","notes",
-            "threshold","weights_json","must","nice","forbid",
-            "pass_count","review_count","pass_rate",
-            "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"
-        ])
-        self._ensure_ws("feedback", ["created_at","user_id","page","rating","categories","email","message"])
-        self._ensure_ws("schedule_runs", ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name","meta_json"])
-        self._ensure_ws("rfis", ["id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"])
-
-
-    def load_presets(self) -> dict:
-        rows = self.ss.worksheet("presets").get_all_records()
-        out = {}
-        for r in rows:
-            try: out[r["name"]] = json.loads(r["json"])
-            except: pass
-        return out
-
-    def save_preset(self, name: str, payload: dict) -> None:
-        ws = self.ss.worksheet("presets")
-        rows = ws.get_all_records()
-        names = [r.get("name") for r in rows]
-        now = datetime.utcnow().isoformat()
-        if name in names:
-            idx = names.index(name) + 2
-            ws.update(f"A{idx}:C{idx}", [[name, json.dumps(payload), now]])
-        else:
-            ws.append_row([name, json.dumps(payload), now])
-
-    def delete_preset(self, name: str) -> None:
-        ws = self.ss.worksheet("presets")
-        rows = ws.get_all_records()
-        for i, r in enumerate(rows, start=2):
-            if r.get("name") == name:
-                ws.delete_rows(i); return
-
-    def _next_id(self) -> int:
-        rows = self.ss.worksheet("submittals").get_all_records()
-        if not rows: return 1
-        try: return max(int(r.get("id",0) or 0) for r in rows) + 1
-        except: return len(rows)+1
-
-    def _sanitize_tab(self, s: str) -> str:
-        return re.sub(r"[\[\]\:\*\?\/\\]", "_", s)[:90]
-
-    def save_submittal(self, meta: dict, result_csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
-        ws = self.ss.worksheet("submittals")
-        run_id = self._next_id()
-        # results in new tab
-        try:
-            df = pd.read_csv(pd.io.common.BytesIO(result_csv_bytes))
-            tab = self._sanitize_tab(f"run_{run_id}_{meta.get('company','')}_{meta.get('project','')}")
-            try:
-                old = self.ss.worksheet(tab); self.ss.del_worksheet(old)
-            except: pass
-            w = self.ss.add_worksheet(title=tab, rows=max(1000, len(df)+10), cols=max(20, len(df.columns)+2))
-            values = [list(df.columns)] + df.astype(object).where(pd.notna(df), "").values.tolist()
-            w.update("A1", values)
-        except Exception:
-            tab = ""
-        now = datetime.utcnow().isoformat()
-        row = [
-            run_id, meta.get("company"), meta.get("client"), meta.get("project"),
-            meta.get("date_submitted"), meta.get("quote"), meta.get("notes"),
-            meta.get("threshold"), json.dumps(meta.get("weights", {})),
-            meta.get("must"), meta.get("nice"), meta.get("forbid"),
-            meta.get("pass_count"), meta.get("review_count"), float(meta.get("pass_rate",0.0)),
-            tab, spec_excerpt, sub_excerpt, now
-        ]
-        ws.append_row(row, value_input_option="RAW")
-        return run_id
-
-    def list_submittals(self) -> pd.DataFrame:
-        rows = self.ss.worksheet("submittals").get_all_records()
-        if not rows:
-            return pd.DataFrame(columns=["id","company","client","project","date_submitted","quote",
-                                         "pass_count","review_count","pass_rate","threshold","created_at"])
-        df = pd.DataFrame(rows)
-        for c in ["id","pass_count","review_count","threshold"]:
-            if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-        if "pass_rate" in df.columns: df["pass_rate"] = pd.to_numeric(df["pass_rate"], errors="coerce").fillna(0.0)
-        return df[["id","company","client","project","date_submitted","quote",
-                   "pass_count","review_count","pass_rate","threshold","created_at"]]
-
-    def get_submittal(self, id_: int) -> dict:
-        for r in self.ss.worksheet("submittals").get_all_records():
-            try:
-                if int(r.get("id",0) or 0) == int(id_): return r
-            except: pass
-        return {}
-
-    def delete_submittal(self, id_: int) -> None:
-        ws = self.ss.worksheet("submittals")
-        rows = ws.get_all_records()
-        for i, r in enumerate(rows, start=2):
-            try:
-                if int(r.get("id",0) or 0) == int(id_):
-                    tab = r.get("result_sheet_name") or ""
-                    if tab:
-                        try: self.ss.del_worksheet(self.ss.worksheet(tab))
-                        except: pass
-                    ws.delete_rows(i); return
-            except: continue
-
-    def save_feedback(self, row: dict) -> None:
-        ws = self.ss.worksheet("feedback")
-        ws.append_row([
-            row.get("created_at"),
-            row.get("user_id"),
-            row.get("page"),
-            int(row.get("rating") or 0),
-            ",".join(row.get("categories") or []),
-            row.get("email"),
-            row.get("message"),
-        ], value_input_option="RAW")
-
-    def list_feedback(self, limit: int = 50) -> pd.DataFrame:
-        rows = self.ss.worksheet("feedback").get_all_records()
-        if not rows:
-            return pd.DataFrame(columns=["created_at","user_id","page","rating","categories","email","message"])
-        df = pd.DataFrame(rows)
-        df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
-        return df.sort_values("created_at", ascending=False).head(limit)
-
-    # ---- RFIs
-    def _next_rfi_id(self) -> int:
-        rows = self.ss.worksheet("rfis").get_all_records()
-        if not rows:
-            return 1
-        try:
-            return max(int(r.get("id", 0) or 0) for r in rows) + 1
-        except Exception:
-            return len(rows) + 1
-
-    def upsert_rfi(self, row: dict) -> int:
-        ws = self.ss.worksheet("rfis")
-        headers = ws.row_values(1)
-        # Ensure header shape
-        expected = ["id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"]
-        if headers != expected:
-            ws.resize(rows=1)
-            ws.update([expected])
-
-        rows = ws.get_all_records()
-        rid = row.get("id")
-        if not rid:
-            rid = self._next_rfi_id()
-            row["id"] = rid
-            row.setdefault("created_at", datetime.utcnow().isoformat())
-
-        row.setdefault("updated_at", datetime.utcnow().isoformat())
-
-        out = [
-            row.get("id"), row.get("created_at"), row.get("updated_at"), row.get("user_id"),
-            row.get("project"), row.get("subject"), row.get("question"), row.get("discipline"),
-            row.get("spec_section"), row.get("priority"), row.get("status"), row.get("due_date"),
-            row.get("assignee_email"), row.get("to_emails"), row.get("cc_emails"),
-            row.get("related_tasks"), row.get("schedule_impact_days"), row.get("cost_impact"),
-            row.get("last_sent_at"), row.get("last_reminded_at"), row.get("last_response_at"), row.get("thread_notes"),
-        ]
-
-        # Update if exists
-        ids = []
+    def list_submittal_checks(self) -> pd.DataFrame:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, created_at, payload_json FROM submittal_checks ORDER BY created_at DESC"
+            ).fetchall()
+        out = []
         for r in rows:
             try:
-                ids.append(int(r.get("id", 0) or 0))
+                payload = json.loads(r["payload_json"])
             except Exception:
-                ids.append(0)
-        if int(rid) in ids:
-            idx = ids.index(int(rid)) + 2
-            ws.update(f"A{idx}:V{idx}", [out], value_input_option="RAW")
-        else:
-            ws.append_row(out, value_input_option="RAW")
-        return int(rid)
+                payload = {}
+            out.append({"id": r["id"], "created_at": r["created_at"], **payload})
+        return pd.DataFrame(out)
 
-    def list_rfis(self, limit: int = 5000) -> pd.DataFrame:
-        rows = self.ss.worksheet("rfis").get_all_records()
-        if not rows:
-            return pd.DataFrame(columns=["id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section","priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks","schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"])
-        df = pd.DataFrame(rows)
-        for c in ["id","schedule_impact_days"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-        for c in ["cost_impact"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-        return df.sort_values("id", ascending=False).head(int(limit))
-
-    def get_rfi(self, id_: int) -> dict:
-        rows = self.ss.worksheet("rfis").get_all_records()
-        for r in rows:
-            try:
-                if int(r.get("id", 0) or 0) == int(id_):
-                    return r
-            except Exception:
-                continue
-        return {}
-
-    def delete_rfi(self, id_: int) -> None:
-        ws = self.ss.worksheet("rfis")
-        rows = ws.get_all_records()
-        for i, r in enumerate(rows, start=2):
-            try:
-                if int(r.get("id", 0) or 0) == int(id_):
-                    ws.delete_rows(i)
-                    return
-            except Exception:
-                continue
-
-
-
-# ---- Schedule Runs (full save/browse/download)
-
-def save_schedule_run(self, meta: dict, df: pd.DataFrame) -> str:
-    ws_index = self.ss.worksheet("schedule_runs")
-    run_id = meta.get("run_id") or f"sched_{int(time.time()*1000)}"
-    created_at = meta.get("created_at") or _utc_now()
-
-    tab = self._sanitize_tab(f"sched_{run_id}_{meta.get('project','')}_{meta.get('kind','')}")
-    try:
-        old = self.ss.worksheet(tab)
-        self.ss.del_worksheet(old)
-    except Exception:
-        pass
-
-    w = self.ss.add_worksheet(title=tab, rows=max(1000, len(df)+10), cols=max(20, len(df.columns)+5))
-    w.update([df.columns.tolist()] + df.fillna("").astype(str).values.tolist())
-
-    row = [
-        run_id,
-        created_at,
-        meta.get("company",""),
-        meta.get("client",""),
-        meta.get("project",""),
-        meta.get("scenario",""),
-        meta.get("kind",""),
-        str(meta.get("baseline_days","") or ""),
-        str(meta.get("crashed_days","") or ""),
-        tab,
-        json.dumps(meta, ensure_ascii=False),
-    ]
-    ws_index.append_row(row)
-    return run_id
-
-def list_schedule_runs(self) -> pd.DataFrame:
-    ws = self.ss.worksheet("schedule_runs")
-    vals = ws.get_all_values()
-    headers = vals[0] if vals else []
-    rows = vals[1:] if len(vals) > 1 else []
-    if not headers:
-        return pd.DataFrame(columns=["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"])
-    df = pd.DataFrame(rows, columns=headers)
-    keep = ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"]
-    for k in keep:
-        if k not in df.columns:
-            df[k] = ""
-    return df[keep].sort_values("created_at", ascending=False)
-
-def load_schedule_run(self, run_id: str) -> tuple[dict, pd.DataFrame]:
-    ws = self.ss.worksheet("schedule_runs")
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        raise KeyError("Schedule run not found")
-    headers = vals[0]
-    for row in vals[1:]:
-        if len(row) >= 1 and str(row[0]) == str(run_id):
-            rec = dict(zip(headers, row))
-            tab = rec.get("sheet_name")
-            meta = {}
-            try:
-                meta = json.loads(rec.get("meta_json","") or "{}")
-            except Exception:
-                meta = {}
-            if not tab:
-                raise KeyError("Schedule run sheet missing")
-            w = self.ss.worksheet(tab)
-            values = w.get_all_values()
-            if len(values) <= 1:
-                return meta, pd.DataFrame()
-            df = pd.DataFrame(values[1:], columns=values[0])
-            return meta, df
-    raise KeyError("Schedule run not found")
-
-def delete_schedule_run(self, run_id: str) -> None:
-    ws = self.ss.worksheet("schedule_runs")
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        return
-    headers = vals[0]
-    kept = [headers]
-    tab_to_delete = None
-    for row in vals[1:]:
-        if len(row) >= 1 and str(row[0]) == str(run_id):
-            try:
-                rec = dict(zip(headers, row))
-                tab_to_delete = rec.get("sheet_name")
-            except Exception:
-                pass
-            continue
-        kept.append(row)
-    ws.clear()
-    ws.update(kept)
-    if tab_to_delete:
+    def load_submittal_check(self, check_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            r = conn.execute("SELECT payload_json FROM submittal_checks WHERE id=?", (check_id,)).fetchone()
+        if not r:
+            return None
         try:
-            w = self.ss.worksheet(tab_to_delete)
-            self.ss.del_worksheet(w)
-        except Exception:
-            pass
-
-    def open_url_hint(self, rec: dict) -> str | None:
-        try: return self.ss.url
-        except: return None
-
-# ---- Google OAuth helpers + Sheets backend
-def _qp_value(params, key):
-    """Return a single query-param value, handling Streamlit's list values."""
-    v = params.get(key)
-    if isinstance(v, list):
-        return v[0] if v else None
-    return v
-
-def google_oauth_start():
-    """Start Google OAuth in a way that's stable on Streamlit (scopes must match callback)."""
-    try:
-        import streamlit as st
-        from google_auth_oauthlib.flow import Flow
-    except Exception as e:
-        st.error(f"Google OAuth unavailable (missing dependency): {e}")
-        return
-
-    cfg = st.secrets.get("google_oauth", {})
-    client_id = cfg.get("client_id", "")
-    client_secret = cfg.get("client_secret", "")
-    redirect_uri = cfg.get("redirect_uri", st.secrets.get("microsoft_oauth", {}).get("redirect_uri", ""))
-
-    if not client_id or not client_secret or not redirect_uri:
-        st.error("Google OAuth is not configured. Fill [google_oauth] client_id/client_secret/redirect_uri in Streamlit secrets.")
-        return
-
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        },
-        scopes=GOOGLE_SCOPES,
-        redirect_uri=redirect_uri,
-    )
-
-    import secrets as _secrets
-    state = "g_" + _secrets.token_urlsafe(16)
-    auth_url, _ = flow.authorization_url(
-    access_type="offline",
-    prompt="consent",
-    state=state,
-    )
-    st.session_state["__google_state__"] = state
-    st.markdown(f"[Continue to Google]({auth_url})")
-
-def google_oauth_callback():
-    """Handle the OAuth redirect back from Google."""
-    from google_auth_oauthlib.flow import Flow
-
-    cfg = get_secret("google_oauth", {})
-    params = st.query_params
-
-    code = _qp_value(params, "code")
-    state = _qp_value(params, "state")
-    if not code or not state:
-        return False
-
-    # Ignore if this callback isn't for Google (helps when multiple providers share ?code=...).
-    if isinstance(state, str) and not state.startswith("g_"):
-        return False
-
-    # Guard against double-processing the same authorization code (refresh/back button can trigger this)
-    used = st.session_state.setdefault("__oauth_used_codes__", set())
-    if code in used:
-        st.query_params.clear()
-        return False
-    used.add(code)
-
-    # If we still have the original state, enforce it. (Streamlit Cloud may lose it.)
-    saved_state = st.session_state.get("__google_state__")
-    if saved_state is not None and state != saved_state:
-        return False
-
-    # Ignore callbacks that aren't for Google (we prefix state with 'g_').
-    if isinstance(state, str) and not state.startswith("g_"):
-        return False
-
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": cfg["client_id"],
-                "client_secret": cfg["client_secret"],
-                "redirect_uris": [cfg["redirect_uri"]],
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        },
-        scopes=GOOGLE_SCOPES,
-        state=state,
-    )
-    flow.redirect_uri = cfg["redirect_uri"]
-    try:
-        flow.fetch_token(code=code)
-    except Exception as e:
-        msg = str(e)
-        # Common when scopes or redirect URIs changed since the last consent.
-        if ("Scope has changed" in msg) or ("invalid_grant" in msg):
-            for k in ["__google_token__", "__google_user__", "__google_state__", "__google_code_verifier__"]:
-                st.session_state.pop(k, None)
-        # Make the error message actionable.
-        raise RuntimeError(
-            "Google OAuth callback failed (scope/consent mismatch). "
-            "Click **Sign out Google**, then in your Google Account → Security → Third‑party access "
-            "remove this app (FieldFlow), and try signing in again."
-        ) from e
-
-    creds = flow.credentials
-    st.session_state["__google_token__"] = {
-        "token": creds.token,
-        "refresh_token": getattr(creds, "refresh_token", None),
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": creds.scopes,
-    }
-
-    ui = requests.get(
-        "https://www.googleapis.com/oauth2/v3/userinfo",
-        headers={"Authorization": f"Bearer {creds.token}"},
-        timeout=15,
-    ).json()
-    st.session_state["__google_user__"] = ui.get("email", "google-user")
-
-    st.query_params.clear()
-    return True
-def google_credentials():
-    """Return Google Credentials (OAuth), refreshing if needed."""
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-
-    tok = st.session_state.get("__google_token__")
-    if not tok:
-        return None
-
-    creds = Credentials(**tok)
-
-    # Best-effort refresh if expired and we have a refresh token.
-    try:
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            st.session_state["__google_token__"] = {
-                "token": creds.token,
-                "refresh_token": creds.refresh_token,
-                "token_uri": creds.token_uri,
-                "client_id": creds.client_id,
-                "client_secret": creds.client_secret,
-                "scopes": creds.scopes,
-            }
-    except Exception:
-        # If refresh fails, fall back to the existing creds; caller can re-auth.
-        pass
-
-    return creds
-class GoogleSheetsOAuth(StorageBackend):
-    def __init__(self, title: str):
-        import gspread
-        creds = google_credentials()
-        if creds is None:
-            raise RuntimeError("Google not authenticated.")
-        self.client = gspread.authorize(creds)
-        self.title = title
-        self.ss = self._open_or_create(self.client)
-        self._ensure_tabs()
-
-    def _open_or_create(self, client):
-        try:
-            return client.open(self.title)
-        except Exception:
-            return client.create(self.title)
-
-    def _ensure_ws(self, title, headers):
-        try:
-            ws = self.ss.worksheet(title)
-        except Exception:
-            ws = self.ss.add_worksheet(title=title, rows=1000, cols=max(20, len(headers)))
-            ws.append_row(headers)
-            return ws
-        if ws.row_values(1) != headers:
-            ws.resize(rows=1)
-            ws.update([headers])
-        return ws
-
-    def _ensure_tabs(self):
-        self._ensure_ws("presets", ["name","json","updated_at"])
-        self._ensure_ws("submittals", [
-            "id","company","client","project","date_submitted","quote","notes",
-            "threshold","weights_json","must","nice","forbid",
-            "pass_count","review_count","pass_rate",
-            "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"
-        ])
-        self._ensure_ws("feedback", ["created_at","user_id","page","rating","categories","email","message"])
-        self._ensure_ws("schedule_runs", ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name","meta_json"])
-        self._ensure_ws("rfis", [
-            "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
-            "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
-            "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
-        ])
-
-    def load_presets(self) -> dict:
-        rows = self.ss.worksheet("presets").get_all_records()
-        out = {}
-        for r in rows:
-            try: out[r["name"]] = json.loads(r["json"])
-            except: pass
-        return out
-
-    def save_preset(self, name, payload):
-        ws = self.ss.worksheet("presets")
-        rows = ws.get_all_records()
-        names = [r.get("name") for r in rows]
-        now = datetime.utcnow().isoformat()
-        if name in names:
-            idx = names.index(name) + 2
-            ws.update(f"A{idx}:C{idx}", [[name, json.dumps(payload), now]])
-        else:
-            ws.append_row([name, json.dumps(payload), now])
-
-    def delete_preset(self, name):
-        ws = self.ss.worksheet("presets")
-        rows = ws.get_all_records()
-        for i, r in enumerate(rows, start=2):
-            if r.get("name")==name:
-                ws.delete_rows(i); return
-
-    def _next_id(self):
-        rows = self.ss.worksheet("submittals").get_all_records()
-        if not rows: return 1
-        try: return max(int(r.get("id",0) or 0) for r in rows) + 1
-        except: return len(rows)+1
-
-    def save_submittal(self, meta, result_csv_bytes, spec_excerpt, sub_excerpt):
-        ws = self.ss.worksheet("submittals")
-        run_id = self._next_id()
-        # results tab
-        try:
-            df = pd.read_csv(pd.io.common.BytesIO(result_csv_bytes))
-            tab = re.sub(r"[\[\]\:\*\?\/\\]", "_", f"run_{run_id}_{meta.get('company','')}_{meta.get('project','')}")[:90]
-            try:
-                old = self.ss.worksheet(tab); self.ss.del_worksheet(old)
-            except: pass
-            w = self.ss.add_worksheet(title=tab, rows=max(1000,len(df)+10), cols=max(20,len(df.columns)+2))
-            values = [list(df.columns)] + df.astype(object).where(pd.notna(df), "").values.tolist()
-            w.update("A1", values)
-        except Exception:
-            tab = ""
-        now = datetime.utcnow().isoformat()
-        row = [
-            run_id, meta.get("company"), meta.get("client"), meta.get("project"),
-            meta.get("date_submitted"), meta.get("quote"), meta.get("notes"),
-            meta.get("threshold"), json.dumps(meta.get("weights", {})),
-            meta.get("must"), meta.get("nice"), meta.get("forbid"),
-            meta.get("pass_count"), meta.get("review_count"), float(meta.get("pass_rate",0.0)),
-            tab, spec_excerpt, sub_excerpt, now
-        ]
-        ws.append_row(row); return run_id
-
-    def list_submittals(self) -> pd.DataFrame:
-        rows = self.ss.worksheet("submittals").get_all_records()
-        if not rows:
-            return pd.DataFrame(columns=["id","company","client","project","date_submitted","quote",
-                                         "pass_count","review_count","pass_rate","threshold","created_at"])
-        df = pd.DataFrame(rows)
-        for c in ["id","pass_count","review_count","threshold"]:
-            if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-        if "pass_rate" in df.columns: df["pass_rate"] = pd.to_numeric(df["pass_rate"], errors="coerce").fillna(0.0)
-        return df[["id","company","client","project","date_submitted","quote",
-                   "pass_count","review_count","pass_rate","threshold","created_at"]]
-
-    def get_submittal(self, id_):
-        for r in self.ss.worksheet("submittals").get_all_records():
-            try:
-                if int(r.get("id",0) or 0)==int(id_): return r
-            except: pass
-        return {}
-
-    def delete_submittal(self, id_):
-        ws = self.ss.worksheet("submittals")
-        rows = ws.get_all_records()
-        for i, r in enumerate(rows, start=2):
-            if r.get("id")==id_:
-                ws.delete_rows(i); return
-
-    def save_feedback(self, row: dict) -> None:
-        ws = self.ss.worksheet("feedback")
-        ws.append_row([
-            row.get("created_at"),
-            row.get("user_id"),
-            row.get("page"),
-            int(row.get("rating") or 0),
-            ",".join(row.get("categories") or []),
-            row.get("email"),
-            row.get("message"),
-        ], value_input_option="RAW")
-
-    def list_feedback(self, limit: int = 50) -> pd.DataFrame:
-        rows = self.ss.worksheet("feedback").get_all_records()
-        if not rows:
-            return pd.DataFrame(columns=["created_at","user_id","page","rating","categories","email","message"])
-        df = pd.DataFrame(rows)
-        df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
-        return df.sort_values("created_at", ascending=False).head(limit)
-
-
-    # ---- RFIs
-    def _next_rfi_id(self) -> int:
-        rows = self.ss.worksheet("rfis").get_all_records()
-        if not rows:
-            return 1
-        try:
-            return max(int(r.get("id", 0) or 0) for r in rows) + 1
-        except Exception:
-            return len(rows) + 1
-
-    def upsert_rfi(self, row: dict) -> int:
-        ws = self.ss.worksheet("rfis")
-        rows = ws.get_all_records()
-        headers = ws.row_values(1)
-        rid = int(row.get("id") or 0)
-        if rid <= 0:
-            rid = self._next_rfi_id()
-            row["id"] = rid
-            row.setdefault("created_at", datetime.utcnow().isoformat())
-        row.setdefault("updated_at", datetime.utcnow().isoformat())
-
-        def as_cells(hs: list[str]):
-            out = []
-            for h in hs:
-                v = row.get(h)
-                if isinstance(v, list):
-                    v = ",".join(map(str, v))
-                out.append("" if v is None else v)
-            return out
-
-        ids = [int(r.get("id", 0) or 0) for r in rows]
-        if rid in ids:
-            idx = ids.index(rid) + 2
-            ws.update(f"A{idx}:{chr(64+len(headers))}{idx}", [as_cells(headers)])
-        else:
-            ws.append_row(as_cells(headers), value_input_option="RAW")
-        return rid
-
-    def list_rfis(self, limit: int = 5000) -> pd.DataFrame:
-        rows = self.ss.worksheet("rfis").get_all_records()
-        if not rows:
-            return pd.DataFrame(columns=[
-                "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
-                "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
-                "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
-            ])
-        df = pd.DataFrame(rows)
-        for c in ["id","schedule_impact_days"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-        if "cost_impact" in df.columns:
-            df["cost_impact"] = pd.to_numeric(df["cost_impact"], errors="coerce").fillna(0.0)
-        return df.sort_values("id", ascending=False).head(int(limit))
-
-    def get_rfi(self, id_: int) -> dict:
-        for r in self.ss.worksheet("rfis").get_all_records():
-            try:
-                if int(r.get("id", 0) or 0) == int(id_):
-                    return r
-            except Exception:
-                continue
-        return {}
-
-    def delete_rfi(self, id_: int) -> None:
-        ws = self.ss.worksheet("rfis")
-        rows = ws.get_all_records()
-        for i, r in enumerate(rows, start=2):
-            try:
-                if int(r.get("id", 0) or 0) == int(id_):
-                    ws.delete_rows(i)
-                    return
-            except Exception:
-                continue
-
-
-# ---- Schedule Runs (full save/browse/download)
-
-def save_schedule_run(self, meta: dict, df: pd.DataFrame) -> str:
-    ws_index = self.ss.worksheet("schedule_runs")
-    run_id = meta.get("run_id") or f"sched_{int(time.time()*1000)}"
-    created_at = meta.get("created_at") or _utc_now()
-
-    tab = self._sanitize_tab(f"sched_{run_id}_{meta.get('project','')}_{meta.get('kind','')}")
-    try:
-        old = self.ss.worksheet(tab)
-        self.ss.del_worksheet(old)
-    except Exception:
-        pass
-
-    w = self.ss.add_worksheet(title=tab, rows=max(1000, len(df)+10), cols=max(20, len(df.columns)+5))
-    w.update([df.columns.tolist()] + df.fillna("").astype(str).values.tolist())
-
-    row = [
-        run_id,
-        created_at,
-        meta.get("company",""),
-        meta.get("client",""),
-        meta.get("project",""),
-        meta.get("scenario",""),
-        meta.get("kind",""),
-        str(meta.get("baseline_days","") or ""),
-        str(meta.get("crashed_days","") or ""),
-        tab,
-        json.dumps(meta, ensure_ascii=False),
-    ]
-    ws_index.append_row(row)
-    return run_id
-
-def list_schedule_runs(self) -> pd.DataFrame:
-    ws = self.ss.worksheet("schedule_runs")
-    vals = ws.get_all_values()
-    headers = vals[0] if vals else []
-    rows = vals[1:] if len(vals) > 1 else []
-    if not headers:
-        return pd.DataFrame(columns=["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"])
-    df = pd.DataFrame(rows, columns=headers)
-    keep = ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"]
-    for k in keep:
-        if k not in df.columns:
-            df[k] = ""
-    return df[keep].sort_values("created_at", ascending=False)
-
-def load_schedule_run(self, run_id: str) -> tuple[dict, pd.DataFrame]:
-    ws = self.ss.worksheet("schedule_runs")
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        raise KeyError("Schedule run not found")
-    headers = vals[0]
-    for row in vals[1:]:
-        if len(row) >= 1 and str(row[0]) == str(run_id):
-            rec = dict(zip(headers, row))
-            tab = rec.get("sheet_name")
-            meta = {}
-            try:
-                meta = json.loads(rec.get("meta_json","") or "{}")
-            except Exception:
-                meta = {}
-            if not tab:
-                raise KeyError("Schedule run sheet missing")
-            w = self.ss.worksheet(tab)
-            values = w.get_all_values()
-            if len(values) <= 1:
-                return meta, pd.DataFrame()
-            df = pd.DataFrame(values[1:], columns=values[0])
-            return meta, df
-    raise KeyError("Schedule run not found")
-
-def delete_schedule_run(self, run_id: str) -> None:
-    ws = self.ss.worksheet("schedule_runs")
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        return
-    headers = vals[0]
-    kept = [headers]
-    tab_to_delete = None
-    for row in vals[1:]:
-        if len(row) >= 1 and str(row[0]) == str(run_id):
-            try:
-                rec = dict(zip(headers, row))
-                tab_to_delete = rec.get("sheet_name")
-            except Exception:
-                pass
-            continue
-        kept.append(row)
-    ws.clear()
-    ws.update(kept)
-    if tab_to_delete:
-        try:
-            w = self.ss.worksheet(tab_to_delete)
-            self.ss.del_worksheet(w)
-        except Exception:
-            pass
-
-    def open_url_hint(self, rec): 
-        try: return self.ss.url
-        except: return None
-
-# ---- Microsoft OAuth helpers + Excel backend
-def ms_oauth_start():
-    import secrets as _secrets
-
-    cfg = get_secret("microsoft_oauth", {})
-    if not cfg:
-        st.error("Microsoft OAuth not configured in secrets.")
-        return
-
-    state = "m_" + _secrets.token_urlsafe(16)
-
-    params = {
-        "client_id": cfg["client_id"],
-        "response_type": "code",
-        "redirect_uri": cfg["redirect_uri"],
-        "response_mode": "query",
-        "scope": " ".join(["openid", "profile", "email", "offline_access", "Files.ReadWrite", "User.Read"]),
-        "state": state,
-    }
-
-    st.session_state["__ms_state__"] = state
-
-    auth_url = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?{q}".format(
-        tenant=cfg.get("tenant_id", "common"),
-        q=urllib.parse.urlencode(params),
-    )
-    st.markdown(f"[Continue to Microsoft]({auth_url})")
-def ms_oauth_callback():
-    cfg = get_secret("microsoft_oauth", {})
-    params = st.query_params
-
-    code = _qp_value(params, "code")
-    state = _qp_value(params, "state")
-    if not code or not state:
-        return False
-
-    used = st.session_state.setdefault("__oauth_used_codes__", set())
-    if code in used:
-        st.query_params.clear()
-        return False
-    used.add(code)
-
-    saved_state = st.session_state.get("__ms_state__")
-    if saved_state is not None and state != saved_state:
-        return False
-
-    if isinstance(state, str) and not state.startswith("m_"):
-        return False
-
-    token_url = f"https://login.microsoftonline.com/{cfg.get('tenant_id','common')}/oauth2/v2.0/token"
-    data = {
-        "client_id": cfg["client_id"],
-        "client_secret": cfg["client_secret"],
-        "code": code,
-        "redirect_uri": cfg["redirect_uri"],
-        "grant_type": "authorization_code",
-        "scope": MS_SCOPES,
-    }
-
-    tok = requests.post(token_url, data=data, timeout=20).json()
-    if "access_token" not in tok:
-        return False
-
-    tok["_obtained"] = int(time.time())
-    st.session_state["__ms_token__"] = tok
-
-    me = requests.get(
-        "https://graph.microsoft.com/v1.0/me",
-        headers={"Authorization": f"Bearer {tok['access_token']}"},
-        timeout=20,
-    ).json()
-    st.session_state["__ms_user__"] = me.get("userPrincipalName", "microsoft-user")
-
-    st.query_params.clear()
-    return True
-def ms_access_token():
-    """Return Microsoft Graph access token, refreshing if needed."""
-    tok = st.session_state.get("__ms_token__")
-    if not tok:
-        return None
-
-    access = tok.get("access_token")
-    if not access:
-        return None
-
-    # Refresh if we know it's expired and we have a refresh token.
-    try:
-        obtained = int(tok.get("_obtained", 0))
-        expires_in = int(tok.get("expires_in", 0))
-        # Refresh a little early (60s).
-        if tok.get("refresh_token") and expires_in and obtained and (time.time() > obtained + expires_in - 60):
-            cfg = get_secret("microsoft_oauth", {})
-            token_url = f"https://login.microsoftonline.com/{cfg.get('tenant_id','common')}/oauth2/v2.0/token"
-            data = {
-                "client_id": cfg["client_id"],
-                "client_secret": cfg["client_secret"],
-                "grant_type": "refresh_token",
-                "refresh_token": tok["refresh_token"],
-                "redirect_uri": cfg["redirect_uri"],
-                "scope": MS_SCOPES,
-            }
-            new_tok = requests.post(token_url, data=data, timeout=20).json()
-            if "access_token" in new_tok:
-                new_tok["_obtained"] = int(time.time())
-                st.session_state["__ms_token__"] = new_tok
-                return new_tok["access_token"]
-    except Exception:
-        pass
-
-    return access
-class MSExcelOAuth(StorageBackend):
-    def __init__(self, title: str):
-        self.base = "https://graph.microsoft.com/v1.0"
-        self.token = ms_access_token()
-        if not self.token:
-            raise RuntimeError("Microsoft not authenticated.")
-        self.title = title
-        # Don't create/find the workbook on every rerun (can trip Graph quota).
-        # We lazily ensure it when we actually need to write, and cache the id in st.session_state.
-        self._workbook_id = st.session_state.get("__ms_workbook_id__") if hasattr(st, "session_state") else None
-
-    def _hed(self): return {"Authorization": f"Bearer {self.token}", "Content-Type":"application/json"}
-
-    def _find_existing_workbook_id(self) -> str | None:
-        """Find an existing workbook in the user's OneDrive by searching for the app title.
-
-        This avoids repeated 'create workbook' calls (which can trigger Graph quota errors).
-        """
-        try:
-            token = ms_access_token()
-            if not token:
-                return None
-            # Search can return many things; we'll pick the newest Excel file whose name matches the title.
-            q = self.title
-            url = f"{self.base}/me/drive/root/search(q='{q}')"
-            data = self._graph_get(url)
-            items = data.get("value", []) if isinstance(data, dict) else []
-            if not items:
-                return None
-
-            want = f"{self.title}.xlsx".lower()
-            candidates = []
-            for it in items:
-                name = str(it.get("name", "")).lower()
-                if not name.endswith(".xlsx"):
-                    continue
-                if (name == want) or name.startswith(self.title.lower()):
-                    candidates.append(it)
-
-            if not candidates:
-                return None
-
-            # Sort newest first
-            candidates.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-            return candidates[0].get("id")
+            return json.loads(r["payload_json"])
         except Exception:
             return None
 
-    def _get_workbook_id(self) -> str:
-        """Return workbook id (auto-detect existing workbook; do NOT auto-create)."""
-        if "__ms_workbook_id__" in st.session_state:
-            return st.session_state["__ms_workbook_id__"]
-
-        wid = self._find_existing_workbook_id()
-        if wid:
-            st.session_state["__ms_workbook_id__"] = wid
-            return wid
-
-        raise RuntimeError(
-            "OneDrive workbook not initialized yet. "
-            "Open **Microsoft workbook (OneDrive)** in the sidebar and click **Initialize OneDrive workbook** once."
-        )
-    def _ensure_workbook(self):
-        """Create the workbook only if it doesn't already exist."""
-        # First: if we can find an existing workbook, reuse it.
-        wid = st.session_state.get("__ms_workbook_id__") or self._find_existing_workbook_id()
-        if wid:
-            st.session_state["__ms_workbook_id__"] = wid
-            st.success("Workbook ready (reused existing OneDrive workbook).")
-            return
-
-        # Avoid spamming create calls on reruns.
-        if st.session_state.get("__ms_workbook_create_attempted__"):
-            raise RuntimeError(
-                "Workbook creation already attempted and still not found. "
-                "If you see quota errors, wait a bit and try again, or delete extra FieldFlow workbooks in OneDrive."
-            )
-        st.session_state["__ms_workbook_create_attempted__"] = True
-
-        token = ms_access_token()
-        if not token:
-            raise RuntimeError("Microsoft not signed in.")
-
-        name = f"{self.title}.xlsx"
-        url = f"{self.base}/me/drive/root:/{name}:/content"
-        try:
-            r = requests.put(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                },
-                data=b"",  # empty workbook
-                timeout=30,
-            )
-            if r.status_code >= 400:
-                # Try one more time to find an existing workbook (in case it exists but wasn't returned previously).
-                msg = ""
-                try:
-                    msg = r.text
-                except Exception:
-                    pass
-
-                if "quotaLimitReached" in msg or "Quota limit reached" in msg:
-                    wid2 = self._find_existing_workbook_id()
-                    if wid2:
-                        st.session_state["__ms_workbook_id__"] = wid2
-                        st.success("Workbook ready (found existing workbook after quota error).")
-                        return
-                    raise RuntimeError("Microsoft Graph quotaLimitReached while creating workbook. Try again later.") from None
-
-                raise RuntimeError(f"Microsoft Graph error creating workbook: {r.status_code} {msg[:300]}")
-            item = r.json()
-            st.session_state["__ms_workbook_id__"] = item.get("id")
-            st.success("Workbook created in OneDrive.")
-        finally:
-            # allow future retries if it didn't actually work
-            if "__ms_workbook_id__" not in st.session_state:
-                st.session_state.pop("__ms_workbook_create_attempted__", None)
-    def _ensure_worksheet(self, name: str, headers: list[str]):
-        url_ws = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets"
-        r = requests.get(url_ws, headers=self._hed()).json()
-        names = [w["name"] for w in r.get("value",[])]
-        if name not in names:
-            _ = requests.post(url_ws + "/add", headers=self._hed(), data=json.dumps({"name": name})).json()
-            self._update_range(name, "A1", [headers])
-        # ensure feedback sheet exists for feedback operations
-        if name != "feedback":
-            self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"])
-
-
-    @staticmethod
-    def _col_name(n: int) -> str:
-        """1 -> A, 2 -> B, 27 -> AA"""
-        name = ""
-        while n > 0:
-            n, r = divmod(n - 1, 26)
-            name = chr(65 + r) + name
-        return name
-
-    def _update_range(self, ws_name: str, start_cell: str, values_2d: list[list]):
-        """Patch a 2D array into a worksheet starting at start_cell (e.g., A1)."""
-        m2 = re.match(r"^([A-Z]+)(\d+)$", str(start_cell).upper().strip())
-        if not m2:
-            raise ValueError(f"Bad start_cell: {start_cell}")
-        col_letters, row_str = m2.group(1), m2.group(2)
-        start_row = int(row_str)
-
-        nrows = max(1, len(values_2d))
-        ncols = max(1, max((len(r) for r in values_2d), default=1))
-        start_col_num = 0
-        for ch in col_letters:
-            start_col_num = start_col_num * 26 + (ord(ch) - 64)
-        end_col_num = start_col_num + ncols - 1
-        end_row = start_row + nrows - 1
-        end_cell = f"{self._col_name(end_col_num)}{end_row}"
-        address = f"{col_letters}{start_row}:{end_cell}"
-
-        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws_name)}/range(address='{address}')"
-        requests.patch(url, headers=self._hed(), data=json.dumps({"values": values_2d}))
-
-    def _append_rows(self, ws_name: str, values_2d: list[list]):
-        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws_name)}/usedRange(valuesOnly=true)"
-        r = requests.get(url, headers=self._hed()).json()
-        row_count = r.get("rowCount", 0) or 0
-        start_cell = f"A{row_count+1}" if row_count>0 else "A1"
-        self._update_range(ws_name, start_cell, values_2d)
-
-    def save_feedback(self, row: dict) -> None:
-        self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"])
-        self._append_rows("feedback", [[
-            row.get("created_at"),
-            row.get("user_id"),
-            row.get("page"),
-            int(row.get("rating") or 0),
-            ",".join(row.get("categories") or []),
-            row.get("email"),
-            row.get("message"),
-        ]])
-
-    def list_feedback(self, limit: int = 50) -> pd.DataFrame:
-        self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"])
-        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote('feedback')}/usedRange(valuesOnly=true)"
-        r = requests.get(url, headers=self._hed()).json()
-        vals = r.get("values", [])
-        if len(vals) <= 1:
-            return pd.DataFrame(columns=["created_at","user_id","page","rating","categories","email","message"])
-        df = pd.DataFrame(vals[1:], columns=vals[0])
-        df["rating"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).astype(int)
-        return df.sort_values("created_at", ascending=False).head(limit)
-
-
-    # ---- RFIs
-    def upsert_rfi(self, row: dict) -> int:
-        ws = "rfis"
-        headers = [
-            "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
-            "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
-            "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
-        ]
-        self._ensure_worksheet(ws, headers)
-        # Load current
-        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-        r = requests.get(url, headers=self._hed()).json()
-        vals = r.get("values", [])
-        existing = vals[1:] if len(vals) > 1 else []
-        id_idx = 0
-        rid = row.get("id")
-        if rid is not None:
-            try:
-                rid = int(rid)
-            except Exception:
-                rid = None
-        if rid is None:
-            # next id
-            mx = 0
-            for rr in existing:
-                try:
-                    mx = max(mx, int(rr[id_idx]))
-                except Exception:
-                    pass
-            rid = mx + 1
-            row["id"] = rid
-        # Build output row values in header order
-        def _get(k):
-            v = row.get(k)
-            if v is None:
-                return ""
-            if isinstance(v, (list, tuple)):
-                return ",".join(str(x) for x in v)
-            return str(v)
-        out_row = [_get(h) for h in headers]
-        # Update if exists
-        found_idx = None
-        for i, rr in enumerate(existing, start=2):
-            try:
-                if int(rr[id_idx]) == int(rid):
-                    found_idx = i
-                    break
-            except Exception:
-                continue
-        if found_idx is None:
-            self._append_rows(ws, [out_row])
-        else:
-            # Update entire row
-            self._update_range(ws, f"A{found_idx}", [out_row])
-        return int(rid)
-
-    def list_rfis(self, limit: int = 5000) -> pd.DataFrame:
-        ws = "rfis"
-        headers = [
-            "id","created_at","updated_at","user_id","project","subject","question","discipline","spec_section",
-            "priority","status","due_date","assignee_email","to_emails","cc_emails","related_tasks",
-            "schedule_impact_days","cost_impact","last_sent_at","last_reminded_at","last_response_at","thread_notes"
-        ]
-        self._ensure_worksheet(ws, headers)
-        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-        r = requests.get(url, headers=self._hed()).json()
-        vals = r.get("values", [])
-        if len(vals) <= 1:
-            return pd.DataFrame(columns=headers)
-        df = pd.DataFrame(vals[1:], columns=vals[0])
-        if "id" in df.columns:
-            df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
-        if "schedule_impact_days" in df.columns:
-            df["schedule_impact_days"] = pd.to_numeric(df["schedule_impact_days"], errors="coerce").fillna(0).astype(int)
-        if "cost_impact" in df.columns:
-            df["cost_impact"] = pd.to_numeric(df["cost_impact"], errors="coerce").fillna(0.0)
-        df = df.sort_values(["status","due_date","created_at"], ascending=[True, True, False], kind="stable")
-        return df.head(int(limit))
-
-    def get_rfi(self, id_: int) -> dict:
-        df = self.list_rfis(limit=10000)
-        try:
-            return df[df["id"] == int(id_)].iloc[0].to_dict()
-        except Exception:
-            return {}
-
-    def delete_rfi(self, id_: int) -> None:
-        # Minimal viable (Excel row delete via Graph is non-trivial). Mark as Closed instead.
-        rec = self.get_rfi(id_)
-        if not rec:
-            return
-        rec["status"] = "Closed"
-        rec["updated_at"] = __import__("datetime").datetime.utcnow().isoformat()
-        self.upsert_rfi(rec)
-
-    # Presets
-    def load_presets(self) -> dict:
-        ws = "presets"; headers = ["name","json","updated_at"]
-        self._ensure_worksheet(ws, headers)
-        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-        r = requests.get(url, headers=self._hed()).json()
-        vals = r.get("values", [])
-        out = {}
-        for row in vals[1:]:
-            if len(row)>=2:
-                try: out[row[0]] = json.loads(row[1])
-                except: pass
-        return out
-
-    def save_preset(self, name: str, payload: dict) -> None:
-        ws = "presets"; headers = ["name","json","updated_at"]
-        self._ensure_worksheet(ws, headers)
-        self._append_rows(ws, [[name, json.dumps(payload), datetime.utcnow().isoformat()]])
-
-    def delete_preset(self, name: str) -> None:
-        pass  # minimal viable; range delete omitted
-
-    # Submittals
-    def save_submittal(self, meta: dict, result_csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
-        ws = "submittals"; headers = ["id","company","client","project","date_submitted","quote","notes",
-                                      "threshold","weights_json","must","nice","forbid",
-                                      "pass_count","review_count","pass_rate",
-                                      "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"]
-        self._ensure_worksheet(ws, headers)
-        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-        r = requests.get(url, headers=self._hed()).json()
-        vals = r.get("values", [])
-        run_id = max(1, len(vals))  # naive id
-
-        tab = f"run_{run_id}_{(meta.get('company') or '')[:30]}_{(meta.get('project') or '')[:30]}"
-        self._ensure_worksheet(tab, ["Results"])
-        try:
-            df = pd.read_csv(pd.io.common.BytesIO(result_csv_bytes))
-            vals2 = [list(df.columns)] + df.astype(object).where(pd.notna(df), "").values.tolist()
-            self._update_range(tab, "A1", vals2)
-        except Exception:
-            tab = ""
-
-        row = [
-            run_id, meta.get("company"), meta.get("client"), meta.get("project"),
-            meta.get("date_submitted"), meta.get("quote"), meta.get("notes"),
-            meta.get("threshold"), json.dumps(meta.get("weights", {})),
-            meta.get("must"), meta.get("nice"), meta.get("forbid"),
-            meta.get("pass_count"), meta.get("review_count"), float(meta.get("pass_rate",0.0)),
-            tab, spec_excerpt, sub_excerpt, datetime.utcnow().isoformat()
-        ]
-        self._append_rows(ws, [row])
-        return run_id
-
-    def list_submittals(self) -> pd.DataFrame:
-        ws = "submittals"; headers = ["id","company","client","project","date_submitted","quote","notes",
-                                      "threshold","weights_json","must","nice","forbid",
-                                      "pass_count","review_count","pass_rate",
-                                      "result_sheet_name","spec_excerpt","submittal_excerpt","created_at"]
-        self._ensure_worksheet(ws, headers)
-        url = f"{self.base}/me/drive/items/{self._get_workbook_id()}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-        r = requests.get(url, headers=self._hed()).json()
-        vals = r.get("values", [])
-        if len(vals) <= 1:
-            return pd.DataFrame(columns=["id","company","client","project","date_submitted","quote",
-                                         "pass_count","review_count","pass_rate","threshold","created_at"])
-        df = pd.DataFrame(vals[1:], columns=vals[0])
-        for c in ["id","pass_count","review_count","threshold"]:
-            if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-        if "pass_rate" in df.columns: df["pass_rate"] = pd.to_numeric(df["pass_rate"], errors="coerce").fillna(0.0)
-        return df[["id","company","client","project","date_submitted","quote",
-                   "pass_count","review_count","pass_rate","threshold","created_at"]]
-
-    def get_submittal(self, id_: int) -> dict:
-        df = self.list_submittals()
-        try:
-            return df[df["id"]==int(id_)].iloc[0].to_dict()
-        except Exception:
-            return {}
-
-    def delete_submittal(self, id_: int) -> None:
-        pass
-
-    def open_url_hint(self, rec: dict) -> str | None:
-        return "https://www.office.com/launch/excel"
-
-def get_backend(kind: str) -> StorageBackend:
-    """Create a backend instance.
-
-    NOTE: OAuth-backed backends are intentionally NOT cached because their behavior depends
-    on per-session OAuth tokens stored in st.session_state.
-    """
-    if kind in (BACKEND_GS_OAUTH, BACKEND_MS_OAUTH):
-        title = get_secret("sheets.title", "SubmittalCheckerData")
-        if kind == BACKEND_GS_OAUTH:
-            return GoogleSheetsOAuth(title)
-        return MSExcelOAuth(title)
-    return _get_backend_cached(kind)
-
-@st.cache_resource
-def _get_backend_cached(kind: str) -> StorageBackend:
-    title = get_secret("sheets.title", "SubmittalCheckerData")
-    if kind == BACKEND_GS_SERVICE:
-        return GoogleSheetsSA(title)
-    data_dir = os.path.join(os.path.dirname(__file__), "data")
-    os.makedirs(data_dir, exist_ok=True)
-    return SQLiteBackend(os.path.join(data_dir, "checker.db"))
-
-# Thin wrappers
-
-def get_backend_choice() -> StorageBackend:
-    """Return the backend instance for the current selection.
-
-    OAuth backends require the user to sign in first. If the user hasn't signed in yet,
-    we keep the app usable by temporarily falling back to SQLite. Once sign-in completes,
-    this will automatically switch to the selected OAuth backend.
-    """
-    selected_key = st.session_state.get("__backend_choice__", BACKEND_SQLITE)
-
-    # Decide what we can actually instantiate right now.
-    effective_key = selected_key
-    if selected_key == BACKEND_GS_OAUTH and google_credentials() is None:
-        st.sidebar.warning("Google not signed in. Click **Sign in** above, then return here.")
-        effective_key = BACKEND_SQLITE
-    elif selected_key == BACKEND_MS_OAUTH and not ms_access_token():
-        st.sidebar.warning("Microsoft not signed in. Click **Sign in** above, then return here.")
-        effective_key = BACKEND_SQLITE
-
-    # Reuse existing instance if it matches what we'd instantiate now.
-    inst = st.session_state.get("__backend_instance__")
-    inst_effective = st.session_state.get("__backend_effective_kind__")
-    if inst is not None and inst_effective == effective_key:
-        return inst
-
-    try:
-        inst = get_backend(effective_key)
-    except Exception as e:
-        st.sidebar.error(f"Backend error: {e}")
-        inst = get_backend(BACKEND_SQLITE)
-        effective_key = BACKEND_SQLITE
-
-    st.session_state["__backend_instance__"] = inst
-    st.session_state["__backend_effective_kind__"] = effective_key
-    return inst
-def db_save_preset(b: StorageBackend, name: str, payload: dict): return b.save_preset(name, payload)
-def db_load_presets(b: StorageBackend) -> dict:
-    """Load presets safely.
-
-    Cloud storage backends can fail if OAuth is signed in but the workbook/sheet isn't ready yet.
-    In that case we return an empty dict and let the page show a friendly prompt.
-    """
-    try:
-        return b.load_presets()
-    except Exception as e:
-        st.warning(f"Couldn't load presets from the selected storage yet: {e}")
-        return {}
-
-def db_delete_preset(b: StorageBackend, name: str): return b.delete_preset(name)
-def db_save_submittal(b: StorageBackend, meta: dict, csv_bytes: bytes, spec_excerpt: str, sub_excerpt: str) -> int:
-    return b.save_submittal(meta, csv_bytes, spec_excerpt, sub_excerpt)
-def db_list_submittals(b: StorageBackend) -> pd.DataFrame: return b.list_submittals()
-def db_get_submittal(b: StorageBackend, id_: int) -> dict: return b.get_submittal(id_)
-def db_delete_submittal(b: StorageBackend, id_: int): return b.delete_submittal(id_)
-def db_open_url_hint(b: StorageBackend, rec: dict) -> str | None: return b.open_url_hint(rec)
-
-
-# RFI wrappers
-
-def db_upsert_rfi(b: StorageBackend, row: dict) -> int:
-    return b.upsert_rfi(row)
-
-def db_list_rfis(b: StorageBackend, limit: int = 5000) -> pd.DataFrame:
-    return b.list_rfis(limit=limit)
-
-def db_get_rfi(b: StorageBackend, id_: int) -> dict:
-    return b.get_rfi(id_)
-
-def db_delete_rfi(b: StorageBackend, id_: int) -> None:
-    return b.delete_rfi(id_)
-
-# -------------------------
-# Tiny settings helper (piggyback on presets table)
-# -------------------------
-_APP_SETTINGS_KEY = "__app_settings__"
-
-
-def db_add_rfi_links(backend: StorageBackend, rfi_id: int, urls: list[str]):
-    fn = getattr(backend, "add_rfi_links", None)
-    if not callable(fn):
-        return
-    fn(rfi_id, urls)
-
-def db_list_rfi_links(backend: StorageBackend, rfi_id: int) -> list[dict]:
-    fn = getattr(backend, "list_rfi_links", None)
-    if not callable(fn):
-        return []
-    return fn(rfi_id)
-
-def db_delete_rfi_link(backend: StorageBackend, link_id: int):
-    fn = getattr(backend, "delete_rfi_link", None)
-    if not callable(fn):
-        return
-    fn(link_id)
-
-def db_add_rfi_attachments(backend: StorageBackend, rfi_id: int, files: list[dict]):
-    fn = getattr(backend, "add_rfi_attachments", None)
-    if not callable(fn):
-        return
-    fn(rfi_id, files)
-
-def db_list_rfi_attachments(backend: StorageBackend, rfi_id: int) -> list[dict]:
-    fn = getattr(backend, "list_rfi_attachments", None)
-    if not callable(fn):
-        return []
-    return fn(rfi_id)
-
-def db_get_rfi_attachment_data(backend: StorageBackend, attachment_id: int) -> tuple[str, str, bytes] | None:
-    fn = getattr(backend, "get_rfi_attachment_data", None)
-    if not callable(fn):
-        return None
-    return fn(attachment_id)
-
-def db_delete_rfi_attachment(backend: StorageBackend, attachment_id: int):
-    fn = getattr(backend, "delete_rfi_attachment", None)
-    if not callable(fn):
-        return
-    fn(attachment_id)
-
-def settings_load(backend: StorageBackend) -> dict:
-    try:
-        presets = db_load_presets(backend)
-        return presets.get(_APP_SETTINGS_KEY, {})
-    except Exception:
-        return {}
-
-def settings_save(backend: StorageBackend, s: dict) -> None:
-    try:
-        db_save_preset(backend, _APP_SETTINGS_KEY, s)
-    except Exception as e:
-        st.warning(f"Could not persist settings: {e}")
-
-# -------------------------
-# Email senders: SendGrid (preferred) or SMTP
-# Configure one of:
-#   st.secrets["sendgrid"]["api_key"]
-#   st.secrets["smtp"] = {"host": "...", "port": 587, "user": "...", "password": "...", "from": "App <app@domain>"}
-# -------------------------
-def send_email(recipients: list[str], subject: str, html_body: str, attachments: list[tuple[str, bytes]] | None = None) -> tuple[bool,str]:
-    # Try SendGrid
-    sg = st.secrets.get("sendgrid")
-    if sg and sg.get("api_key"):
-        try:
-            import base64, requests
-            data = {
-                "personalizations": [{"to": [{"email": r} for r in recipients]}],
-                "from": {"email": sg.get("from_email", "no-reply@example.com"), "name": sg.get("from_name", "FieldFlow")},
-                "subject": subject,
-                "content": [{"type": "text/html", "value": html_body}],
-            }
-            if attachments:
-                data["attachments"] = [
-                    {"content": base64.b64encode(b).decode("ascii"), "type": "text/csv", "filename": fn}
-                    for (fn, b) in attachments
-                ]
-            r = requests.post(
-                "https://api.sendgrid.com/v3/mail/send",
-                headers={"Authorization": f"Bearer {sg['api_key']}", "Content-Type": "application/json"},
-                data=json.dumps(data),
-                timeout=20,
-            )
-            if r.status_code in (200, 202):
-                return True, "sent via SendGrid"
-            return False, f"SendGrid HTTP {r.status_code}: {r.text[:200]}"
-        except Exception as e:
-            return False, f"SendGrid error: {e}"
-
-    # Fallback SMTP
-    smtp = st.secrets.get("smtp")
-    if smtp:
-        try:
-            import smtplib
-            from email.mime.multipart import MIMEMultipart
-            from email.mime.text import MIMEText
-            from email.mime.base import MIMEBase
-            from email import encoders
-
-            msg = MIMEMultipart()
-            msg["From"] = smtp.get("from", smtp.get("user", "no-reply@example.com"))
-            msg["To"] = ", ".join(recipients)
-            msg["Subject"] = subject
-            msg.attach(MIMEText(html_body, "html"))
-
-            for (filename, bytes_) in attachments or []:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(bytes_)
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-                msg.attach(part)
-
-            server = smtplib.SMTP(smtp["host"], int(smtp.get("port", 587)))
-            server.starttls()
-            server.login(smtp["user"], smtp["password"])
-            server.sendmail(smtp.get("from", smtp["user"]), recipients, msg.as_string())
-            server.quit()
-            return True, "sent via SMTP"
-        except Exception as e:
-            return False, f"SMTP error: {e}"
-
-    return False, "No email provider configured (set sendgrid.api_key or smtp.* in st.secrets)"
-
-
-# -------------------------
-# RFI helpers (PDF + email)
-# -------------------------
-
-def parse_emails(s: str) -> list[str]:
-    parts = re.split(r"[;,\s]+", (s or "").strip())
-    out = []
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        if "@" in p and "." in p:
-            out.append(p)
-    # de-dup, preserve order
-    seen = set(); dedup = []
-    for e in out:
-        if e.lower() in seen:
-            continue
-        seen.add(e.lower()); dedup.append(e)
-    return dedup
-
-
-def generate_rfi_pdf(rfi: dict) -> bytes:
-    """Create a simple one-page PDF for an RFI."""
-    try:
-        from reportlab.lib.pagesizes import LETTER
-        from reportlab.pdfgen import canvas
-    except Exception as e:
-        raise RuntimeError("Missing reportlab. Add it to requirements.txt") from e
-
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=LETTER)
-    w, h = LETTER
-
-    def draw_label_value(y, label, value):
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(40, y, label)
-        c.setFont("Helvetica", 10)
-        c.drawString(150, y, (value or "—")[:120])
-        return y - 14
-
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, h - 50, "Request for Information (RFI)")
-
-    y = h - 80
-    y = draw_label_value(y, "RFI ID:", str(rfi.get("id") or "—"))
-    y = draw_label_value(y, "Project:", rfi.get("project"))
-    y = draw_label_value(y, "Subject:", rfi.get("subject"))
-    y = draw_label_value(y, "Discipline:", rfi.get("discipline"))
-    y = draw_label_value(y, "Spec Section:", rfi.get("spec_section"))
-    y = draw_label_value(y, "Priority:", rfi.get("priority"))
-    y = draw_label_value(y, "Status:", rfi.get("status"))
-    y = draw_label_value(y, "Due Date:", rfi.get("due_date"))
-    y = draw_label_value(y, "Assignee:", rfi.get("assignee_email"))
-
-    y -= 8
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(40, y, "Question")
-    y -= 14
-    c.setFont("Helvetica", 10)
-
-    question = (rfi.get("question") or "").strip() or "—"
-    # Simple wrapping
-    max_chars = 95
-    lines = []
-    for para in question.splitlines():
-        para = para.strip()
-        if not para:
-            lines.append("")
-            continue
-        while len(para) > max_chars:
-            cut = para.rfind(" ", 0, max_chars)
-            if cut < 20:
-                cut = max_chars
-            lines.append(para[:cut].strip())
-            para = para[cut:].strip()
-        lines.append(para)
-
-    for ln in lines[:35]:
-        c.drawString(50, y, ln)
-        y -= 12
-        if y < 80:
-            break
-
-    c.setFont("Helvetica-Oblique", 8)
-    c.drawString(40, 40, "Generated by FieldFlow")
-    c.showPage()
-    c.save()
-
-    return buf.getvalue()
-
-
-def rfi_email_html(rfi: dict) -> str:
-    esc = lambda s: (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-    q_html = esc(rfi.get("question") or "").replace("\n", "<br/>")
-    return f"""
-    <h3>RFI #{esc(str(rfi.get('id') or ''))} — {esc(rfi.get('subject') or '')}</h3>
-    <p><b>Project:</b> {esc(rfi.get('project') or '')}<br/>
-       <b>Discipline:</b> {esc(rfi.get('discipline') or '')}<br/>
-       <b>Spec Section:</b> {esc(rfi.get('spec_section') or '')}<br/>
-       <b>Priority:</b> {esc(rfi.get('priority') or '')}<br/>
-       <b>Due:</b> {esc(rfi.get('due_date') or '')}</p>
-    <p><b>Question</b><br/>{q_html}</p>
-    <p style='color:#666'>Sent from FieldFlow</p>
-    """
-
-def apply_rfi_impacts(tasks_df: pd.DataFrame, rfis_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Apply schedule impact days from open RFIs to a tasks table.
-
-    Expects rfis_df to have columns: related_tasks, schedule_impact_days, status, id.
-    Returns: (modified tasks_df, impacts_df)
-    """
-    if tasks_df is None or tasks_df.empty:
-        return tasks_df, pd.DataFrame()
-    if rfis_df is None or rfis_df.empty:
-        return tasks_df, pd.DataFrame()
-
-    tasks = tasks_df.copy()
-    if "RFI_Impact_Days" not in tasks.columns:
-        tasks["RFI_Impact_Days"] = 0
-
-    impacts = []
-    for _, r in rfis_df.iterrows():
-        try:
-            days = int(float(r.get("schedule_impact_days") or 0))
-        except Exception:
-            days = 0
-        if days <= 0:
-            continue
-        rel = str(r.get("related_tasks") or "").strip()
-        if not rel:
-            continue
-        task_names = [t.strip() for t in rel.split(",") if t.strip()]
-        if not task_names:
-            continue
-
-        # Distribute evenly (integer days) across listed tasks.
-        per = max(1, days // len(task_names))
-        remainder = days - per * len(task_names)
-
-        for i, tname in enumerate(task_names):
-            add = per + (1 if i < remainder else 0)
-            mask = tasks["Task"].astype(str) == tname
-            if mask.any():
-                tasks.loc[mask, "RFI_Impact_Days"] = tasks.loc[mask, "RFI_Impact_Days"] + add
-                impacts.append({
-                    "rfi_id": r.get("id"),
-                    "task": tname,
-                    "added_days": add,
-                    "status": r.get("status"),
-                    "subject": r.get("subject"),
-                })
-
-    if impacts:
-        # Preserve original duration if needed
-        if "Duration_Base" not in tasks.columns:
-            tasks["Duration_Base"] = tasks["Duration"]
-        tasks["Duration"] = (pd.to_numeric(tasks["Duration"], errors="coerce").fillna(0).astype(int) +
-                              pd.to_numeric(tasks["RFI_Impact_Days"], errors="coerce").fillna(0).astype(int))
-
-    return tasks, pd.DataFrame(impacts)
-
-# -------------------------
-# Feedback digest (pull, filter, summarize)
-# -------------------------
-def make_feedback_digest_df(backend: StorageBackend, period: str = "last_30_days") -> pd.DataFrame:
-    # Grab a lot, then filter locally (keeps backend API simple)
-    df = backend.list_feedback(limit=10000) if hasattr(backend, "list_feedback") else pd.DataFrame()
-    if df.empty:
-        return df
-    # Normalize
-    if "created_at" in df.columns:
-        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
-    else:
-        df["created_at"] = pd.Timestamp.utcnow()
-
-    now = pd.Timestamp.utcnow()
-    if period == "this_month":
-        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    elif period == "last_month":
-        start = (now.replace(day=1) - pd.offsets.MonthBegin(1))
-        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return df[(df["created_at"] >= start) & (df["created_at"] < end)].copy()
-    else:  # last_30_days
-        start = now - pd.Timedelta(days=30)
-    return df[df["created_at"] >= start].copy()
-
-def summarize_feedback(df: pd.DataFrame) -> dict:
-    if df.empty:
-        return {"count": 0, "avg_rating": None, "by_page": {}, "top_words": []}
-    count = len(df)
-    avg = float(pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(0).mean())
-    by_page = df.groupby("page")["rating"].mean().round(2).to_dict()
-
-    # naive “top words” from message
-    all_text = " ".join(df.get("message", "").astype(str).tolist()).lower()
-    tokens = re.findall(r"[a-z]{3,}", all_text)
-    stop = set("the and for with this that you your are was were have has but not into from out too very more some much they them can like just get make".split())
-    freq = {}
-    for t in tokens:
-        if t in stop: continue
-        freq[t] = freq.get(t, 0) + 1
-    top_words = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:15]
-    return {"count": count, "avg_rating": avg, "by_page": by_page, "top_words": top_words}
-
-
-# =========================
-# Sidebar: storage + auth
-# =========================
-from pathlib import Path
-import streamlit as st
-
-# Tighter sidebar padding so the logo sits higher.
-st.markdown(
-    """
-<style>
-section[data-testid='stSidebar'] div.block-container { padding-top: 0.5rem; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-LOGO_PATH = Path(__file__).parent / "assets" / "FieldFlow_logo.png"
-
-if LOGO_PATH.exists():
-    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
-else:
-    st.sidebar.write("FieldFlow")  # fallback
-
-st.sidebar.title("FieldFlow")
-st.sidebar.subheader("Storage")
-
-backend_choice = st.sidebar.selectbox(
-    "Save presets & memory bank to",
-    BACKEND_CHOICES,
-    index=BACKEND_CHOICES.index(_ensure_ss("__backend_choice__", BACKEND_SQLITE)),
-)
-st.session_state["__backend_choice__"] = backend_choice
-
-def _badge(ok): return "🟢 signed in" if ok else "⚪ not signed in"
-
-if backend_choice == BACKEND_GS_OAUTH:
-    st.sidebar.write("Google: " + _badge("__google_user__" in st.session_state))
-    colA, colB = st.sidebar.columns(2)
-    if colA.button("Sign in"):
-        st.session_state["__do_google_oauth__"] = True
-        st.rerun()
-    if colB.button("Sign out"):
-        for k in ["__google_token__","__google_user__","__google_flow__","__google_state__"]:
-            st.session_state.pop(k, None)
-        st.success("Signed out of Google.")
-elif backend_choice == BACKEND_MS_OAUTH:
-    st.sidebar.write("Microsoft: " + _badge("__ms_user__" in st.session_state))
-    colA, colB = st.sidebar.columns(2)
-    if colA.button("Sign in"):
-        st.session_state["__do_ms_oauth__"] = True
-        st.rerun()
-    if colB.button("Sign out"):
-        for k in ["__ms_token__","__ms_user__","__ms_state__"]:
-            st.session_state.pop(k, None)
-        st.success("Signed out of Microsoft.")
-
-# Handle OAuth flows
-if st.session_state.get("__do_google_oauth__"):
-    st.session_state.pop("__do_google_oauth__", None)
-    google_oauth_start()
-    st.stop()
-elif st.session_state.get("__do_ms_oauth__"):
-    st.session_state.pop("__do_ms_oauth__", None)
-    ms_oauth_start()
-    st.stop()
-else:
-    code = _qp_value(st.query_params, "code")
-    state = _qp_value(st.query_params, "state")
-    if code and state:
-        handled = False
-
-        # Use state prefixes to avoid "Google handler tries to redeem Microsoft code" chaos.
-        if isinstance(state, str) and state.startswith("g_"):
-            try:
-                handled = bool(google_oauth_callback())
-            except Exception as e:
-                st.sidebar.warning(f"Google OAuth callback failed: {e}")
-        elif isinstance(state, str) and state.startswith("m_"):
-            try:
-                handled = bool(ms_oauth_callback())
-            except Exception as e:
-                st.sidebar.warning(f"Microsoft OAuth callback failed: {e}")
-        else:
-            # Back-compat: if state isn't prefixed, attempt both but don't crash.
-            try:
-                handled = bool(google_oauth_callback()) or handled
-            except Exception as e:
-                st.sidebar.warning(f"Google OAuth callback failed: {e}")
-            try:
-                handled = bool(ms_oauth_callback()) or handled
-            except Exception as e:
-                st.sidebar.warning(f"Microsoft OAuth callback failed: {e}")
-
-        if handled:
-            st.rerun()
-
-
-from pathlib import Path as _Path
-
-def render_sidebar(active_page: str = "Home"):
-    """Shared sidebar: logo + storage selection + OAuth sign-in + basic help.
-    Call this at the top of every page.
-    """
-    # Keep sidebar padding tight so the logo sits closer to the top
-    st.markdown("""
-    <style>
-      [data-testid="stSidebar"] > div:first-child { padding-top: 0.5rem; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Optional security layer (only if a local security.py exists)
-    try:
-        import security  # local module
-        security.require_passcode()
-        security.secure_mode_banner()
-        security.purge_button()
-    except Exception:
-        pass
-
-    # --- Logo (make it robust to filename case/extension) ---
-    assets_dir = _Path(__file__).parent / 'assets'
-    logo_candidates = [
-        'FieldFlow_logo.png', 'FieldFlow_logo.PNG',
-        'FieldFlow_logo.jpg', 'FieldFlow_logo.jpeg',
-    ]
-    for nm in logo_candidates:
-        lp = assets_dir / nm
-        if lp.exists():
-            st.sidebar.image(str(lp), use_container_width=True)
-            break
-
-    st.sidebar.markdown("## FieldFlow")
-
-    # --- OAuth callbacks (must run on every page because redirect lands on *a page*) ---
-    handled = False
-    try:
-        handled = bool(google_oauth_callback()) or handled
-    except Exception as e:
-        st.sidebar.warning(f"Google OAuth callback failed: {e}")
-    try:
-        handled = bool(ms_oauth_callback()) or handled
-    except Exception as e:
-        st.sidebar.warning(f"Microsoft OAuth callback failed: {e}")
-
-    if handled:
-        st.rerun()
-
-    # --- Sign-in / sign-out ---
-    st.sidebar.markdown("### Sign in")
-    colg, colm = st.sidebar.columns(2)
-    with colg:
-        if st.button("Google", use_container_width=True):
-            google_oauth_start()
-    with colm:
-        if st.button("Microsoft", use_container_width=True):
-            ms_oauth_start()
-
-    # Signed-in status + sign-out
-    g_ok = google_credentials() is not None
-    m_ok = bool(ms_access_token())
-
-    if g_ok:
-        st.sidebar.success("Google: signed in")
-    else:
-        st.sidebar.info("Google: not signed in")
-
-    if m_ok:
-        st.sidebar.success("Microsoft: signed in")
-    else:
-        st.sidebar.info("Microsoft: not signed in")
-
-    colso1, colso2 = st.sidebar.columns(2)
-    with colso1:
-        if g_ok and st.button("Sign out Google", use_container_width=True):
-            for k in ["__google_token__", "__google_state__", "__google_code_verifier__"]:
-                st.session_state.pop(k, None)
-            # Clear query params so we don't re-process callback on rerun
-            try:
-                st.query_params.clear()
-            except Exception:
-                pass
-            st.rerun()
-    with colso2:
-        if m_ok and st.button("Sign out Microsoft", use_container_width=True):
-            for k in ["__ms_token__", "__ms_state__", "__ms_code_verifier__", "__ms_workbook_id__"]:
-                st.session_state.pop(k, None)
-            try:
-                st.query_params.clear()
-            except Exception:
-                pass
-            st.rerun()
-
-    # One-time Microsoft workbook init (prevents quotaLimitReached on reruns)
-    if m_ok:
-        with st.sidebar.expander("Microsoft workbook (OneDrive)", expanded=False):
-            wb_id = st.session_state.get("__ms_workbook_id__")
-            if wb_id:
-                st.caption("Workbook initialized ✅")
-            else:
-                st.caption("Workbook not initialized yet.")
-                if st.button("Initialize OneDrive workbook", use_container_width=True):
-                    try:
-                        cfg = get_secret("sheets", {})
-                        title = cfg.get("title") or "FieldFlow"
-                        b = MSExcelOAuth(title)
-                        wid = b._ensure_workbook()
-                        st.session_state["__ms_workbook_id__"] = wid
-                        st.success("Workbook created and cached for this session.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Workbook init failed: {e}")
-# --- Storage backend selection ---
-    st.sidebar.markdown("### Storage")
-    options = [
-        (BACKEND_SQLITE, "Local (SQLite)"),
-        (BACKEND_GS_SERVICE, "Google Sheets (Service Account)"),
-        (BACKEND_GS_OAUTH, "Google Sheets (OAuth)"),
-        (BACKEND_MS_OAUTH, "Microsoft 365 Excel (OAuth)"),
-    ]
-    labels = [label for _, label in options]
-    key_to_idx = {k: i for i, (k, _) in enumerate(options)}
-    current = st.session_state.get("__backend_choice__", BACKEND_SQLITE)
-    idx = key_to_idx.get(current, 0)
-    chosen_label = st.sidebar.selectbox("Where to save data", labels, index=idx)
-    chosen_key = dict(options)[chosen_label]
-    st.session_state["__backend_choice__"] = chosen_key
-
-    # Helpful hint: show effective backend (OAuth falls back to SQLite until signed in)
-    eff = chosen_key
-    if chosen_key == BACKEND_GS_OAUTH and google_credentials() is None:
-        eff = BACKEND_SQLITE
-    if chosen_key == BACKEND_MS_OAUTH and not ms_access_token():
-        eff = BACKEND_SQLITE
-    st.sidebar.caption(f"Effective backend: **{eff}**")
-
-    # --- Navigation hint (since we're using Streamlit multipage) ---
-    st.sidebar.markdown("---")
-    st.sidebar.caption(f"Page: **{active_page}**")
-    st.sidebar.caption("Use the left nav (pages) to switch tools.")
-
-
-def submittal_checker_page():
-    backend = get_backend_choice()
-    st.header("Submittal Checker")
-
-    # Readers
-    try:
-        from rapidfuzz import fuzz
-    except Exception:
-        st.error("Missing dependency `rapidfuzz`. pip install rapidfuzz")
-        return
-    try:
-        from pypdf import PdfReader
-    except Exception:
-        PdfReader = None
-    try:
-        import docx
-    except Exception:
-        docx = None
-
-    def _read_pdf(file: io.BytesIO) -> str:
-        if not PdfReader: return ""
-        reader = PdfReader(file)
-        parts = []
-        for p in reader.pages:
-            try: parts.append(p.extract_text() or "")
-            except Exception: pass
-        return "\n".join(parts)
-
-    def _read_docx(file: io.BytesIO) -> str:
-        if not docx: return ""
-        d = docx.Document(file)
-        return "\n".join(p.text for p in d.paragraphs)
-
-    def _read_txt(file: io.BytesIO) -> str:
-        return file.read().decode(errors="ignore")
-
-    def _read_csv(file: io.BytesIO) -> str:
-        df = pd.read_csv(file)
-        strings = []
-        for col in df.columns:
-            try: strings.extend(df[col].astype(str).tolist())
-            except: pass
-        return "\n".join(strings)
-
-    def read_any(uploaded) -> str:
-        name = (getattr(uploaded, "name","") or "").lower()
-        raw_bytes = uploaded.read()
-        data = io.BytesIO(raw_bytes)
-
-        # primary text extraction
-        if name.endswith(".pdf"):
-            base = _read_pdf(data)
-            # OCR fallback
-            if use_ocr and (not base or len(base.strip()) < 40):
-                base = ocr_pdf_to_text(io.BytesIO(raw_bytes)) or base
-            # tables
-            tabtxt = tabula_tables_to_text(io.BytesIO(raw_bytes)) if use_table else ""
-            return (base + "\n\n" + tabtxt).strip()
-        if name.endswith(".docx"): return _read_docx(data)
-        if name.endswith(".txt"):  return _read_txt(data)
-        if name.endswith(".csv"):  return _read_csv(data)
-        raise ValueError(f"Unsupported file: {name}")
-
-    BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+[.)]|[A-Z]\.|[A-Z]\))\s+")
-    HEADER_RE = re.compile(r"^(?:PART|SECTION|DIVISION|SUBMITTALS?|WARRANTY|SHOP DRAWINGS)\b", re.I)
-    def clean_text(t: str) -> str:
-        t = re.sub(r"\r","\n", t)
-        t = re.sub(r"\n{2,}","\n", t)
-        return t.strip()
-    def split_into_chunks(t: str) -> List[str]:
-        lines = [ln.strip() for ln in t.split("\n")]
-        chunks, acc = [], []
-        def flush():
-            if acc:
-                s = " ".join(acc).strip()
-                if s: chunks.append(s)
-                acc.clear()
-        for ln in lines:
-            if not ln:
-                flush(); continue
-            if BULLET_RE.search(ln) or HEADER_RE.search(ln):
-                flush(); chunks.append(ln); continue
-            acc.append(ln)
-        flush()
-        seen, out = set(), []
-        for c in chunks:
-            k = c.lower()
-            if k not in seen:
-                out.append(c); seen.add(k)
-        return out
-
-    # Presets + defaults
-    DEFAULTS = {
-        "must": "data sheet,warranty,certificate",
-        "nice": "shop drawing,test report,O&M manual",
-        "forbid": "by others,not provided,N/A",
-        "weights": {"alpha":0.45,"beta":0.35,"gamma":0.20,"delta":0.20,"epsilon":0.05},
-        "threshold": 85,
-    }
-    def _apply_preset(p):
-        st.session_state["kw_must"] = p.get("must", DEFAULTS["must"])
-        st.session_state["kw_nice"] = p.get("nice", DEFAULTS["nice"])
-        st.session_state["kw_forbid"] = p.get("forbid", DEFAULTS["forbid"])
-        w = p.get("weights", DEFAULTS["weights"])
-        st.session_state["w_alpha"] = float(w.get("alpha", DEFAULTS["weights"]["alpha"]))
-        st.session_state["w_beta"] = float(w.get("beta", DEFAULTS["weights"]["beta"]))
-        st.session_state["w_gamma"] = float(w.get("gamma", DEFAULTS["weights"]["gamma"]))
-        st.session_state["w_delta"] = float(w.get("delta", DEFAULTS["weights"]["delta"]))
-        st.session_state["w_epsilon"] = float(w.get("epsilon", DEFAULTS["weights"]["epsilon"]))
-        st.session_state["hybrid_threshold"] = int(p.get("threshold", DEFAULTS["threshold"]))
-        st.rerun()
-    if "kw_must" not in st.session_state:
-        _apply_preset(DEFAULTS)
-
-    # Sources
-    cL, cR = st.columns(2)
-    with cL:
-        st.subheader("Spec Source")
-        spec_file = st.file_uploader("Upload spec (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="spec_file")
-        spec_text_area = st.text_area("Or paste spec text", height=220, placeholder="Paste specification clauses…", key="spec_text")
-    with cR:
-        st.subheader("Submittal Source")
-        sub_file = st.file_uploader("Upload submittal (PDF/DOCX/TXT/CSV)", type=["pdf","docx","txt","csv"], key="sub_file")
-        sub_text_area = st.text_area("Or paste submittal text", height=220, placeholder="Paste submittal content…", key="sub_text")
-
-    st.markdown("---")
-    with st.expander("Reviewer policy, keywords & weights", expanded=False):
-        # Presets
-        row1 = st.columns([0.35,0.2,0.2,0.25])
-        try:
-            presets = db_load_presets(backend)
-        except RuntimeError as e:
-            st.warning(str(e))
-            presets = {}
-        except Exception as e:
-            st.warning(f"Could not load presets: {e}")
-            presets = {}
-        with row1[0]:
-            sel = st.selectbox("Load preset", ["—"] + sorted(presets.keys()))
-        with row1[1]:
-            if st.button("Load"):
-                if sel != "—":
-                    _apply_preset(presets[sel])
-        with row1[2]:
-            if st.button("Reset"):
-                _apply_preset(DEFAULTS)
-        with row1[3]:
-            if sel != "—" and st.button("Delete preset"):
-                db_delete_preset(backend, sel); st.success(f"Deleted {sel}"); st.rerun()
-
-        cA, cB = st.columns(2)
-        with cA:
-            must_text = st.text_area("Must-have terms (comma-separated)",
-                                     st.session_state["kw_must"], key="kw_must",
-                                     help="All must appear in the best-matching submittal excerpt; otherwise PASS is blocked.")
-            nice_text = st.text_area("Nice-to-have terms",
-                                     st.session_state["kw_nice"], key="kw_nice",
-                                     help="Improves the coverage portion of the hybrid score.")
-        with cB:
-            forbid_text = st.text_area("Forbidden phrases",
-                                       st.session_state["kw_forbid"], key="kw_forbid",
-                                       help="Any hit blocks PASS and applies a penalty.")
-            st.caption("Forbidden always blocks PASS regardless of score.")
-
-        st.markdown("**Scoring weights**")
-        α = st.slider("Lexical weight", 0.0, 1.0, st.session_state["w_alpha"], 0.05, key="w_alpha",
-                      help="RapidFuzz token-set similarity of spec vs. submittal text (literal match strength).")
-        β = st.slider("Semantic weight", 0.0, 1.0, st.session_state["w_beta"], 0.05, key="w_beta",
-                      help="Embedding cosine similarity (meaning match). Uses sentence-transformers if available.")
-        γ = st.slider("Coverage weight", 0.0, 1.0, st.session_state["w_gamma"], 0.05, key="w_gamma",
-                      help="Coverage: 70% must + 30% nice. Encourages presence of reviewer keywords.")
-        δ = st.slider("Forbidden penalty per hit", 0.0, 1.0, st.session_state["w_delta"], 0.05, key="w_delta",
-                      help="Subtract this per forbidden phrase hit in the best match.")
-        ε = st.slider("Section boost (match)", 0.0, 0.5, st.session_state["w_epsilon"], 0.01, key="w_epsilon",
-                      help="Small bonus when headings align (e.g., Warranty vs. Warranty).")
-
-        row2 = st.columns([0.8,0.2])
-        with row2[0]:
-            pname = st.text_input("Preset name", placeholder="e.g., Div03_Concrete_ReviewerA")
-        with row2[1]:
-            if st.button("Save preset"):
-                payload = {
-                    "must": st.session_state["kw_must"],
-                    "nice": st.session_state["kw_nice"],
-                    "forbid": st.session_state["kw_forbid"],
-                    "weights": {"alpha":α, "beta":β, "gamma":γ, "delta":δ, "epsilon":ε},
-                    "threshold": st.session_state.get("hybrid_threshold", 85),
-                }
-                if not pname.strip():
-                    st.warning("Enter a preset name.")
-                else:
-                    db_save_preset(backend, pname.strip(), payload)
-                    st.success(f"Saved preset: {pname.strip()}"); st.rerun()
-
-    threshold = st.slider("Hybrid PASS threshold", 0, 100,
-                          st.session_state.get("hybrid_threshold", 85),
-                          help="Final decision threshold on the 0–100 hybrid score.")
-    st.markdown("---")
-    t1, t2, t3, t4 = st.columns(4)
-    use_ocr   = t1.checkbox("OCR if PDF text is empty", value=True,
-                            help="Try Tesseract when PDFs are scans.")
-    use_table = t2.checkbox("Extract tables", value=True,
-                            help="Use tabula to read embedded tables and index them.")
-    use_bm25  = t3.checkbox("BM25 boost", value=True,
-                            help="Lexical retriever for long clauses.")
-    use_sem   = t4.checkbox("Semantic embeddings", value=True,
-                            help="Use sentence-transformer embeddings if available")
-
-    run_btn = st.button("Analyze", type="primary")
-
-    if run_btn:
-            spec_text = ""
-            if spec_file: spec_text = read_any(spec_file)
-            if spec_text_area: spec_text = (spec_text + "\n" + spec_text_area).strip()
-
-            sub_text = ""
-            if sub_file: sub_text = read_any(sub_file)
-            if sub_text_area: sub_text = (sub_text + "\n" + sub_text_area).strip()
-
-            if not spec_text: st.warning("Provide spec text or upload a spec file."); st.stop()
-            if not sub_text: st.warning("Provide submittal text or upload a submittal file."); st.stop()
-
-            spec_text = clean_text(spec_text); sub_text = clean_text(sub_text)
-            spec_chunks = split_into_chunks(spec_text)
-            sub_chunks = split_into_chunks(sub_text)
-
-            # lexical + semantic(optional)
-            try:
-                from sentence_transformers import SentenceTransformer
-                model = SentenceTransformer("all-MiniLM-L6-v2")
-                emb_spec = model.encode(spec_chunks, show_progress_bar=False, normalize_embeddings=True)
-                emb_sub  = model.encode(sub_chunks, show_progress_bar=False, normalize_embeddings=True)
-                use_sem = True
-            except Exception:
-                use_sem = False
-
-            def section_of(s: str) -> str:
-                m = re.search(r"(WARRANTY|SUBMITTALS?|SHOP DRAWINGS|PRODUCT DATA|TESTS?)", s, re.I)
-                return (m.group(1).upper() if m else "")
-
-            must = [w.strip() for w in st.session_state["kw_must"].split(",") if w.strip()]
-            nice = [w.strip() for w in st.session_state["kw_nice"].split(",") if w.strip()]
-            forbid = [w.strip() for w in st.session_state["kw_forbid"].split(",") if w.strip()]
-
-            rows = []
-            for i, s in enumerate(spec_chunks):
-                s_norm = s.lower()
-                sec_s = section_of(s)
-                best_rf = -1.0; best_sem = 0.0; best_sec = 0.0
-                best_chunk = ""
-                for j, t in enumerate(sub_chunks):
-                    t_norm = t.lower()
-                    rf = float(fuzz.token_set_ratio(s_norm, t_norm)) / 100.0
-                    sem = float(np.dot(emb_spec[i], emb_sub[j])) if use_sem else 0.0
-                    sec_bonus = ε if (sec_s and sec_s == section_of(t)) else 0.0
-                    score = α*rf + β*sem + sec_bonus
-                    ref = α*best_rf + β*best_sem + best_sec
-                    if score > ref:
-                        best_rf, best_sem, best_sec, best_chunk = rf, sem, sec_bonus, t
-
-                # coverage / forbid
-                t_use = best_chunk.lower()
-                must_hits = sum(1 for w in must if w.lower() in t_use)
-                nice_hits = sum(1 for w in nice if w.lower() in t_use)
-                forb_hits = sum(1 for w in forbid if w.lower() in t_use)
-                must_cov = (must_hits / max(1, len(must))) if must else 0.0
-                nice_cov = (nice_hits / max(1, len(nice))) if nice else 0.0
-                coverage = 0.7*must_cov + 0.3*nice_cov
-
-                hybrid = α*best_rf + β*(best_sem if use_sem else 0.0) + γ*coverage + best_sec - δ*forb_hits
-                hybrid = max(0.0, min(1.0, hybrid))
-                exact_like = (s_norm in t_use) or (best_rf >= 0.97)
-                pass_logic = (exact_like or (hybrid*100 >= threshold)) and (must_hits == len(must)) and (forb_hits == 0)
-                decision = "PASS" if pass_logic else "REVIEW"
-
-                def hl(text: str, words: List[str], color: str) -> str:
-                    out = text
-                    for w in sorted(words, key=len, reverse=True):
-                        if not w: continue
-                        out = re.sub(rf"({re.escape(w)})", rf"<mark style='background:{color};padding:0 2px'>\1</mark>", out, flags=re.I)
-                    return out
-
-                best_chunk_html = hl(best_chunk, must, "#d1ffd1")
-                best_chunk_html = hl(best_chunk_html, nice, "#d1e8ff")
-                best_chunk_html = hl(best_chunk_html, forbid, "#ffd6d6")
-
-                rows.append({
-                    "Concept": " ".join(re.findall(r"[A-Za-z0-9-/]+", s)[:10]),
-                    "Spec Item": s,
-                    "Best Match": best_chunk,
-                    "Hybrid_Score": round(hybrid, 3),
-                    "Lexical": round(best_rf, 3),
-                    "Semantic": round(best_sem if use_sem else 0.0, 3),
-                    "Coverage": round(coverage, 3),
-                    "Must_hits": must_hits,
-                    "Nice_hits": nice_hits,
-                    "Forbidden_hits": forb_hits,
-                    "Section_bonus": round(best_sec, 3),
-                    "Exact_like": exact_like,
-                    "Decision": decision,
-                    "_best_chunk_html": best_chunk_html,
-                })
-
-            df = pd.DataFrame(rows)
-            pass_rate = (df["Decision"]=="PASS").mean() if not df.empty else 0.0
-
-            m1,m2,m3 = st.columns(3)
-            m1.metric("Coverage (PASS)", f"{pass_rate*100:.0f}%")
-            m2.metric("Threshold", threshold)
-            m3.metric("Items", len(df))
-
-            st.markdown("### Results")
-            df_show = df.drop(columns=["_best_chunk_html"])
-            df_fullwidth(df_show, hide_index=True, height=rows_to_height(len(df_show)+5))
-
-            st.markdown("### Best-match highlights")
-            for _, r in df.iterrows():
-                with st.expander(r["Concept"][:80] or r["Spec Item"][:80]):
-                    st.write("**Spec:** ", r["Spec Item"])
-                    st.write("**Decision:** ", r["Decision"], " — Hybrid: ", r["Hybrid_Score"])
-                    st.markdown(r["_best_chunk_html"], unsafe_allow_html=True)
-
-            csv_bytes = df_show.to_csv(index=False).encode()
-            st.download_button("Download results CSV", csv_bytes, "submittal_checker_results.csv", "text/csv")
-
-            # Memory Bank save
-            st.markdown("---")
-            st.subheader("Save to Memory Bank")
-            pass_count = int((df["Decision"]=="PASS").sum())
-            review_count = int((df["Decision"]=="REVIEW").sum())
-            meta_weights = {"alpha":α,"beta":β,"gamma":γ,"delta":δ,"epsilon":ε}
-
-            with st.form("save_run"):
-                c1,c2,c3 = st.columns(3)
-                company = c1.text_input("Company", "")
-                client  = c2.text_input("Client", "")
-                project = c3.text_input("Project", "")
-                c4,c5,c6 = st.columns(3)
-                date_submitted = c4.date_input("Date submitted", value=date.today())
-                quote = c5.number_input("Quote (if any)", min_value=0.0, value=0.0, step=1000.0)
-                notes = c6.text_input("Notes", "")
-                submit = st.form_submit_button("Save run")
-                if submit:
-                    if not company or not project:
-                        st.warning("Company and Project required.")
-                    else:
-                        run_id = db_save_submittal(
-                            backend,
-                            {
-                                "company":company,"client":client,"project":project,
-                                "date_submitted":str(date_submitted),"quote":float(quote),"notes":notes,
-                                "threshold":int(threshold),"weights":meta_weights,
-                                "must":",".join(must),"nice":",".join(nice),"forbid":",".join(forbid),
-                                "pass_count":pass_count,"review_count":review_count,"pass_rate":float(pass_rate),
-                            },
-                            csv_bytes,
-                            spec_text[:2000],
-                            sub_text[:2000],
-                        )
-                        st.success(f"Saved run #{run_id} ({company} – {project})")
-
-            st.subheader("Memory Bank")
-            bank = db_list_submittals(backend)
-            if bank.empty:
-                st.info("No saved runs yet.")
-            else:
-                fc1,fc2,fc3,fc4 = st.columns(4)
-                f_company = fc1.selectbox("Company", ["All"] + sorted(bank["company"].dropna().unique().tolist()))
-                f_project = fc2.selectbox("Project", ["All"] + sorted(bank["project"].dropna().unique().tolist()))
-                f_client  = fc3.selectbox("Client",  ["All"] + sorted(bank["client"].dropna().unique().tolist()))
-                sort_by   = fc4.selectbox("Sort by", ["created_at (new→old)","pass_rate (high→low)","date_submitted (new→old)"])
-                view = bank.copy()
-                if f_company!="All": view = view[view["company"]==f_company]
-                if f_project!="All": view = view[view["project"]==f_project]
-                if f_client!="All":  view = view[view["client"]==f_client]
-                if sort_by.startswith("pass_rate"): view = view.sort_values("pass_rate", ascending=False)
-                elif sort_by.startswith("date_submitted"): view = view.sort_values("date_submitted", ascending=False)
-                else: view = view.sort_values("created_at", ascending=False)
-                df_fullwidth(view.assign(PassPct=(view["pass_rate"]*100).round(1)).rename(columns={"PassPct":"Pass %"}),
-                             hide_index=True, height=rows_to_height(len(view)+5))
-                st.markdown("##### Inspect / Download a saved run")
-                sid = st.number_input("Run ID", min_value=0, step=1)
-                a,b,c = st.columns(3)
-                if a.button("View details"):
-                    rec = db_get_submittal(backend, int(sid))
-                    if not rec: st.warning("No such run.")
-                    else:
-                        st.json({k: rec.get(k) for k in ["id","company","client","project","date_submitted","quote","pass_count","review_count","pass_rate","threshold","created_at"]})
-                        st.code(rec.get("spec_excerpt") or "—", language="text")
-                        st.code(rec.get("submittal_excerpt") or "—", language="text")
-                        if "result_csv" in rec:  # SQLite path
-                            st.download_button("Download results CSV", rec["result_csv"], f"submittal_run_{rec['id']}.csv", "text/csv")
-                        else:
-                            st.caption("For Google/Microsoft backends, open the workspace to fetch results.")
-                        url = db_open_url_hint(backend, rec)
-                        if url: st.markdown(f"[Open in workspace]({url})")
-                if b.button("Delete"):
-                    db_delete_submittal(backend, int(sid)); st.success(f"Deleted run #{int(sid)}"); st.rerun()
-
-# =========================
-# Schedule What-Ifs (page)
-# =========================
-def schedule_whatifs_page():
-    backend = get_backend_choice()
-    st.header("Schedule What-Ifs — Floats + Calendar")
-
-    REQUIRED = ["Task","Duration","Predecessors","Normal_Cost_per_day","Crash_Cost_per_day"]
-    ALIASES: Dict[str,str] = {
-        "task":"Task","activity":"Task","name":"Task",
-        "duration":"Duration","duration_days":"Duration","duration_(days)":"Duration","dur":"Duration",
-        "predecessors":"Predecessors","pred":"Predecessors","predecessor":"Predecessors",
-        "normal_cost_per_day":"Normal_Cost_per_day","normal/day":"Normal_Cost_per_day","normal_cost/day":"Normal_Cost_per_day",
-        "normal_cost":"Normal_Cost_per_day","normal_cost_usd":"Normal_Cost_per_day",
-        "crash_cost_per_day":"Crash_Cost_per_day","crash/day":"Crash_Cost_per_day","crash_cost/day":"Crash_Cost_per_day",
-        "crash_cost":"Crash_Cost_per_day","crash_cost_usd":"Crash_Cost_per_day",
-        "min_duration":"Min_Duration","min_dur":"Min_Duration","min":"Min_Duration",
-        "crash_duration":"Min_Duration","crash_duration_days":"Min_Duration","crash_dur":"Min_Duration",
-        "overlap_ok":"Overlap_OK","overlap?":"Overlap_OK","allow_overlap":"Overlap_OK",
-    }
-
-    def norm_col(s: str) -> str:
-        s = str(s).strip().lower()
-        s = re.sub(r"[^a-z0-9]+","_", s)
-        return re.sub(r"_+","_", s).strip("_")
-
-    def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-        raw_to_norm = {c: norm_col(c) for c in df.columns}
-        rename_map = {}
-        for raw, norm in raw_to_norm.items():
-            if norm in ALIASES:
-                rename_map[raw] = ALIASES[norm]
-        return df.rename(columns=rename_map)
-
-    def load_csv(uploaded) -> Tuple[pd.DataFrame, List[str]]:
-        warnings: List[str] = []
-        raw = uploaded.getvalue()
-        df = pd.read_csv(io.BytesIO(raw))
-        df = canonicalize_columns(df)
-        if "Min_Duration" not in df.columns and "Duration" in df.columns:
-            df["Min_Duration"] = df["Duration"]; warnings.append("Min_Duration not provided; defaulting to Duration.")
-        if "Overlap_OK" not in df.columns:
-            df["Overlap_OK"] = False; warnings.append("Overlap_OK not provided; defaulting to False.")
-        for col in ["Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]:
-            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
-        if "Overlap_OK" in df.columns:
-            df["Overlap_OK"] = df["Overlap_OK"].astype(str).str.strip().str.lower().map(
-                {"1":True,"0":False,"true":True,"false":False,"yes":True,"no":False,"y":True,"n":False}
-            ).fillna(False)
-        if "Task" in df.columns: df["Task"] = df["Task"].astype(str)
-        if "Predecessors" in df.columns: df["Predecessors"] = df["Predecessors"].fillna("").astype(str)
-        if {"Duration","Min_Duration"} <= set(df.columns):
-            mask = df["Min_Duration"] > df["Duration"]
-            if mask.any():
-                warnings.append("Some rows have Min_Duration > Duration; clamping to Duration.")
-                df.loc[mask,"Min_Duration"] = df.loc[mask,"Duration"]
-        return df, warnings
-
-    # CPM with lags: FS/SS/FF + integer lag (±)
-    @dataclass
-    class CPMNode:
-        task: str
-        dur: int
-        preds: List[Tuple[str,str,int]]  # (pred, rel, lag)
-        es: int=0; ef: int=0; ls: int=0; lf: int=0; tf: int=0
-
-    def parse_predecessors(s: str) -> List[Tuple[str,str,int]]:
-        """
-        Accepts: "A", "A FS+0", "B SS+2; C FF-1"
-        Returns list of (pred_task, REL, lag_days)
-        """
-        if not s: return []
-        out = []
-        parts = [p.strip() for p in re.split(r"[;,]", s) if p.strip()]
-        for p in parts:
-            m = re.match(r"^(.+?)\s*(FS|SS|FF)?\s*([+\-]\d+)?$", p, re.I)
-            if m:
-                pred = m.group(1).strip()
-                rel  = (m.group(2) or "FS").upper()
-                lag  = int(m.group(3)) if m.group(3) else 0
-                out.append((pred, rel, lag))
-            else:
-                out.append((p, "FS", 0))
-        return out
-
-    def topological_order(nodes: Dict[str, CPMNode]) -> List[str]:
-        indeg = {k: 0 for k in nodes}
-        for n in nodes.values():
-            for p,_,_ in n.preds:
-                if p in indeg:
-                    indeg[n.task] += 1
-        Q = [k for k,d in indeg.items() if d==0]
-        order = []
-        while Q:
-            v = Q.pop(0); order.append(v)
-            for w in nodes:
-                if any(v==pp for pp,_,_ in nodes[w].preds):
-                    indeg[w]-=1
-                    if indeg[w]==0: Q.append(w)
-        if len(order)!=len(nodes):
-            raise ValueError("Dependency cycle detected. Check Predecessors.")
-        return order
-
-    def cpm_schedule(df: pd.DataFrame, overlap_frac: float=0.0, clamp_free_float: bool=True) -> Tuple[pd.DataFrame, int]:
-        nodes: Dict[str, CPMNode] = {}
-        for _, r in df.iterrows():
-            preds = parse_predecessors(r.get("Predecessors",""))
-            nodes[r["Task"]] = CPMNode(task=r["Task"], dur=int(max(0, r["Duration"])), preds=preds)
-
-        order = topological_order(nodes)
-
-        # Forward pass
-        for name in order:
-            node = nodes[name]
-            if not node.preds:
-                node.es = 0
-            else:
-                starts = []
-                for (p, rel, lag) in node.preds:
-                    if p not in nodes: raise ValueError(f"Unknown predecessor '{p}' for task '{name}'.")
-                    pred = nodes[p]
-                    if rel == "FS":
-                        base = pred.ef
-                        allow = bool(df.loc[df["Task"]==name, "Overlap_OK"].iloc[0]) if "Overlap_OK" in df.columns else False
-                        if allow and overlap_frac>0:
-                            base = max(0, pred.ef - int(round(overlap_frac*pred.dur)))
-                        starts.append(base + lag)
-                    elif rel == "SS":
-                        starts.append(pred.es + lag)
-                    elif rel == "FF":
-                        starts.append((pred.ef + lag) - node.dur)
-                    else:
-                        starts.append(pred.ef + lag)
-                node.es = max(starts)
-            node.ef = node.es + node.dur
-
-        project_duration = max((n.ef for n in nodes.values()), default=0)
-
-        # Successors
-        succs: Dict[str,List[str]] = {k:[] for k in nodes}
-        for t, n in nodes.items():
-            for (p,_,_) in n.preds:
-                if p in succs: succs[p].append(t)
-
-        # Backward pass
-        for name in reversed(order):
-            node = nodes[name]
-            succ_ls = [nodes[s].ls for s in succs[name]]
-            node.lf = min(succ_ls) if succ_ls else project_duration
-            node.ls = node.lf - node.dur
-            node.tf = node.ls - node.es
-
-        rows = []
-        for name in order:
-            n = nodes[name]
-            succ_es_min = min([nodes[s].es for s in succs[name]], default=project_duration)
-            free_raw = succ_es_min - n.ef
-            free_float = max(0, free_raw) if clamp_free_float else free_raw
-            max_pred_ef = 0
-            if n.preds:
-                max_pred_ef = max([
-                    nodes[p].ef if rel!="SS" else nodes[p].es
-                    for (p,rel,_) in n.preds if p in nodes
-                ], default=0)
-            indep = max(0, succ_es_min - max_pred_ef - n.dur)
-            interfering = n.tf - free_float
-            rows.append({
-                "Task": n.task, "Duration": n.dur,
-                "ES": n.es, "EF": n.ef, "LS": n.ls, "LF": n.lf,
-                "Total_Float": n.tf, "Slack": n.tf,
-                "Free_Float": free_float, "Free_Float_Raw": free_raw,
-                "Independent_Float": indep, "Interfering_Float": interfering,
-                "Critical": n.tf==0,
-            })
-        out = pd.DataFrame(rows).sort_values("ES", kind="stable")
-        return out, project_duration
-
-    # Calendar helpers
-    from pandas.tseries.offsets import CustomBusinessDay
-    def make_cbd(workdays: List[str], holidays: List[str]) -> CustomBusinessDay:
-        weekmask = " ".join(workdays)
-        hols = [pd.to_datetime(h).date() for h in holidays if h.strip()]
-        return CustomBusinessDay(weekmask=weekmask, holidays=hols)
-    def calendarize(schedule_df: pd.DataFrame, project_start: date, cbd: CustomBusinessDay) -> pd.DataFrame:
-        if schedule_df is None or schedule_df.empty: return schedule_df
-        out = schedule_df.copy()
-        start_ts = pd.to_datetime(project_start)
-        out["ES_date"] = start_ts + out["ES"].astype(int) * cbd
-        out["EF_date_excl"] = start_ts + out["EF"].astype(int) * cbd
-        out["Start_Date"] = out["ES_date"]
-        out["Finish_Date"] = out["EF_date_excl"] - 1 * cbd
-        return out
-    def gantt_chart(schedule_df: pd.DataFrame) -> alt.Chart:
-        if schedule_df is None or schedule_df.empty:
-            return alt.Chart(pd.DataFrame({"ES":[0],"EF":[0],"Task":["No tasks"]})).mark_bar()
-        data = schedule_df.copy()
-        data["Task"] = data["Task"].astype(str)
-        height = max(160, min(40*len(data), 1200))
-        if "ES_date" in data.columns and "EF_date_excl" in data.columns:
-            x = alt.X("ES_date:T", title="Start"); x2 = "EF_date_excl:T"
-        else:
-            x = alt.X("ES:Q", title="Day (project time)"); x2 = "EF:Q"
-        return (alt.Chart(data).mark_bar().encode(
-            x=x, x2=x2,
-            y=alt.Y("Task:N", sort=alt.SortField("ES", order="ascending")),
-            color=alt.condition("datum.Critical", alt.value("#d62728"), alt.value("#1f77b4")),
-            tooltip=["Task","Duration","ES","EF","LS","LF","Total_Float","Free_Float","Independent_Float","Interfering_Float",
-                     alt.Tooltip("Start_Date:T", title="Start Date", format="%Y-%m-%d"),
-                     alt.Tooltip("Finish_Date:T", title="Finish Date", format="%Y-%m-%d")],
-        ).properties(height=height))
-
-    # UI
-    st.subheader("Task Table")
-    uploaded = st.file_uploader("Upload tasks CSV", type=["csv"], accept_multiple_files=False)
-    with st.expander("CSV columns & example", expanded=False):
-        st.code(
-            "Task,Duration,Predecessors,Normal_Cost_per_day,Crash_Cost_per_day,Min_Duration,Overlap_OK\n"
-            "A - Site Prep,5,,1200,1800,3,TRUE\n"
-            "B - Foundations,10,\"A - Site Prep FS+0\",1600,2600,7,TRUE\n"
-            "C - Structure,12,\"B - Foundations SS+2\",1900,3000,9,TRUE\n"
-            "D - Enclosure,9,\"C - Structure FF+0\",1400,2300,7,FALSE\n",
-            language="csv"
-        )
-        st.caption("Predecessors accept lags like FS+2, SS-1, FF+0. Separate multiple predecessors by comma/semicolon.")
-
-    base_df = pd.DataFrame({
-        "Task":["A - Site Prep","B - Foundations","C - Structure","D - MEP Rough-In","E - Enclosure","F - Finishes"],
-        "Duration":[5,10,12,8,9,10],
-        "Predecessors":["","A - Site Prep FS+0","B - Foundations SS+2","C - Structure","C - Structure FF+0","D - MEP Rough-In, E - Enclosure"],
-        "Normal_Cost_per_day":[1200,1600,1900,1500,1400,1550],
-        "Crash_Cost_per_day":[1800,2600,3000,2400,2300,2550],
-        "Min_Duration":[3,7,9,6,7,8],
-        "Overlap_OK":[True, True, True, True, False, False],
-    })
-    if uploaded:
-        df, warns = load_csv(uploaded)
-    else:
-        df, warns = base_df.copy(), ["Using example table — upload your CSV to replace it."]
-
-    for w in warns: st.warning(w)
-    editor_height = rows_to_height(len(df)+5)
-    edited_df = editor_fullwidth(
-        df, hide_index=True, num_rows="dynamic",
-        column_config={
-            "Task": st.column_config.TextColumn("Task", required=True),
-            "Duration": st.column_config.NumberColumn("Duration", min_value=0, step=1),
-            "Predecessors": st.column_config.TextColumn(
-                "Predecessors",
-                help="Use FS/SS/FF with optional ±lag. e.g., A FS+0; B SS+2; C FF-1"
-            ),
-            "Normal_Cost_per_day": st.column_config.NumberColumn("Normal Cost / day", min_value=0),
-            "Crash_Cost_per_day": st.column_config.NumberColumn("Crash Cost / day", min_value=0),
-            "Min_Duration": st.column_config.NumberColumn("Min Duration", min_value=0, step=1),
-            "Overlap_OK": st.column_config.CheckboxColumn(
-                "Overlap OK", help="If enabled, FS successors may start earlier by a fraction of predecessor duration (see overlap control)."
-            ),
-        },
-        key="task_table", height=editor_height
-    )
-    # Coercions
-    edited_df["Task"] = edited_df["Task"].astype(str)
-    edited_df["Predecessors"] = edited_df["Predecessors"].fillna("").astype(str)
-    for c in ["Duration","Min_Duration"]: edited_df[c] = pd.to_numeric(edited_df[c], errors="coerce").fillna(0).astype(int).clip(lower=0)
-    for c in ["Normal_Cost_per_day","Crash_Cost_per_day"]: edited_df[c] = pd.to_numeric(edited_df[c], errors="coerce").fillna(0.0)
-    if "Overlap_OK" in edited_df.columns: edited_df["Overlap_OK"] = edited_df["Overlap_OK"].fillna(False).astype(bool)
-    else: edited_df["Overlap_OK"] = False
-
-    # Optional: apply schedule impacts from open RFIs
-    apply_rfi = st.checkbox("Apply open RFI schedule impacts", value=False, help="Adds Schedule_Impact_Days from open RFIs to linked tasks (Related_Tasks).")
-    edited_df_use = edited_df
-    if apply_rfi:
-        try:
-            rfis = db_list_rfis(backend, limit=5000)
-            if not rfis.empty:
-                impacts_src = rfis.copy()
-                impacts_src["schedule_impact_days"] = pd.to_numeric(impacts_src.get("schedule_impact_days", 0), errors="coerce").fillna(0).astype(int)
-                impacts_src["status"] = impacts_src.get("status", "").astype(str)
-                open_mask = ~impacts_src["status"].str.lower().isin(["closed", "cancelled"])
-                impacts_src = impacts_src[open_mask & (impacts_src["schedule_impact_days"] > 0)]
-                edited_df_use, impacts_applied = apply_rfi_impacts(edited_df, impacts_src)
-                if impacts_applied.empty:
-                    st.info("No open RFIs with schedule impact days to apply.")
-                else:
-                    st.success(f"Applied RFI impacts to {impacts_applied['Task'].nunique()} task(s).")
-                    df_fullwidth(impacts_applied, hide_index=True, height=rows_to_height(len(impacts_applied)+2))
-            else:
-                st.info("No RFIs found in the current storage backend.")
-        except Exception as e:
-            st.warning(f"Could not apply RFI impacts: {e}")
-
-    st.markdown("---")
-    left, right = st.columns([1,1])
-    with left:
-        target_days = st.number_input("Target project duration (days)", min_value=1, value=30, step=1,
-                                      help="Desired total project duration for crash analysis.")
-    with right:
-        overlap_frac = st.number_input("Fast-track overlap fraction", min_value=0.0, max_value=0.9, value=0.0, step=0.05,
-            help="When Overlap OK is true, FS successors may start earlier by this fraction of predecessor duration.")
-
-    c1, c2 = st.columns(2)
-    clamp_ff = c1.checkbox("Clamp Free Float at ≥ 0", value=True,
-                           help="Classic CPM reports Free Float as zero when negative. Uncheck to reveal negative FF caused by overlaps.")
-    cal_mode = c2.checkbox("Calendar mode (map to dates)", value=True,
-                           help="Convert ES/EF to working dates using your workweek and holidays.")
-    if cal_mode:
-        cw1, cw2 = st.columns([1,1])
-        with cw1:
-            proj_start = st.date_input("Project start date", value=date.today())
-        with cw2:
-            workdays = st.multiselect("Workdays", options=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
-                                      default=["Mon","Tue","Wed","Thu","Fri"],
-                                      help="Working days for date conversion.")
-        holidays_text = st.text_area("Holidays (YYYY-MM-DD, one per line)", height=80, placeholder="2025-11-27\n2025-12-25",
-                                     help="Non-working dates to exclude.")
-        holidays = [ln.strip() for ln in holidays_text.splitlines() if ln.strip()]
-        cbd = make_cbd(workdays, holidays)
-
-    cA, cB = st.columns([1,1])
-    compute = cA.button("Compute CPM", type="secondary")
-    run_crash = cB.button("Crash to Target", type="primary")
-
-    if compute or run_crash:
-        try:
-            missing = [c for c in REQUIRED if c not in edited_df.columns]
-            if missing:
-                st.error(f"Missing required columns: {missing}"); st.stop()
-
-            base_schedule, base_days = cpm_schedule(edited_df_use, overlap_frac, clamp_ff)
-            if cal_mode: base_schedule = calendarize(base_schedule, proj_start, cbd)
-
-            # Cache results so we can export / save without recomputing on every rerun
-            st.session_state["__schedule_baseline_df__"] = base_schedule.copy()
-            st.session_state["__schedule_baseline_days__"] = int(base_days) if base_days is not None else None
-
-            st.success(f"Baseline duration: {base_days} days")
-            df_fullwidth(base_schedule, hide_index=True, height=rows_to_height(len(base_schedule)+5))
-            st.subheader("Gantt (Baseline)")
-            chart_fullwidth(gantt_chart(base_schedule))
-
-            # Simple greedy crash loop
-            def crash_once(df_cfg: pd.DataFrame, schedule: pd.DataFrame) -> Optional[str]:
-                crit = schedule[schedule["Critical"]]
-                if crit.empty: return None
-                merged = crit.merge(
-                    df_cfg[["Task","Duration","Min_Duration","Normal_Cost_per_day","Crash_Cost_per_day"]],
-                    on="Task", how="left", suffixes=("_sched","_cfg")
-                )
-                merged["slope"] = (merged["Crash_Cost_per_day"] - merged["Normal_Cost_per_day"]).astype(float)
-                # After merge, pandas suffixes duplicate column names (e.g., Duration -> Duration_sched/Duration_cfg).
-                dur_col = "Duration_cfg" if "Duration_cfg" in merged.columns else "Duration"
-                merged[dur_col] = pd.to_numeric(merged[dur_col], errors="coerce")
-                merged["Min_Duration"] = pd.to_numeric(merged["Min_Duration"], errors="coerce")
-                can = merged[merged[dur_col] > merged["Min_Duration"]]
-                if can.empty: return None
-                can = can.sort_values(["slope","ES"], kind="stable")
-                return str(can.iloc[0]["Task"])
-
-            def apply_crash(df_cfg: pd.DataFrame, task: str) -> pd.DataFrame:
-                new = df_cfg.copy()
-                new.loc[new["Task"]==task, "Duration"] = new.loc[new["Task"]==task, "Duration"] - 1
-                return new
-
-            def total_cost(df_cfg: pd.DataFrame) -> float:
-                baseline = (df_cfg["Normal_Cost_per_day"] * df_cfg["Duration"].round(0)).sum()
-                crashed_days = (df_cfg.get("_baseline_duration", df_cfg["Duration"]) - df_cfg["Duration"]).clip(lower=0)
-                slope = (df_cfg["Crash_Cost_per_day"] - df_cfg["Normal_Cost_per_day"]).clip(lower=0)
-                return float(baseline + (crashed_days * slope).sum())
-
-            if run_crash:
-                if target_days >= base_days:
-                    st.info("Target ≥ baseline; nothing to crash.")
-                else:
-                    df_cfg = edited_df_use.copy()
-                    df_cfg["_baseline_duration"] = df_cfg["Duration"]
-                    log = []
-                    schedule, cur = cpm_schedule(df_cfg, overlap_frac, clamp_ff)
-                    while cur > target_days:
-                        pick = crash_once(df_cfg, schedule)
-                        if pick is None: break
-                        df_cfg = apply_crash(df_cfg, pick)
-                        log.append(f"Shortened '{pick}' by 1 day.")
-                        schedule, cur = cpm_schedule(df_cfg, overlap_frac, clamp_ff)
-
-                    crashed_schedule, final_days = schedule, cur
-                    if cal_mode: crashed_schedule = calendarize(crashed_schedule, proj_start, cbd)
-                    edited_df_use["_baseline_duration"] = edited_df_use["Duration"]; base_cost = total_cost(edited_df_use)
-                    df_cfg["_baseline_duration"] = edited_df_use["Duration"]; crash_cost = total_cost(df_cfg)
-
-                    st.markdown("### Crashed Scenario")
-                    st.success(f"New duration: {final_days} days (target: {target_days})")
-                    # Cache latest crash scenario results for export / save
-                    st.session_state["__schedule_crashed_df__"] = crashed_schedule.copy()
-                    st.session_state["__schedule_crashed_days__"] = int(final_days) if final_days is not None else None
-                    st.session_state["__schedule_crash_log__"] = log.copy() if isinstance(log, list) else log
-
-                    st.metric("Added cost (approx)", f"${crash_cost - base_cost:,.0f}")
-
-                    st.subheader("Crashed Schedule")
-                    df_fullwidth(crashed_schedule, hide_index=True, height=rows_to_height(len(crashed_schedule)+5))
-                    st.subheader("Gantt (Crashed)")
-                    chart_fullwidth(gantt_chart(crashed_schedule))
-                    st.subheader("Crash Log")
-                    if log:
-                        for line in log: st.write("•", line)
-                    else:
-                        st.write("No feasible crashes — target may be below theoretical minimum.")
-
-        except Exception as e:
-            st.error(f"Schedule analysis failed: {e}")
-            st.exception(e)
-            return
-
-
-        # -------------------------
-        # Save / Download / Browse
-        # -------------------------
-        st.markdown("---")
-        st.subheader("Save, download, and browse schedule runs")
-
-        base_df = st.session_state.get("__schedule_baseline_df__")
-        crash_df = st.session_state.get("__schedule_crashed_df__")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if isinstance(base_df, pd.DataFrame) and not base_df.empty:
-                st.download_button(
-                    "Download baseline CSV",
-                    data=base_df.to_csv(index=False).encode("utf-8"),
-                    file_name="fieldflow_schedule_baseline.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-        with c2:
-            if isinstance(crash_df, pd.DataFrame) and not crash_df.empty:
-                st.download_button(
-                    "Download crashed CSV",
-                    data=crash_df.to_csv(index=False).encode("utf-8"),
-                    file_name="fieldflow_schedule_crashed.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-
-        with st.expander("Save this schedule run (to your selected backend)", expanded=False):
-            kind = st.radio("Which result do you want to save?", ["baseline","crashed"], horizontal=True)
-            df_to_save = base_df if kind == "baseline" else crash_df
-            if not isinstance(df_to_save, pd.DataFrame) or df_to_save.empty:
-                st.info("Run a baseline (and optionally a crash) above first — then you can save it here.")
-            else:
-                company = st.text_input("Company", value=str(st.session_state.get("company_name","")))
-                client = st.text_input("Client", value=str(st.session_state.get("client_name","")))
-                project = st.text_input("Project", value=str(st.session_state.get("project_name","")))
-                scenario = st.text_input("Scenario label", value="What-if run")
-                baseline_days = st.session_state.get("__schedule_baseline_days__")
-                crashed_days = st.session_state.get("__schedule_crashed_days__")
-                if st.button("Save schedule run", use_container_width=True):
-                    meta = {
-                        "company": company,
-                        "client": client,
-                        "project": project,
-                        "scenario": scenario,
-                        "kind": kind,
-                        "baseline_days": baseline_days,
-                        "crashed_days": crashed_days,
-                    }
-                    rid = backend.save_schedule_run(meta, df_to_save)
-                    st.success(f"Saved. Run ID: {rid}")
-
-        with st.expander("Saved schedule runs", expanded=True):
-            runs = backend.list_schedule_runs()
-            if runs is None or runs.empty:
-                st.info("No saved schedule runs yet (in the currently selected backend).")
-            else:
-                df_fullwidth(runs, hide_index=True, height=rows_to_height(len(runs)+5))
-                run_ids = [str(x) for x in runs["run_id"].tolist()] if "run_id" in runs.columns else []
-                pick = st.selectbox("Open a saved run", options=[""] + run_ids)
-                if pick:
-                    meta, df_run = backend.load_schedule_run(pick)
-                    st.markdown("**Metadata**")
-                    st.json(meta)
-                    st.markdown("**Schedule**")
-                    df_fullwidth(df_run, hide_index=True, height=rows_to_height(len(df_run)+8))
-                    st.download_button(
-                        "Download this run as CSV",
-                        data=df_run.to_csv(index=False).encode("utf-8"),
-                        file_name=f"fieldflow_schedule_{pick}.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                    if st.button("Delete this saved run", use_container_width=True):
-                        backend.delete_schedule_run(pick)
-                        st.success("Deleted. Refreshing…")
-                        st.rerun()
-
-
-
-# =========================
-# RFI Manager (page)
-# =========================
-
-def rfi_manager_page():
-    st.header("RFI Manager")
-
-    backend = get_backend_choice()
-
-    # --- Create / Draft form ---
-    with st.expander("Create new RFI", expanded=True):
-        st.caption("Fields marked required: **Project**, **Subject**, **Question / Clarification needed**.")
-        with st.form("new_rfi_form"):
-            c1, c2, c3 = st.columns(3)
-            project = c1.text_input(
-                "Project *",
-                value="",
-                help="Your project/job identifier (e.g., 'LA River Rehab - Phase 2').",
-            )
-            discipline = c2.selectbox(
-                "Discipline",
-                ["General", "Civil", "Structural", "MEP", "Geotech", "Traffic", "Utilities", "Architectural"],
-                index=0,
-                help="Used for filtering and reporting.",
-            )
-            priority = c3.selectbox(
-                "Priority",
-                ["Low", "Normal", "High", "Urgent"],
-                index=1,
-                help="Used for triage and the aging dashboard.",
-            )
-
-            subject = st.text_input(
-                "Subject *",
-                help="Short title you would put in an email subject line.",
-            )
-            spec_section = st.text_input(
-                "Spec / Drawing Ref (optional)",
-                placeholder="e.g., 03 30 00 / S-201",
-                help="Reference the spec section, sheet, detail, or addendum item.",
-            )
-            question = st.text_area(
-                "Question / Clarification needed *",
-                height=160,
-                help="Write the actual question. Include assumptions and what decision you need.",
-            )
-
-            c4, c5, c6 = st.columns(3)
-            due_date = c4.date_input(
-                "Due date (optional)",
-                value=None,
-                help="When you need a response by (drives 'Overdue' logic).",
-            )
-            assignee_email = c5.text_input(
-                "Assignee (optional)",
-                placeholder="pm@company.com",
-                help="Internal owner responsible for follow-up.",
-            )
-            to_emails = c6.text_input(
-                "To (emails)",
-                placeholder="architect@firm.com; engineer@firm.com",
-                help="External recipients. Separate with commas or semicolons.",
-            )
-
-            cc_emails = st.text_input(
-                "CC (emails)",
-                placeholder="super@company.com",
-                help="Optional CC list. Separate with commas or semicolons.",
-            )
-
-            st.markdown("**Schedule impact (optional)**")
-            c7, c8, c9 = st.columns(3)
-            related_tasks = c7.text_input(
-                "Related schedule task(s)",
-                placeholder="B - Foundations; C - Structure",
-                help="Helps tie the RFI back to the schedule what-ifs.",
-            )
-            schedule_impact_days = c8.number_input(
-                "Potential delay (days)",
-                min_value=0,
-                step=1,
-                value=0,
-                help="Your best estimate if this is not resolved quickly.",
-            )
-            cost_impact = c9.number_input(
-                "Potential cost impact ($)",
-                min_value=0.0,
-                step=1000.0,
-                value=0.0,
-                help="Rough order-of-magnitude cost impact.",
-            )
-
-            thread_notes = st.text_area(
-                "Notes / Thread",
-                height=100,
-                help="Paste email snippets, meeting notes, and decisions as they happen.",
-            )
-
-            links_raw = st.text_area(
-                "Links (optional)",
-                height=90,
-                help="One link per line (plan room, BIM 360, Procore, Drive, etc.).",
-            )
-
-            attachments_files = st.file_uploader(
-                "Attachments (optional)",
-                type=["pdf", "csv", "docx", "doc", "txt"],
-                accept_multiple_files=True,
-                help=(
-                    "Upload supporting docs. For Google Docs, download as .docx or PDF first. "
-                    "Supported: PDF, CSV, Word (.doc/.docx), TXT."
+    def delete_submittal_check(self, check_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM submittal_checks WHERE id=?", (check_id,))
+            conn.commit()
+
+    def save_schedule_run(self, meta: Dict[str, Any], baseline_df: pd.DataFrame, crashed_df: pd.DataFrame) -> str:
+        run_id = uuid.uuid4().hex
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO schedule_runs (id, created_at, meta_json, baseline_csv, crashed_csv) VALUES (?,?,?,?,?)",
+                (
+                    run_id,
+                    _now_iso(),
+                    json.dumps(meta),
+                    baseline_df.to_csv(index=False),
+                    crashed_df.to_csv(index=False),
                 ),
             )
+            conn.commit()
+        return run_id
 
-            cbtn1, cbtn2 = st.columns(2)
-
-            save_draft = cbtn1.form_submit_button("Save draft", type="secondary", use_container_width=True)
-
-            submit_rfi = cbtn2.form_submit_button("Submit", type="primary", use_container_width=True)
-        if save_draft or submit_rfi:
-            if not project.strip() or not subject.strip() or not question.strip():
-                st.warning("Project, Subject, and Question are required.")
-            else:
-                new_status = "Draft" if save_draft else "Sent"
-                sent_at = datetime.utcnow().isoformat() if submit_rfi else None
-                rfi_id = db_upsert_rfi(
-                    backend,
-                    {
-                        "id": None,
-                        "created_at": datetime.utcnow().isoformat(),
-                        "updated_at": datetime.utcnow().isoformat(),
-                        "user_id": _current_user_label(),
-                        "project": project.strip(),
-                        "subject": subject.strip(),
-                        "question": question.strip(),
-                        "discipline": discipline,
-                        "spec_section": spec_section.strip() or None,
-                        "priority": priority,
-                        "status": new_status,
-                        "due_date": str(due_date) if due_date else None,
-                        "assignee_email": assignee_email.strip() or None,
-                        "to_emails": ";".join(parse_emails(to_emails)),
-                        "cc_emails": ";".join(parse_emails(cc_emails)),
-                        "related_tasks": related_tasks.strip() or None,
-                        "schedule_impact_days": int(schedule_impact_days or 0),
-                        "cost_impact": float(cost_impact or 0.0),
-                        "last_sent_at": sent_at,
-                        "last_reminded_at": None,
-                        "last_response_at": None,
-                        "thread_notes": thread_notes.strip() or None,
-                    },
-                )
-
-                links = [u.strip() for u in (links_raw or "").splitlines() if u.strip()]
-                if links:
-                    db_add_rfi_links(backend, rfi_id, links)
-
-                if attachments_files:
-                    db_add_rfi_attachments(backend, rfi_id, attachments_files)
-
-                st.success(f"{'Submitted' if submit_rfi else 'Saved draft'} RFI #{rfi_id}.")
-                st.rerun()
-
-    st.markdown("---")
-    st.subheader("RFI List")
-
-    rfis = db_list_rfis(backend)
-    if rfis.empty:
-        st.info("No RFIs yet. Create one above to start.")
-        return
-
-    # Filters
-    f1, f2, f3, f4 = st.columns([0.28, 0.24, 0.24, 0.24])
-    proj_opts = ["All"] + sorted([p for p in rfis.get("project", pd.Series(dtype=str)).dropna().unique().tolist() if str(p).strip()])
-    status_opts = ["All", "Draft", "Sent", "Answered", "Closed"]
-    prio_opts = ["All", "Low", "Normal", "High", "Urgent"]
-
-    f_project = f1.selectbox("Project", proj_opts, index=0)
-    f_status = f2.selectbox("Status", status_opts, index=0)
-    f_priority = f3.selectbox("Priority", prio_opts, index=0)
-    search = f4.text_input("Search", placeholder="subject / spec / keyword")
-
-    view = rfis.copy()
-    if f_project != "All":
-        view = view[view["project"] == f_project]
-    if f_status != "All":
-        view = view[view["status"] == f_status]
-    if f_priority != "All":
-        view = view[view["priority"] == f_priority]
-    if search.strip():
-        s = search.strip().lower()
-        for col in ["subject", "question", "spec_section", "thread_notes"]:
-            if col not in view.columns:
-                view[col] = ""
-        mask = (
-            view["subject"].fillna("").str.lower().str.contains(s)
-            | view["question"].fillna("").str.lower().str.contains(s)
-            | view["spec_section"].fillna("").str.lower().str.contains(s)
-            | view["thread_notes"].fillna("").str.lower().str.contains(s)
-        )
-        view = view[mask]
-
-    # Quick counts
-    today = date.today()
-    overdue = 0
-    for _, r in view.iterrows():
-        try:
-            if r.get("status") not in ("Answered", "Closed") and r.get("due_date"):
-                dd = date.fromisoformat(str(r.get("due_date")))
-                if dd < today:
-                    overdue += 1
-        except Exception:
-            pass
-
-    cA, cB, cC = st.columns(3)
-    cA.metric("Open RFIs", int((view["status"].fillna("") != "Closed").sum()))
-    cB.metric("Overdue", int(overdue))
-    cC.metric("Total", int(len(view)))
-
-    st.dataframe(
-        view[
-            [
-                "id",
-                "project",
-                "subject",
-                "status",
-                "priority",
-                "due_date",
-                "last_sent_at",
-                "last_response_at",
-                "schedule_impact_days",
-                "related_tasks",
-            ]
-        ].sort_values(by=["id"], ascending=False),
-        width='stretch',
-        hide_index=True,
-    )
-
-    st.markdown("---")
-    st.subheader("Open / Edit an RFI")
-
-    rfi_ids = view["id"].dropna().astype(int).tolist()
-    pick = st.selectbox("RFI ID", [0] + rfi_ids, index=0, help="Select an RFI to view/edit details.")
-    if not pick:
-        return
-
-    rfi = rfis[rfis["id"] == pick].iloc[0].to_dict()
-
-    with st.form("edit_rfi_form"):
-        c1, c2, c3 = st.columns(3)
-        status = c1.selectbox("Status", ["Draft", "Sent", "Answered", "Closed"], index=["Draft","Sent","Answered","Closed"].index(rfi.get("status","Draft")))
-        priority = c2.selectbox("Priority", ["Low", "Normal", "High", "Urgent"], index=["Low","Normal","High","Urgent"].index(rfi.get("priority","Normal")))
-        due = c3.date_input("Due date (optional)", value=date.fromisoformat(rfi["due_date"]) if rfi.get("due_date") else None)
-
-        subject = st.text_input("Subject", value=rfi.get("subject",""), help="Short title.")
-        spec_section = st.text_input("Spec / Drawing Ref (optional)", value=rfi.get("spec_section") or "")
-        question = st.text_area("Question / Clarification needed", value=rfi.get("question",""), height=160)
-
-        c4, c5, c6 = st.columns(3)
-        assignee_email = c4.text_input("Assignee (optional)", value=rfi.get("assignee_email") or "")
-        to_emails = c5.text_input("To (emails)", value=rfi.get("to_emails") or "")
-        cc_emails = c6.text_input("CC (emails)", value=rfi.get("cc_emails") or "")
-
-        st.markdown("**Schedule impact (optional)**")
-        c7, c8, c9 = st.columns(3)
-        related_tasks = c7.text_input("Related schedule task(s)", value=rfi.get("related_tasks") or "")
-        schedule_impact_days = c8.number_input("Potential delay (days)", min_value=0, step=1, value=int(rfi.get("schedule_impact_days") or 0))
-        cost_impact = c9.number_input("Potential cost impact ($)", min_value=0.0, step=1000.0, value=float(rfi.get("cost_impact") or 0.0))
-
-        thread_notes = st.text_area("Notes / Thread", value=rfi.get("thread_notes") or "", height=140)
-
-        save = st.form_submit_button("Save changes")
-
-    if save:
-        db_upsert_rfi(
-            backend,
-            {
-                **rfi,
-                "updated_at": datetime.utcnow().isoformat(),
-                "status": status,
-                "priority": priority,
-                "due_date": str(due) if due else None,
-                "subject": subject.strip(),
-                "spec_section": spec_section.strip() or None,
-                "question": question.strip(),
-                "assignee_email": assignee_email.strip() or None,
-                "to_emails": ";".join(parse_emails(to_emails)),
-                "cc_emails": ";".join(parse_emails(cc_emails)),
-                "related_tasks": related_tasks.strip() or None,
-                "schedule_impact_days": int(schedule_impact_days or 0),
-                "cost_impact": float(cost_impact or 0.0),
-                "thread_notes": thread_notes.strip() or None,
-            },
-        )
-        st.success("Saved.")
-        st.rerun()
-
-def aging_dashboard_page():
-    backend = get_backend_choice()
-    st.header("Aging Dashboard")
-    st.caption("Spot lagging submittals and RFIs. Use this as a lightweight 'PM pulse' panel.")
-
-    # Tunables
-    c1, c2, c3 = st.columns(3)
-    submittal_lag_days = c1.number_input("Flag submittals older than (days)", min_value=1, value=14, step=1)
-    rfi_remind_after = c2.number_input("Remind on RFIs after (days since last sent)", min_value=1, value=7, step=1)
-    rfi_overdue_grace = c3.number_input("Overdue grace (days)", min_value=0, value=0, step=1)
-
-    st.markdown("---")
-    st.subheader("Submittal Runs (Memory Bank)")
-
-    bank = db_list_submittals(backend)
-    if bank.empty:
-        st.info("No saved submittal runs yet.")
-    else:
-        # age from date_submitted if present, otherwise created_at
-        dt = pd.to_datetime(bank.get("date_submitted"), errors="coerce")
-        created = pd.to_datetime(bank.get("created_at"), errors="coerce")
-        base = dt.fillna(created)
-        bank = bank.copy()
-        bank["Age_days"] = (pd.Timestamp.utcnow() - base).dt.days
-        lag = bank[bank["Age_days"] >= int(submittal_lag_days)].copy()
-        st.metric("Lagging runs", len(lag))
-        df_fullwidth(lag.sort_values(["Age_days","created_at"], ascending=[False,False], kind="stable"), hide_index=True, height=rows_to_height(min(len(lag)+6, 50)))
-
-    st.markdown("---")
-    st.subheader("RFIs")
-    rfis = db_list_rfis(backend, limit=5000)
-    if rfis.empty:
-        st.info("No RFIs yet.")
-        return
-
-    rfis = rfis.copy()
-    rfis["created_at_dt"] = pd.to_datetime(rfis.get("created_at"), errors="coerce")
-    rfis["last_sent_at_dt"] = pd.to_datetime(rfis.get("last_sent_at"), errors="coerce")
-    rfis["due_dt"] = pd.to_datetime(rfis.get("due_date"), errors="coerce")
-
-    open_mask = rfis.get("status","").isin(["Draft","Sent","Answered"])  # treat Answered as open until Closed
-    open_rfis = rfis[open_mask].copy()
-
-    # derived ages
-    open_rfis["Age_days"] = (pd.Timestamp.utcnow() - open_rfis["created_at_dt"]).dt.days
-    open_rfis["Days_since_sent"] = (pd.Timestamp.utcnow() - open_rfis["last_sent_at_dt"]).dt.days
-
-    overdue_mask = open_rfis["due_dt"].notna() & ((open_rfis["due_dt"].dt.date + pd.to_timedelta(rfi_overdue_grace, unit='D')).dt.date < datetime.utcnow().date())
-    remind_mask = open_rfis["last_sent_at_dt"].notna() & (open_rfis["Days_since_sent"] >= int(rfi_remind_after))
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Open RFIs", len(open_rfis))
-    m2.metric("Overdue", int(overdue_mask.sum()))
-    m3.metric("Need reminder", int(remind_mask.sum()))
-
-    show = open_rfis.copy()
-    show["Overdue"] = overdue_mask
-    show["Needs_Reminder"] = remind_mask
-
-    show_cols = ["id","project","subject","status","priority","due_date","Age_days","Days_since_sent","Overdue","Needs_Reminder","assignee_email","to_emails"]
-    for c in show_cols:
-        if c not in show.columns:
-            show[c] = None
-    df_fullwidth(show[show_cols].sort_values(["Overdue","Needs_Reminder","Age_days"], ascending=[False,False,False], kind="stable"), hide_index=True, height=rows_to_height(min(len(show)+6, 70)))
-
-    st.markdown("### Reminder sending")
-    st.caption("Reminders send via your configured email provider (SendGrid/SMTP).")
-
-    attach_pdf = st.checkbox("Attach RFI PDF to reminders", value=False)
-    reminder_cc_owner = st.text_input("CC me (optional)", value="")
-
-    if st.button("Send reminders to flagged RFIs"):
-        if not remind_mask.any():
-            st.info("No RFIs currently meet the reminder rule.")
-        else:
-            sent = 0
-            failed = 0
-            for _, r in open_rfis[remind_mask].iterrows():
-                rfi = db_get_rfi(backend, int(r["id"])) or r.to_dict()
-                recips = parse_emails(rfi.get("to_emails") or "")
-                recips += parse_emails(rfi.get("cc_emails") or "")
-                recips += parse_emails(reminder_cc_owner)
-                recips = list(dict.fromkeys(recips))
-                if not recips:
-                    continue
-
-                subj = f"Reminder: RFI #{rfi.get('id')}: {rfi.get('subject') or ''}"
-                html = rfi_email_html(rfi) + "<p><i>Reminder:</i> Please respond when you can. Thank you.</p>"
-                atts = None
-                if attach_pdf:
-                    try:
-                        atts = [(f"RFI_{rfi.get('id')}.pdf", generate_rfi_pdf(rfi))]
-                    except Exception:
-                        atts = None
-
-                ok, msg = send_email(recips, subj, html, attachments=atts)
-                if ok:
-                    sent += 1
-                    rfi["last_reminded_at"] = datetime.utcnow().isoformat()
-                    rfi["updated_at"] = datetime.utcnow().isoformat()
-                    db_upsert_rfi(backend, rfi)
-                else:
-                    failed += 1
-            st.success(f"Reminders sent: {sent}. Failed: {failed}.")
-
-# -----------------------------------------------------------------------------
-# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
-#
-# Policy:
-# 1) Try stored workbook ID (persisted in user's OneDrive approot as a small JSON file)
-# 2) If missing, scan approot for any workbook with FieldFlow marker
-# 3) If still missing, search by name (FieldFlow) as last resort
-# 4) If none found, create workbook, add marker, and store its ID
-#
-# This class overrides only the workbook-id lifecycle and preset loading to avoid
-# Graph quotaLimitReached due to Streamlit rerun storms.
-# -----------------------------------------------------------------------------
-
-_MSExcelOAuthBase = MSExcelOAuth
-
-class MSExcelOAuth(_MSExcelOAuthBase):
-    _POINTER_FILENAME = ".fieldflow_workbook.json"
-    _MARKER_SHEET = "_fieldflow_meta"
-    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
-
-    def _graph_headers(self, extra: dict | None = None) -> dict:
-        h = {"Authorization": f"Bearer {self.token}"}
-        if extra:
-            h.update(extra)
-        return h
-
-    def _graph_request(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: dict | None = None,
-        json_body=None,
-        data=None,
-        timeout: int = 30,
-        max_retries: int = 5,
-    ) -> requests.Response:
-        """Graph request with backoff for 429/503/504 and quotaLimitReached."""
-        h = self._graph_headers(headers)
-        last = None
-        for attempt in range(max_retries):
+    def list_schedule_runs(self) -> pd.DataFrame:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, created_at, meta_json FROM schedule_runs ORDER BY created_at DESC"
+            ).fetchall()
+        out = []
+        for r in rows:
             try:
-                r = requests.request(method, url, headers=h, json=json_body, data=data, timeout=timeout)
-                last = r
+                meta = json.loads(r["meta_json"])
             except Exception:
-                time.sleep(min(2 ** attempt, 20))
-                continue
+                meta = {}
+            out.append({"run_id": r["id"], "created_at": r["created_at"], **meta})
+        return pd.DataFrame(out)
 
-            err_code = None
+    def get_schedule_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            r = conn.execute(
+                "SELECT created_at, meta_json, baseline_csv, crashed_csv FROM schedule_runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+        if not r:
+            return None
+        try:
+            meta = json.loads(r["meta_json"])
+        except Exception:
+            meta = {}
+        baseline_df = pd.read_csv(io.StringIO(r["baseline_csv"]))
+        crashed_df = pd.read_csv(io.StringIO(r["crashed_csv"]))
+        return {"run_id": run_id, "created_at": r["created_at"], "meta": meta, "baseline_df": baseline_df, "crashed_df": crashed_df}
+
+    def delete_schedule_run(self, run_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM schedule_runs WHERE id=?", (run_id,))
+            conn.commit()
+
+# ----------------------------
+# Google Drive backend (files)
+# ----------------------------
+def _google_credentials_from_session():
+    data = _ss_get("__google_tokens__")
+    if not data:
+        return None
+    try:
+        from google.oauth2.credentials import Credentials
+        creds = Credentials(
+            token=data.get("token"),
+            refresh_token=data.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=get_secret("google_oauth.client_id"),
+            client_secret=get_secret("google_oauth.client_secret"),
+            scopes=GOOGLE_SCOPES,
+        )
+        # expiry handling
+        exp = data.get("expiry")
+        if exp:
             try:
-                if r.status_code >= 400:
-                    j = r.json()
-                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
-                        err_code = j["error"].get("code")
+                creds.expiry = _dt.datetime.fromisoformat(exp.replace("Z",""))
             except Exception:
                 pass
-
-            throttled = r.status_code in (429, 503, 504) or (err_code == "quotaLimitReached")
-            if throttled and attempt < max_retries - 1:
-                ra = r.headers.get("Retry-After")
-                if ra and str(ra).isdigit():
-                    wait = int(ra)
-                else:
-                    wait = min(2 ** attempt, 30)
-                time.sleep(wait)
-                continue
-
-            return r
-
-        return last if last is not None else requests.Response()
-
-    @staticmethod
-    def _safe_json(r: requests.Response) -> dict:
-        try:
-            return r.json()
-        except Exception:
-            return {}
-
-    # ---------- persistent pointer file (approot) ----------
-
-    def _pointer_content_url(self) -> str:
-        # /me/drive/special/approot:/<path>:/content
-        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
-
-    def _read_pointer(self) -> dict | None:
-        url = self._pointer_content_url()
-        r = self._graph_request("GET", url, timeout=20, max_retries=2)
-        if r.status_code == 404:
-            return None
-        if r.status_code >= 400:
-            return None
-        try:
-            # content endpoint returns bytes; try json
-            return json.loads(r.content.decode("utf-8"))
-        except Exception:
-            return None
-
-    def _write_pointer(self, workbook_id: str) -> None:
-        payload = {
-            "workbook_id": workbook_id,
-            "updated_at": datetime.utcnow().isoformat(),
-            "title": self.title,
-        }
-        url = self._pointer_content_url()
-        self._graph_request(
-            "PUT",
-            url,
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload).encode("utf-8"),
-            timeout=30,
-            max_retries=3,
-        )
-
-    def _validate_workbook_id(self, workbook_id: str) -> bool:
-        if not workbook_id:
-            return False
-        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
-        r = self._graph_request("GET", url, timeout=15, max_retries=2)
-        return 200 <= r.status_code < 300
-
-    # ---------- marker inside workbook ----------
-
-    def _worksheet_exists(self, workbook_id: str, ws_name: str) -> bool:
-        url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        if r.status_code >= 400:
-            return False
-        data = self._safe_json(r)
-        names = [w.get("name") for w in data.get("value", []) if isinstance(w, dict)]
-        return ws_name in names
-
-    def _ensure_marker(self, workbook_id: str) -> None:
-        # Ensure sheet exists
-        if not self._worksheet_exists(workbook_id, self._MARKER_SHEET):
-            url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
-            r = self._graph_request("POST", url, json_body={"name": self._MARKER_SHEET}, timeout=25, max_retries=3)
-            if r.status_code >= 400:
-                # If we can't add, just stop (don't crash the app)
-                return
-
-        # Write marker value into A1
-        url = (
-            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/"
-            f"{urllib.parse.quote(self._MARKER_SHEET)}/range(address='A1:A3')"
-        )
-        values = [[self._MARKER_VALUE], [self.title], [datetime.utcnow().isoformat()]]
-        self._graph_request("PATCH", url, headers={"Content-Type": "application/json"}, json_body={"values": values}, timeout=25, max_retries=3)
-
-    def _has_marker(self, workbook_id: str) -> bool:
-        url = (
-            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/"
-            f"{urllib.parse.quote(self._MARKER_SHEET)}/range(address='A1')"
-        )
-        r = self._graph_request("GET", url, timeout=20, max_retries=2)
-        if r.status_code >= 400:
-            return False
-        data = self._safe_json(r)
-        try:
-            v = data.get("values", [[""]])[0][0]
-            return str(v).strip() == self._MARKER_VALUE
-        except Exception:
-            return False
-
-    # ---------- discovery helpers ----------
-
-    def _list_approot_children(self) -> list[dict]:
-        url = f"{self.base}/me/drive/special/approot/children?$select=id,name,lastModifiedDateTime&$top=200"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        if r.status_code >= 400:
-            return []
-        data = self._safe_json(r)
-        return data.get("value", []) if isinstance(data, dict) else []
-
-    def _search_drive(self, q: str) -> list[dict]:
-        q_esc = q.replace("'", "\\'")
-        url = f"{self.base}/me/drive/root/search(q='{q_esc}')?$select=id,name,lastModifiedDateTime&$top=50"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        if r.status_code >= 400:
-            return []
-        data = self._safe_json(r)
-        return data.get("value", []) if isinstance(data, dict) else []
-
-    def _pick_latest(self, items: list[dict]) -> dict | None:
-        if not items:
-            return None
-        items = [it for it in items if isinstance(it, dict)]
-        items.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-        return items[0] if items else None
-
-    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
-        # Cache first
-        cached = st.session_state.get("__ms_workbook_id__")
-        if cached and self._validate_workbook_id(cached):
-            return cached
-
-        # 1) Pointer file
-        ptr = self._read_pointer()
-        if isinstance(ptr, dict):
-            wid = ptr.get("workbook_id")
-            if wid and self._validate_workbook_id(str(wid)):
-                st.session_state["__ms_workbook_id__"] = str(wid)
-                return str(wid)
-
-        # 2) Scan approot for marker
-        approot = [it for it in self._list_approot_children() if str(it.get("name", "")).lower().endswith(".xlsx")]
-        # Try marker check first (few items in approot typically)
-        for it in approot:
-            wid = it.get("id")
-            if wid and self._validate_workbook_id(str(wid)) and self._has_marker(str(wid)):
-                st.session_state["__ms_workbook_id__"] = str(wid)
-                self._write_pointer(str(wid))
-                return str(wid)
-
-        # 3) Search by name (last resort)
-        hits = [it for it in self._search_drive("FieldFlow") if str(it.get("name", "")).lower().endswith(".xlsx")]
-        # Prefer exact/starts-with title
-        want = f"{self.title}.xlsx".lower()
-        preferred = [it for it in hits if (str(it.get("name", "")).lower() == want) or str(it.get("name", "")).lower().startswith(self.title.lower())]
-        candidates = preferred or hits
-
-        # If any candidate already has marker, use it
-        for it in candidates:
-            wid = it.get("id")
-            if wid and self._validate_workbook_id(str(wid)) and self._has_marker(str(wid)):
-                st.session_state["__ms_workbook_id__"] = str(wid)
-                self._write_pointer(str(wid))
-                return str(wid)
-
-        # If we found name matches but no marker, adopt the newest candidate
-        newest = self._pick_latest(candidates)
-        if newest and newest.get("id") and self._validate_workbook_id(str(newest["id"])):
-            wid = str(newest["id"])
-            # Best effort: add marker so we can recognize it next time
-            try:
-                self._ensure_marker(wid)
-            except Exception:
-                pass
-            st.session_state["__ms_workbook_id__"] = wid
-            self._write_pointer(wid)
-            return wid
-
-        # 4) Create new if allowed
-        if not create_if_missing:
-            return None
-
-        return self._create_and_register_workbook()
-
-    def _create_and_register_workbook(self) -> str:
-        # Cooldown gate to avoid rerun spam
-        now = time.time()
-        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
-        if now < next_ok:
-            raise RuntimeError("Microsoft is throttling workbook creation. Please wait ~30 seconds and try again.")
-
-        name = f"{self.title}.xlsx"
-
-        # Build minimal workbook bytes
-        try:
-            from openpyxl import Workbook
-            import io as _io
-            wb = Workbook()
-            try:
-                ws_meta = wb.create_sheet(self._MARKER_SHEET)
-                ws_meta["A1"] = self._MARKER_VALUE
-                ws_meta.sheet_state = "hidden"
-            except Exception:
-                pass
-            buf = _io.BytesIO()
-            wb.save(buf)
-            content = buf.getvalue()
-        except Exception:
-            content = b"PK\x03\x04"  # fallback ZIP header (not ideal but prevents crash)
-
-        url = f"{self.base}/me/drive/special/approot:/{name}:/content"
-        r = self._graph_request(
-            "PUT",
-            url,
-            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
-            data=content,
-            timeout=60,
-            max_retries=5,
-        )
-
-        if r.status_code >= 400:
-            data = self._safe_json(r)
-            code = None
-            msg = None
-            if isinstance(data, dict) and isinstance(data.get("error"), dict):
-                code = data["error"].get("code")
-                msg = data["error"].get("message")
-            if code == "quotaLimitReached" or r.status_code in (429, 503, 504):
-                st.session_state["__ms_next_create_ok__"] = time.time() + 30
-                raise RuntimeError("Microsoft Graph quotaLimitReached. Please wait ~30 seconds and try again.")
-            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or r.status_code} {msg or ''}")
-
-        # Determine workbook id by listing approot
-        wid = None
-        for it in self._list_approot_children():
-            if str(it.get("name", "")).lower() == name.lower() and it.get("id"):
-                wid = str(it["id"])
-                break
-        if not wid:
-            # fallback to response json
-            try:
-                wid = str(self._safe_json(r).get("id") or "")
-            except Exception:
-                wid = ""
-        if not wid or not self._validate_workbook_id(wid):
-            raise RuntimeError("Workbook created but could not resolve its ID. Please refresh and try again.")
-
-        # Mark + persist
-        try:
-            self._ensure_marker(wid)
-        except Exception:
-            pass
-        self._write_pointer(wid)
-        st.session_state["__ms_workbook_id__"] = wid
-        return wid
-
-    # ---------- override public/parent methods ----------
-
-    def _find_existing_workbook_id(self) -> str | None:
-        # Keep a simple compatibility path for any callers
-        return self._resolve_workbook_id(create_if_missing=False)
-
-def _get_workbook_id(self, create_if_missing: bool = True) -> str:
-    """Return workbook id. If create_if_missing is False, returns '' if unavailable."""
-    wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
-    if not wid:
-        if not create_if_missing:
-            return ""
-        raise RuntimeError(
-            "No OneDrive workbook found yet. Please sign in and try saving again. "
-            "(If this is your first time, FieldFlow will create a workbook in your OneDrive App Folder.)"
-        )
-    return wid
-
-def _ensure_workbook(self):
-    """Create/find workbook and return its id (for Settings button)."""
-    wid = self._resolve_workbook_id(create_if_missing=True)
-    if wid:
-        st.session_state["__ms_workbook_id__"] = str(wid)
-        st.success("OneDrive workbook ready.")
-        return str(wid)
-    return None
-def load_presets(self) -> dict:
-        """Load presets WITHOUT creating a workbook during normal page loads."""
-        try:
-            wid = self._resolve_workbook_id(create_if_missing=False)
-            if not wid:
-                return {}
-
-            ws = "presets"
-            url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-            r = self._graph_request("GET", url, timeout=20, max_retries=3)
-            if r.status_code >= 400:
-                return {}
-            data = self._safe_json(r)
-            vals = data.get("values", []) if isinstance(data, dict) else []
-            out = {}
-            for row in vals[1:]:
-                if len(row) >= 2:
-                    try:
-                        out[str(row[0])] = json.loads(row[1])
-                    except Exception:
-                        pass
-            return out
-        except Exception:
-            return {}
-
-# -----------------------------------------------------------------------------
-# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
-# -----------------------------------------------------------------------------
-#
-# This overrides the earlier MSExcelOAuth class with a safer, production-style
-# workbook lookup/creation strategy.
-#
-# Policy:
-# 1) Try stored workbook ID (persisted in the user's OneDrive approot as JSON)
-# 2) If missing, scan approot for any workbook with a FieldFlow marker sheet
-# 3) If still missing, search by name (FieldFlow) as last resort
-# 4) If none found, create one and store its ID
-#
-# The persisted pointer file makes this robust even if the user renames the
-# workbook.
-
-try:
-    _OldMSExcelOAuth = MSExcelOAuth  # type: ignore
-except Exception:
-    _OldMSExcelOAuth = object  # type: ignore
-
-
-class MSExcelOAuth(_OldMSExcelOAuth):  # type: ignore
-    """Microsoft 365 Excel backend with robust workbook discovery.
-
-    Note: this class is intentionally defined at the end of the module to
-    override any earlier MSExcelOAuth definition.
-    """
-
-    _POINTER_FILENAME = ".fieldflow_workbook.json"
-    _MARKER_SHEET = "_fieldflow_meta"
-    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
-
-    # ---- Graph helpers
-    def _graph_request(
-        self,
-        method: str,
-        url: str,
-        *,
-        json_body=None,
-        data=None,
-        headers=None,
-        timeout: int = 30,
-        max_retries: int = 6,
-    ):
-        """Graph request with throttling/backoff.
-
-        Retries on 429/503/504 and Graph error code quotaLimitReached.
-        """
-        base_headers = {"Authorization": f"Bearer {self.token}"}
-        if headers:
-            base_headers.update(headers)
-        if json_body is not None and "Content-Type" not in base_headers:
-            base_headers["Content-Type"] = "application/json"
-
-        last = None
-        for attempt in range(max_retries):
-            try:
-                r = requests.request(
-                    method,
-                    url,
-                    headers=base_headers,
-                    json=json_body,
-                    data=data,
-                    timeout=timeout,
-                )
-                last = r
-            except Exception:
-                time.sleep(min(2 ** attempt, 20))
-                continue
-
-            err_code = None
-            retry_after = None
-            try:
-                retry_after = r.headers.get("Retry-After")
-            except Exception:
-                pass
-            try:
-                if r.status_code >= 400:
-                    j = r.json()
-                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
-                        err_code = j["error"].get("code")
-            except Exception:
-                pass
-
-            throttled = (r.status_code in (429, 503, 504)) or (err_code == "quotaLimitReached")
-            if throttled and attempt < max_retries - 1:
-                if retry_after and str(retry_after).isdigit():
-                    wait = int(retry_after)
-                else:
-                    wait = min(2 ** attempt, 30)
-                time.sleep(wait)
-                continue
-
-            return r
-
-        return last
-
-    def _graph_json(self, r):
-        try:
-            return r.json() if r is not None else {}
-        except Exception:
-            return {}
-
-    # ---- Pointer file helpers (persistent across sessions)
-    def _pointer_url(self) -> str:
-        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
-
-    def _read_pointer(self) -> dict | None:
-        r = self._graph_request("GET", self._pointer_url(), timeout=20, max_retries=3)
-        if r is None or r.status_code == 404:
-            return None
-        if r.status_code >= 400:
-            return None
-        try:
-            return json.loads(r.content.decode("utf-8"))
-        except Exception:
-            return None
-
-    def _write_pointer(self, workbook_id: str, *, drive_id: str | None = None) -> None:
-        payload = {
-            "workbook_id": workbook_id,
-            "drive_id": drive_id or "me",
-            "updated_at": datetime.utcnow().isoformat(),
-        }
-        self._graph_request(
-            "PUT",
-            self._pointer_url(),
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload).encode("utf-8"),
-            timeout=30,
-            max_retries=4,
-        )
-
-    def _validate_workbook_id(self, workbook_id: str) -> bool:
-        if not workbook_id:
-            return False
-        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        return bool(r is not None and r.status_code < 400)
-
-    # ---- Marker helpers
-    def _marker_range_url(self, workbook_id: str, address: str = "A1") -> str:
-        ws = urllib.parse.quote(self._MARKER_SHEET)
-        addr = urllib.parse.quote(address)
-        return (
-            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/{ws}"
-            f"/range(address='{addr}')"
-        )
-
-    def _has_marker(self, workbook_id: str) -> bool:
-        r = self._graph_request("GET", self._marker_range_url(workbook_id, "A1"), timeout=20, max_retries=2)
-        if r is None or r.status_code >= 400:
-            return False
-        data = self._graph_json(r)
-        vals = data.get("values") if isinstance(data, dict) else None
-        try:
-            return bool(vals and vals[0] and str(vals[0][0]).strip() == self._MARKER_VALUE)
-        except Exception:
-            return False
-
-    def _ensure_marker(self, workbook_id: str) -> None:
-        # Ensure marker sheet exists
-        url_ws = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
-        r = self._graph_request("GET", url_ws, timeout=20, max_retries=3)
-        names = []
-        try:
-            names = [w.get("name") for w in self._graph_json(r).get("value", [])]
-        except Exception:
-            names = []
-        if self._MARKER_SHEET not in names:
-            add_url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
-            self._graph_request("POST", add_url, json_body={"name": self._MARKER_SHEET}, timeout=20, max_retries=3)
-
-        # Write marker values
-        values = [[self._MARKER_VALUE], ["v1"], [datetime.utcnow().isoformat()]]
-        # Use a range that spans A1:A3
-        ws = urllib.parse.quote(self._MARKER_SHEET)
-        url = (
-            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/{ws}"
-            "/range(address='A1:A3')"
-        )
-        self._graph_request("PATCH", url, json_body={"values": values}, timeout=20, max_retries=3)
-
-    # ---- Discovery
-    def _list_approot_children(self) -> list[dict]:
-        url = f"{self.base}/me/drive/special/approot/children?$select=id,name,lastModifiedDateTime,file&$top=200"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._graph_json(r)
-        return data.get("value", []) if isinstance(data, dict) else []
-
-    def _search_drive(self, q: str) -> list[dict]:
-        # Search in root (Graph search is scoped to a folder; root is good enough fallback)
-        url = f"{self.base}/me/drive/root/search(q='{q}')?$select=id,name,lastModifiedDateTime,file&$top=50"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._graph_json(r)
-        return data.get("value", []) if isinstance(data, dict) else []
-
-    def _create_workbook_in_approot(self) -> str:
-        # Gate repeated create attempts on reruns
-        now = time.time()
-        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
-        if now < next_ok:
-            raise RuntimeError("Microsoft is throttling workbook creation. Please wait a bit and try again.")
-
-        name = f"{self.title}.xlsx"
-
-        # Build a minimal valid XLSX
-        content = None
-        try:
-            from openpyxl import Workbook
-            import io
-            wb = Workbook()
-            buf = io.BytesIO()
-            wb.save(buf)
-            content = buf.getvalue()
-        except Exception:
-            # Fallback: (should still be valid enough for OneDrive upload)
-            content = b"PK\x03\x04"
-
-        url = f"{self.base}/me/drive/special/approot:/{name}:/content"
-        r = self._graph_request(
-            "PUT",
-            url,
-            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
-            data=content,
-            timeout=60,
-            max_retries=6,
-        )
-
-        if r is None or r.status_code >= 400:
-            data = self._graph_json(r)
-            code = None
-            msg = None
-            if isinstance(data, dict) and isinstance(data.get("error"), dict):
-                code = data["error"].get("code")
-                msg = data["error"].get("message")
-            # Cooldown if throttled
-            if (code == "quotaLimitReached") or (r is not None and r.status_code in (429, 503, 504)):
-                st.session_state["__ms_next_create_ok__"] = time.time() + 30
-                raise RuntimeError("Microsoft Graph is throttling requests (quotaLimitReached). Try again in ~30 seconds.")
-            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or (r.status_code if r else 'unknown')} {msg or ''}")
-
-        # Prefer id from response; if missing, resolve via approot listing
-        wid = None
-        try:
-            j = self._graph_json(r)
-            wid = j.get("id") if isinstance(j, dict) else None
-        except Exception:
-            wid = None
-        if not wid:
-            # Resolve by exact name
-            for it in self._list_approot_children():
-                if str(it.get("name", "")).lower() == name.lower():
-                    wid = it.get("id")
-                    break
-        if not wid:
-            raise RuntimeError("Workbook upload succeeded but could not resolve workbook id.")
-
-        # Mark + persist
-        self._ensure_marker(wid)
-        self._write_pointer(wid)
-        return wid
-
-    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
-        # Session cache
-        wid = st.session_state.get("__ms_workbook_id__")
-        if wid and self._validate_workbook_id(wid):
-            return wid
-
-        # 1) Pointer file
-        ptr = self._read_pointer() or {}
-        ptr_wid = ptr.get("workbook_id") if isinstance(ptr, dict) else None
-        if ptr_wid and self._validate_workbook_id(ptr_wid):
-            st.session_state["__ms_workbook_id__"] = ptr_wid
-            return ptr_wid
-
-        # 2) Scan approot for marker
-        approot_items = self._list_approot_children()
-        xlsx_items = [it for it in approot_items if str(it.get("name", "")).lower().endswith(".xlsx")]
-        # Newest first
-        xlsx_items.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-        for it in xlsx_items:
-            wid2 = it.get("id")
-            if not wid2:
-                continue
-            if self._has_marker(wid2):
-                st.session_state["__ms_workbook_id__"] = wid2
-                self._write_pointer(wid2)
-                return wid2
-
-        # 3) Name search fallback
-        items = self._search_drive("FieldFlow")
-        candidates = [it for it in items if str(it.get("name", "")).lower().endswith(".xlsx")]
-        candidates.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-        for it in candidates:
-            wid3 = it.get("id")
-            if not wid3:
-                continue
-            if self._has_marker(wid3):
-                st.session_state["__ms_workbook_id__"] = wid3
-                self._write_pointer(wid3)
-                return wid3
-
-        # If we found candidates but none had marker, adopt newest as last resort
-        if candidates:
-            wid4 = candidates[0].get("id")
-            if wid4 and self._validate_workbook_id(wid4):
-                try:
-                    self._ensure_marker(wid4)
-                except Exception:
-                    pass
-                st.session_state["__ms_workbook_id__"] = wid4
-                self._write_pointer(wid4)
-                return wid4
-
-        # 4) Create
-        if create_if_missing:
-            wid5 = self._create_workbook_in_approot()
-            st.session_state["__ms_workbook_id__"] = wid5
-            return wid5
-
+        if creds and creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+            _ss_set("__google_tokens__", {
+                "token": creds.token,
+                "refresh_token": creds.refresh_token,
+                "expiry": (creds.expiry.isoformat() if creds.expiry else ""),
+            })
+        return creds
+    except Exception:
         return None
 
-    # Override: keep signature used by parent methods
-    def _get_workbook_id(self, create_if_missing: bool = True) -> str:
-        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
-        if wid:
-            return wid
-        raise RuntimeError(
-            "No FieldFlow workbook found for this Microsoft account yet. "
-            "Try saving once (the app will create a workbook), or create a workbook then retry."
-        )
+class GoogleDriveBackend(StorageBackend):
+    name = "Google Drive"
 
-    # Override: creation entrypoint used by sidebar button
-    def _ensure_workbook(self):
-        wid = self._resolve_workbook_id(create_if_missing=True)
-        if wid:
-            st.session_state["__ms_workbook_id__"] = wid
+    def __init__(self):
+        creds = _google_credentials_from_session()
+        if creds is None:
+            raise RuntimeError("Google not authenticated.")
+        from googleapiclient.discovery import build
+        self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        self.folder_id = self._ensure_folder()
+
+    def _ensure_folder(self) -> str:
+        q = "mimeType='application/vnd.google-apps.folder' and name='%s' and trashed=false" % FOLDER_NAME
+        res = self.drive.files().list(q=q, spaces="drive", fields="files(id,name)").execute()
+        files = res.get("files", [])
+        if files:
+            return files[0]["id"]
+        body = {"name": FOLDER_NAME, "mimeType": "application/vnd.google-apps.folder"}
+        created = self.drive.files().create(body=body, fields="id").execute()
+        return created["id"]
+
+    def _upload_bytes(self, name: str, data: bytes, mime: str) -> str:
+        from googleapiclient.http import MediaIoBaseUpload
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+        body = {"name": name, "parents": [self.folder_id]}
+        created = self.drive.files().create(body=body, media_body=media, fields="id,name,createdTime").execute()
+        return created["id"]
+
+    def _list_in_folder(self) -> List[Dict[str, Any]]:
+        q = f"'{self.folder_id}' in parents and trashed=false"
+        res = self.drive.files().list(q=q, fields="files(id,name,createdTime,mimeType)", pageSize=200).execute()
+        return res.get("files", [])
+
+    def _download(self, file_id: str) -> bytes:
+        from googleapiclient.http import MediaIoBaseDownload
+        request = self.drive.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return fh.getvalue()
+
+    def _delete(self, file_id: str):
+        self.drive.files().delete(fileId=file_id).execute()
+
+    # submittal checks as JSON files
+    def save_submittal_check(self, payload: Dict[str, Any]) -> str:
+        cid = uuid.uuid4().hex
+        payload = dict(payload)
+        payload.setdefault("created_at", _now_iso())
+        name = f"submittal_{cid}.json"
+        self._upload_bytes(name, json.dumps(payload, indent=2).encode("utf-8"), "application/json")
+        return cid
+
+    def list_submittal_checks(self) -> pd.DataFrame:
+        files = [f for f in self._list_in_folder() if f["name"].startswith("submittal_") and f["name"].endswith(".json")]
+        out = []
+        for f in sorted(files, key=lambda x: x.get("createdTime",""), reverse=True)[:50]:
+            cid = f["name"].replace("submittal_","").replace(".json","")
+            out.append({"id": cid, "created_at": f.get("createdTime",""), "file_id": f["id"], "name": f["name"]})
+        return pd.DataFrame(out)
+
+    def load_submittal_check(self, check_id: str) -> Optional[Dict[str, Any]]:
+        target = f"submittal_{check_id}.json"
+        files = [f for f in self._list_in_folder() if f["name"] == target]
+        if not files:
+            return None
+        data = self._download(files[0]["id"])
+        try:
+            return json.loads(data.decode("utf-8"))
+        except Exception:
+            return None
+
+    def delete_submittal_check(self, check_id: str) -> None:
+        target = f"submittal_{check_id}.json"
+        files = [f for f in self._list_in_folder() if f["name"] == target]
+        if files:
+            self._delete(files[0]["id"])
+
+    # schedule runs: meta json + baseline/crashed csv
+    def save_schedule_run(self, meta: Dict[str, Any], baseline_df: pd.DataFrame, crashed_df: pd.DataFrame) -> str:
+        run_id = uuid.uuid4().hex
+        created_at = _now_iso()
+        meta_obj = dict(meta)
+        meta_obj.setdefault("created_at", created_at)
+        meta_name = f"schedule_{run_id}_meta.json"
+        base_name = f"schedule_{run_id}_baseline.csv"
+        crash_name = f"schedule_{run_id}_crashed.csv"
+        self._upload_bytes(meta_name, json.dumps(meta_obj, indent=2).encode("utf-8"), "application/json")
+        self._upload_bytes(base_name, baseline_df.to_csv(index=False).encode("utf-8"), "text/csv")
+        self._upload_bytes(crash_name, crashed_df.to_csv(index=False).encode("utf-8"), "text/csv")
+        return run_id
+
+    def list_schedule_runs(self) -> pd.DataFrame:
+        files = [f for f in self._list_in_folder() if f["name"].startswith("schedule_") and f["name"].endswith("_meta.json")]
+        out = []
+        for f in sorted(files, key=lambda x: x.get("createdTime",""), reverse=True)[:50]:
+            run_id = f["name"].replace("schedule_","").replace("_meta.json","")
+            # try parse some meta fields quickly by downloading small json
+            meta = {}
             try:
-                st.success("OneDrive workbook ready.")
+                meta = json.loads(self._download(f["id"]).decode("utf-8"))
             except Exception:
-                pass
+                meta = {}
+            out.append({
+                "run_id": run_id,
+                "created_at": meta.get("created_at", f.get("createdTime","")),
+                **{k: meta.get(k) for k in ["company","client","project","scenario","kind","baseline_days","crashed_days"]},
+            })
+        return pd.DataFrame(out)
 
-    # Override: avoid creating workbook just to load presets
-    def load_presets(self) -> dict:
-        try:
-            wid = self._resolve_workbook_id(create_if_missing=False)
-            if not wid:
-                return {}
-            ws = "presets"
-            url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-            r = self._graph_request("GET", url, timeout=20, max_retries=3)
-            if r is None or r.status_code >= 400:
-                return {}
-            vals = self._graph_json(r).get("values", [])
-            out = {}
-            for row in vals[1:]:
-                if len(row) >= 2:
-                    try:
-                        out[str(row[0])] = json.loads(row[1])
-                    except Exception:
-                        pass
-            return out
-        except Exception:
-            return {}
-
-
-# -----------------------------------------------------------------------------
-# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
-# -----------------------------------------------------------------------------
-#
-# This module originally defined MSExcelOAuth earlier. We redefine it here as a
-# subclass that overrides only the workbook discovery/creation logic.
-#
-# Policy:
-# 1) Try stored workbook ID (best, rename-proof)
-# 2) If missing, look in OneDrive app folder (approot) for any workbook that
-#    contains the FieldFlow marker
-# 3) If still missing, search by name ('FieldFlow') as a last resort
-# 4) If none found, create one, add marker, and store its ID
-
-_MSEXCEL_OAUTH_BASE = MSExcelOAuth  # keep the original implementation for data ops
-
-
-class MSExcelOAuth(_MSEXCEL_OAUTH_BASE):
-    """Microsoft Excel backend with robust workbook discovery.
-
-    Stores a small pointer file in the user's OneDrive *app folder* (approot):
-    `.fieldflow_workbook.json`, which contains the workbook driveItem id.
-
-    This makes the integration resilient to:
-    - workbook renames
-    - workbook moves (within the same drive)
-    - Streamlit reruns (prevents repeated create calls)
-    """
-
-    _POINTER_FILENAME = ".fieldflow_workbook.json"
-    _MARKER_SHEET = "_fieldflow_meta"
-    _MARKER_CELL = "A1"
-    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
-
-    # ---- Graph helpers
-    def _graph_headers(self, extra: dict | None = None) -> dict:
-        h = {"Authorization": f"Bearer {self.token}"}
-        if extra:
-            h.update(extra)
-        return h
-
-    def _graph_request(self, method: str, url: str, *, json_body=None, data=None, headers=None, timeout: int = 30, max_retries: int = 6) -> requests.Response:
-        """Graph request with backoff for throttling/quota.
-
-        Retries on:
-        - 429, 503, 504
-        - Graph error code: quotaLimitReached
-
-        Uses Retry-After when available.
-        """
-        h = self._graph_headers(headers)
-        last = None
-        for attempt in range(max_retries):
-            try:
-                r = requests.request(method, url, headers=h, json=json_body, data=data, timeout=timeout)
-                last = r
-            except Exception:
-                time.sleep(min(2 ** attempt, 30))
-                continue
-
-            err_code = None
-            try:
-                if r.status_code >= 400:
-                    j = r.json()
-                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
-                        err_code = j["error"].get("code")
-            except Exception:
-                pass
-
-            throttled = r.status_code in (429, 503, 504) or (err_code == "quotaLimitReached")
-            if throttled and attempt < max_retries - 1:
-                ra = r.headers.get("Retry-After")
-                if ra and str(ra).isdigit():
-                    wait = int(ra)
-                else:
-                    wait = min(2 ** attempt, 30)
-                time.sleep(wait)
-                continue
-
-            return r
-
-        return last if last is not None else requests.Response()
-
-    @staticmethod
-    def _safe_json(r: requests.Response) -> dict:
-        try:
-            return r.json()
-        except Exception:
-            return {}
-
-    # ---- Pointer file in approot
-    def _pointer_content_url(self) -> str:
-        # Using approot so the file isn't littering Drive root.
-        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
-
-    def _read_pointer(self) -> str | None:
-        url = self._pointer_content_url()
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        if r.status_code == 404:
+    def get_schedule_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        meta_name = f"schedule_{run_id}_meta.json"
+        base_name = f"schedule_{run_id}_baseline.csv"
+        crash_name = f"schedule_{run_id}_crashed.csv"
+        files = {f["name"]: f["id"] for f in self._list_in_folder()}
+        if meta_name not in files or base_name not in files or crash_name not in files:
             return None
-        if r.status_code >= 400:
-            return None
-        try:
-            obj = json.loads(r.content.decode("utf-8"))
-            wid = obj.get("workbook_id") if isinstance(obj, dict) else None
-            return str(wid) if wid else None
-        except Exception:
-            return None
-
-    def _write_pointer(self, workbook_id: str) -> None:
-        url = self._pointer_content_url()
-        payload = json.dumps({"workbook_id": workbook_id, "updated_at": datetime.utcnow().isoformat()}).encode("utf-8")
-        _ = self._graph_request(
-            "PUT",
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=20,
-            max_retries=3,
-        )
-
-    # ---- Workbook verification + listing
-    def _workbook_exists(self, workbook_id: str) -> bool:
-        if not workbook_id:
-            return False
-        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
-        r = self._graph_request("GET", url, timeout=15, max_retries=2)
-        return 200 <= r.status_code < 300
-
-    def _list_approot_children(self) -> list[dict]:
-        url = f"{self.base}/me/drive/special/approot/children?$select=id,name,lastModifiedDateTime,file&$top=200"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._safe_json(r)
-        items = data.get("value", []) if isinstance(data, dict) else []
-        return items if isinstance(items, list) else []
-
-    def _search_drive(self, q: str) -> list[dict]:
-        q_esc = str(q).replace("'", "")
-        url = f"{self.base}/me/drive/root/search(q='{q_esc}')?$select=id,name,lastModifiedDateTime,file&$top=50"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._safe_json(r)
-        items = data.get("value", []) if isinstance(data, dict) else []
-        return items if isinstance(items, list) else []
-
-    # ---- Marker sheet
-    def _marker_range_url(self, workbook_id: str, ws_name: str, address: str) -> str:
-        return (
-            f"{self.base}/me/drive/items/{workbook_id}"
-            f"/workbook/worksheets/{urllib.parse.quote(ws_name)}/range(address='{address}')"
-        )
-
-    def _worksheet_names(self, workbook_id: str) -> list[str]:
-        url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        if r.status_code >= 400:
-            return []
-        data = self._safe_json(r)
-        vals = data.get("value", []) if isinstance(data, dict) else []
-        return [w.get("name") for w in vals if isinstance(w, dict) and w.get("name")]
-
-    def _has_marker(self, workbook_id: str) -> bool:
-        try:
-            names = self._worksheet_names(workbook_id)
-            if self._MARKER_SHEET not in names:
-                return False
-
-            url = self._marker_range_url(workbook_id, self._MARKER_SHEET, self._MARKER_CELL)
-            r = self._graph_request("GET", url, timeout=20, max_retries=3)
-            if r.status_code >= 400:
-                return False
-            data = self._safe_json(r)
-            vals = data.get("values") if isinstance(data, dict) else None
-            if not vals or not isinstance(vals, list) or not vals[0] or not isinstance(vals[0], list):
-                return False
-            return str(vals[0][0]).strip() == self._MARKER_VALUE
-        except Exception:
-            return False
-
-    def _ensure_marker(self, workbook_id: str) -> None:
-        """Ensure the FieldFlow marker exists in the workbook."""
-        names = self._worksheet_names(workbook_id)
-        if self._MARKER_SHEET not in names:
-            url_ws = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
-            r = self._graph_request("POST", url_ws, json_body={"name": self._MARKER_SHEET}, timeout=20, max_retries=3)
-            if r.status_code >= 400:
-                # If we can't add it, we don't fail the whole app.
-                return
-
-        url = self._marker_range_url(workbook_id, self._MARKER_SHEET, "A1:A3")
-        _ = self._graph_request(
-            "PATCH",
-            url,
-            json_body={"values": [[self._MARKER_VALUE], ["version"], ["created_at:" + datetime.utcnow().isoformat()]]},
-            timeout=20,
-            max_retries=3,
-        )
-
-    # ---- Core policy resolver
-    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
-        # Cache
-        cached = st.session_state.get("__ms_workbook_id__")
-        if cached and self._workbook_exists(cached):
-            return cached
-
-        # 1) Pointer file
-        wid = self._read_pointer()
-        if wid and self._workbook_exists(wid):
-            st.session_state["__ms_workbook_id__"] = wid
-            return wid
-
-        # 2) Scan approot for marker
-        approot_items = self._list_approot_children()
-        xlsx_items = [it for it in approot_items if str(it.get("name", "")).lower().endswith(".xlsx")]
-        # Prefer ones that look like ours
-        xlsx_items.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-        for it in xlsx_items:
-            cand = it.get("id")
-            if cand and self._has_marker(cand):
-                st.session_state["__ms_workbook_id__"] = cand
-                self._write_pointer(cand)
-                return cand
-
-        # 3) Search by name (last resort)
-        hits = self._search_drive("FieldFlow")
-        hits = [it for it in hits if str(it.get("name", "")).lower().endswith(".xlsx")]
-        hits.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-        for it in hits:
-            cand = it.get("id")
-            if cand and self._has_marker(cand):
-                st.session_state["__ms_workbook_id__"] = cand
-                self._write_pointer(cand)
-                return cand
-
-        # If we have name hits but no marker, adopt the newest one (still last-resort)
-        if hits:
-            cand = hits[0].get("id")
-            if cand and self._workbook_exists(cand):
-                # Install marker + pointer to make future runs rename-proof
-                self._ensure_marker(cand)
-                self._write_pointer(cand)
-                st.session_state["__ms_workbook_id__"] = cand
-                return cand
-
-        if not create_if_missing:
-            return None
-
-        # 4) Create
-        return self._create_workbook_in_approot()
-
-    def _create_workbook_in_approot(self) -> str:
-        # Prevent rerun spam
-        now = time.time()
-        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
-        if now < next_ok:
-            raise RuntimeError("Microsoft is throttling workbook creation. Please wait ~30 seconds and try again.")
-
-        # Create a minimal valid workbook (Excel) and upload to approot
-        name = f"{self.title}.xlsx"
-        try:
-            from openpyxl import Workbook
-            import io as _io
-            wb = Workbook()
-            buf = _io.BytesIO()
-            wb.save(buf)
-            content = buf.getvalue()
-        except Exception:
-            # last-resort (should still create a file, but may not be valid excel)
-            content = b"PK\x03\x04"
-
-        url = f"{self.base}/me/drive/special/approot:/{name}:/content"
-        r = self._graph_request(
-            "PUT",
-            url,
-            data=content,
-            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
-            timeout=60,
-            max_retries=6,
-        )
-
-        if r.status_code >= 400:
-            data = self._safe_json(r)
-            code = None
-            msg = None
-            if isinstance(data, dict) and isinstance(data.get("error"), dict):
-                code = data["error"].get("code")
-                msg = data["error"].get("message")
-            if code == "quotaLimitReached" or r.status_code in (429, 503, 504):
-                st.session_state["__ms_next_create_ok__"] = time.time() + 30
-                raise RuntimeError("Microsoft is throttling requests (quotaLimitReached). Please wait ~30 seconds and try again.")
-            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or r.status_code} {msg or ''}")
-
-        # Find it in approot to get id
-        wid = None
-        try:
-            for it in self._list_approot_children():
-                if str(it.get("name", "")) == name and str(it.get("id")):
-                    wid = str(it.get("id"))
-                    break
-        except Exception:
-            wid = None
-
-        if not wid:
-            # Some responses include id; try to use it
-            data = self._safe_json(r)
-            wid = data.get("id") if isinstance(data, dict) else None
-
-        if not wid:
-            raise RuntimeError("Workbook created but could not resolve its id. Please try again.")
-
-        # Install marker and pointer
-        self._ensure_marker(wid)
-        self._write_pointer(wid)
-        st.session_state["__ms_workbook_id__"] = wid
-        return wid
-
-    # ---- Overridden entrypoints used by the rest of the app
-    def _find_existing_workbook_id(self) -> str | None:  # compatibility
-        return self._resolve_workbook_id(create_if_missing=False)
-
-    def _get_workbook_id(self, create_if_missing: bool = True) -> str:
-        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
-        if wid:
-            return wid
-        raise RuntimeError(
-            "No FieldFlow workbook found in your OneDrive yet. "
-            "Try saving once (the app will create it), or use the Settings page to initialize."
-        )
-
-    def _ensure_workbook(self):
-        _ = self._get_workbook_id(create_if_missing=True)
-
-    def load_presets(self) -> dict:
-        """Load presets without creating a workbook during normal reruns."""
-        wid = self._resolve_workbook_id(create_if_missing=False)
-        if not wid:
-            return {}
-        ws = "presets"
-        url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        if r.status_code >= 400:
-            return {}
-        data = self._safe_json(r)
-        vals = data.get("values", []) if isinstance(data, dict) else []
-        out = {}
-        for row in vals[1:]:
-            if len(row) >= 2:
-                try:
-                    out[str(row[0])] = json.loads(row[1])
-                except Exception:
-                    pass
-        return out
-
-
-# -----------------------------------------------------------------------------
-# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
-# -----------------------------------------------------------------------------
-#
-# This file originally defines MSExcelOAuth above. We redefine it here as a
-# subclass that keeps all existing worksheet/table logic, but replaces the
-# workbook lookup/creation to avoid Graph quota issues and to survive renames.
-#
-# Policy:
-# 1) Try stored workbook ID (persisted in the user's OneDrive approot as a JSON file)
-# 2) If missing, scan approot for any workbook with a FieldFlow marker
-# 3) If still missing, search by name "FieldFlow" (last resort)
-# 4) If none found, create a workbook and store its ID
-
-_OLD_MSExcelOAuth = MSExcelOAuth
-
-class MSExcelOAuth(_OLD_MSExcelOAuth):
-    """Microsoft Excel backend with rename-proof workbook lookup.
-
-    We persist the workbook id in OneDrive's *app folder* (approot) in a small
-    JSON file so the workbook can be renamed without breaking the app.
-    """
-
-    _POINTER_FILENAME = ".fieldflow_workbook.json"
-    _MARKER_SHEET = "_fieldflow_meta"
-    _MARKER_CELL = "A1"
-    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
-
-    # ---- Graph helpers (throttle aware)
-    def _graph_request(self, method: str, url: str, *, headers: dict | None = None,
-                       json_body=None, data=None, timeout: int = 30, max_retries: int = 6) -> requests.Response:
-        base_headers = {"Authorization": f"Bearer {self.token}"}
-        if headers:
-            base_headers.update(headers)
-
-        last = None
-        for attempt in range(max_retries):
-            try:
-                r = requests.request(method, url, headers=base_headers, json=json_body, data=data, timeout=timeout)
-                last = r
-            except Exception:
-                # transient network-ish
-                time.sleep(min(2 ** attempt, 20))
-                continue
-
-            # Determine throttling
-            err_code = None
-            try:
-                if r.status_code >= 400:
-                    j = r.json()
-                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
-                        err_code = j["error"].get("code")
-            except Exception:
-                pass
-
-            throttled = r.status_code in (429, 503, 504) or err_code == "quotaLimitReached"
-            if throttled and attempt < max_retries - 1:
-                ra = r.headers.get("Retry-After")
-                if ra and str(ra).isdigit():
-                    wait = int(ra)
-                else:
-                    wait = min(2 ** attempt, 30)
-                time.sleep(wait)
-                continue
-
-            return r
-
-        return last if last is not None else requests.Response()
-
-    def _graph_json(self, r: requests.Response) -> dict:
-        try:
-            return r.json()
-        except Exception:
-            return {}
-
-    # ---- Pointer file (persist workbook id in user's OneDrive approot)
-    def _pointer_url(self) -> str:
-        # Read/write raw content of a file in approot.
-        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
-
-    def _read_pointer(self) -> dict | None:
-        r = self._graph_request("GET", self._pointer_url(), timeout=20, max_retries=3)
-        if r is None or getattr(r, "status_code", 0) == 404:
-            return None
-        if getattr(r, "status_code", 0) >= 400:
-            return None
-        try:
-            return json.loads(r.content.decode("utf-8"))
-        except Exception:
-            return None
-
-    def _write_pointer(self, workbook_id: str) -> None:
-        payload = {
-            "workbook_id": workbook_id,
-            "updated_at": datetime.utcnow().isoformat() + "Z",
-            "app": "FieldFlow",
-        }
-        content = json.dumps(payload, indent=2).encode("utf-8")
-        r = self._graph_request(
-            "PUT",
-            self._pointer_url(),
-            headers={"Content-Type": "application/json"},
-            data=content,
-            timeout=30,
-            max_retries=5,
-        )
-        # ignore errors; pointer is a convenience
-        _ = r
-
-    def _validate_workbook_id(self, workbook_id: str) -> bool:
-        if not workbook_id:
-            return False
-        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        return getattr(r, "status_code", 0) < 400
-
-    # ---- Marker sheet (lets us confirm a workbook is truly ours)
-    def _marker_read(self, workbook_id: str) -> str | None:
-        url = (
-            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/"
-            f"{urllib.parse.quote(self._MARKER_SHEET)}/range(address='{self._MARKER_CELL}')"
-        )
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        if getattr(r, "status_code", 0) >= 400:
-            return None
-        data = self._graph_json(r)
-        vals = data.get("values")
-        try:
-            return str(vals[0][0])
-        except Exception:
-            return None
-
-    def _has_marker(self, workbook_id: str) -> bool:
-        try:
-            return self._marker_read(workbook_id) == self._MARKER_VALUE
-        except Exception:
-            return False
-
-    def _update_range_by_id(self, workbook_id: str, ws_name: str, start_cell: str, values_2d: list[list]):
-        # Same as parent _update_range, but allows specifying workbook id.
-        m2 = re.match(r"^([A-Z]+)(\d+)$", str(start_cell).upper().strip())
-        if not m2:
-            raise ValueError(f"Bad start_cell: {start_cell}")
-        col_letters, row_str = m2.group(1), m2.group(2)
-        start_row = int(row_str)
-
-        nrows = max(1, len(values_2d))
-        ncols = max(1, max((len(r) for r in values_2d), default=1))
-
-        start_col_num = 0
-        for ch in col_letters:
-            start_col_num = start_col_num * 26 + (ord(ch) - 64)
-
-        def _col_name(n: int) -> str:
-            name = ""
-            while n > 0:
-                n, rr = divmod(n - 1, 26)
-                name = chr(65 + rr) + name
-            return name
-
-        end_col_num = start_col_num + ncols - 1
-        end_row = start_row + nrows - 1
-        end_cell = f"{_col_name(end_col_num)}{end_row}"
-        address = f"{col_letters}{start_row}:{end_cell}"
-
-        url = (
-            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/"
-            f"{urllib.parse.quote(ws_name)}/range(address='{address}')"
-        )
-        self._graph_request(
-            "PATCH",
-            url,
-            headers={"Content-Type": "application/json"},
-            json_body={"values": values_2d},
-            timeout=30,
-            max_retries=4,
-        )
-
-    def _ensure_marker(self, workbook_id: str) -> None:
-        # Ensure the marker sheet exists and set A1.
-        url_ws = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
-        r = self._graph_request("GET", url_ws, timeout=20, max_retries=3)
-        if getattr(r, "status_code", 0) >= 400:
-            return
-        data = self._graph_json(r)
-        names = [w.get("name") for w in data.get("value", []) if isinstance(w, dict)]
-        if self._MARKER_SHEET not in names:
-            add_url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
-            self._graph_request(
-                "POST",
-                add_url,
-                headers={"Content-Type": "application/json"},
-                json_body={"name": self._MARKER_SHEET},
-                timeout=30,
-                max_retries=4,
-            )
-        # Set marker value
-        try:
-            self._update_range_by_id(workbook_id, self._MARKER_SHEET, "A1", [[self._MARKER_VALUE], ["v1"], [datetime.utcnow().isoformat() + "Z"]])
-        except Exception:
-            pass
-
-    # ---- Step 2 helpers
-    def _approot_children(self) -> list[dict]:
-        url = f"{self.base}/me/drive/special/approot/children?$select=id,name,lastModifiedDateTime,file&$top=200"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._graph_json(r)
-        return data.get("value", []) if isinstance(data, dict) else []
-
-    def _search_drive(self, q: str) -> list[dict]:
-        url = f"{self.base}/me/drive/root/search(q='{q}')?$select=id,name,lastModifiedDateTime,file&$top=50"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._graph_json(r)
-        return data.get("value", []) if isinstance(data, dict) else []
-
-    def _create_workbook_in_approot(self) -> str:
-        # Gate creation (Streamlit reruns)
-        now = time.time()
-        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
-        if now < next_ok:
-            raise RuntimeError("Microsoft is throttling workbook creation. Please wait a moment and try again.")
-
-        # Create a minimal valid workbook bytes
-        try:
-            from openpyxl import Workbook
-            import io
-            wb = Workbook()
-            buf = io.BytesIO()
-            wb.save(buf)
-            content = buf.getvalue()
-        except Exception:
-            content = b"PK\x03\x04"
-
-        name = f"{self.title}.xlsx"
-        url = f"{self.base}/me/drive/special/approot:/{name}:/content"
-        r = self._graph_request(
-            "PUT",
-            url,
-            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
-            data=content,
-            timeout=60,
-            max_retries=6,
-        )
-        if getattr(r, "status_code", 0) >= 400:
-            # Set a cooldown and provide a human message
-            st.session_state["__ms_next_create_ok__"] = time.time() + 30
-            data = self._graph_json(r)
-            code = None
-            msg = None
-            if isinstance(data, dict) and isinstance(data.get("error"), dict):
-                code = data["error"].get("code")
-                msg = data["error"].get("message")
-            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or r.status_code} {msg or ''}".strip())
-
-        # Resolve id (upload usually returns it, but we also fall back to listing approot)
-        try:
-            item = r.json()
-            wid = item.get("id")
-            if wid:
-                return wid
-        except Exception:
-            pass
-
-        # Fallback: list approot and find by name
-        want = name.lower()
-        items = self._approot_children()
-        for it in items:
-            if str(it.get("name", "")).lower() == want:
-                return str(it.get("id"))
-        raise RuntimeError("Workbook upload succeeded but workbook id could not be resolved.")
-
-    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
-        # Cache
-        wid = st.session_state.get("__ms_workbook_id__")
-        if wid and self._validate_workbook_id(wid):
-            return wid
-
-        # Step 1: pointer file
-        p = self._read_pointer()
-        if isinstance(p, dict):
-            pwid = p.get("workbook_id")
-            if isinstance(pwid, str) and self._validate_workbook_id(pwid):
-                st.session_state["__ms_workbook_id__"] = pwid
-                return pwid
-
-        # Step 2: scan approot for marker
-        approot = self._approot_children()
-        xlsx = [it for it in approot if str(it.get("name", "")).lower().endswith(".xlsx")]
-        # newest first
-        xlsx.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-        for it in xlsx:
-            cid = str(it.get("id", ""))
-            if cid and self._has_marker(cid):
-                st.session_state["__ms_workbook_id__"] = cid
-                try:
-                    self._write_pointer(cid)
-                except Exception:
-                    pass
-                return cid
-
-        # Step 3: name search (last resort)
-        hits = self._search_drive("FieldFlow")
-        candidates = []
-        for it in hits:
-            name = str(it.get("name", ""))
-            if not name.lower().endswith(".xlsx"):
-                continue
-            candidates.append(it)
-        candidates.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-
-        for it in candidates:
-            cid = str(it.get("id", ""))
-            if cid and self._has_marker(cid):
-                st.session_state["__ms_workbook_id__"] = cid
-                try:
-                    self._write_pointer(cid)
-                except Exception:
-                    pass
-                return cid
-
-        # If we found name-matches but no marker, we can *adopt* the newest one.
-        if candidates:
-            cid = str(candidates[0].get("id", ""))
-            if cid and self._validate_workbook_id(cid):
-                try:
-                    self._ensure_marker(cid)
-                    self._write_pointer(cid)
-                except Exception:
-                    pass
-                st.session_state["__ms_workbook_id__"] = cid
-                return cid
-
-        # None found
-        if not create_if_missing:
-            return None
-
-        # Create + mark + persist
-        wid_new = self._create_workbook_in_approot()
-        try:
-            self._ensure_marker(wid_new)
-        except Exception:
-            pass
-        try:
-            self._write_pointer(wid_new)
-        except Exception:
-            pass
-        st.session_state["__ms_workbook_id__"] = wid_new
-        return wid_new
-
-    # --- Override: workbook id getter used by parent methods
-    def _get_workbook_id(self, create_if_missing: bool = True) -> str:
-        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
-        if wid:
-            return wid
-        raise RuntimeError(
-            "No FieldFlow workbook found in your OneDrive yet. "
-            "Try saving once (the app will create it), or use the Settings page to initialize."
-        )
-
-    # --- Override: workbook initializer button should reuse the same policy
-    def _ensure_workbook(self):
-        wid = self._resolve_workbook_id(create_if_missing=True)
-        if not wid:
-            raise RuntimeError("Failed to create or resolve OneDrive workbook.")
-        # Friendly UI
-        try:
-            st.success("Workbook ready in OneDrive (auto-detected / reused).")
-        except Exception:
-            pass
-
-    # --- Override: presets read should NOT create workbooks during page load
-    def load_presets(self) -> dict:
-        wid = self._resolve_workbook_id(create_if_missing=False)
-        if not wid:
-            return {}
-        ws = "presets"
-        url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        if getattr(r, "status_code", 0) >= 400:
-            return {}
-        data = self._graph_json(r)
-        vals = data.get("values", []) if isinstance(data, dict) else []
-        out: dict = {}
-        for row in vals[1:]:
-            if len(row) >= 2:
-                try:
-                    out[str(row[0])] = json.loads(row[1])
-                except Exception:
-                    pass
-        return out
-
-    # Ensure we don't create the workbook just to check worksheets during read paths.
-    def _ensure_worksheet(self, name: str, headers: list[str], create_if_missing: bool = True):
-        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
-        if not wid:
-            raise RuntimeError("OneDrive workbook not initialized.")
-        url_ws = f"{self.base}/me/drive/items/{wid}/workbook/worksheets"
-        r = self._graph_request("GET", url_ws, timeout=20, max_retries=3)
-        data = self._graph_json(r)
-        names = [w.get("name") for w in data.get("value", []) if isinstance(w, dict)]
-        if name not in names and create_if_missing:
-            add_url = url_ws + "/add"
-            self._graph_request(
-                "POST",
-                add_url,
-                headers={"Content-Type": "application/json"},
-                json_body={"name": name},
-                timeout=30,
-                max_retries=4,
-            )
-            # Write headers
-            try:
-                self._update_range_by_id(wid, name, "A1", [headers])
-            except Exception:
-                pass
-        # Keep feedback sheet for feedback operations when we are in create mode
-        if create_if_missing and name != "feedback":
-            try:
-                if "feedback" not in names:
-                    self._ensure_worksheet("feedback", ["created_at","user_id","page","rating","categories","email","message"], create_if_missing=True)
-            except Exception:
-                pass
-
-
-# -----------------------------------------------------------------------------
-# Microsoft Excel (OAuth) workbook discovery + persistence (rename-proof)
-# -----------------------------------------------------------------------------
-#
-# This file originally defines MSExcelOAuth above. We redefine it here as a
-# subclass that keeps all existing worksheet storage logic, but replaces the
-# workbook lookup/creation to avoid Graph `quotaLimitReached` and to remain
-# stable even if the user renames the workbook.
-#
-# Policy:
-#  1) Try a stored workbook ID (persisted in the user's OneDrive App Folder).
-#  2) If missing, scan the App Folder for a workbook with a FieldFlow marker.
-#  3) If still missing, search the drive by name as a last resort.
-#  4) If none found, create a new workbook and store its ID.
-
-try:
-    _MSExcelOAuth_BASE = MSExcelOAuth  # type: ignore
-except Exception:
-    _MSExcelOAuth_BASE = object  # pragma: no cover
-
-
-class MSExcelOAuth(_MSExcelOAuth_BASE):  # type: ignore
-    _POINTER_FILENAME = ".fieldflow_workbook.json"
-    _MARKER_SHEET = "_fieldflow_meta"
-    _MARKER_VALUE = "FIELD_FLOW_WORKBOOK"
-    _CREATE_COOLDOWN_SEC = 30
-
-    # -----------------------------
-    # Graph helpers (retry/backoff)
-    # -----------------------------
-    def _graph_request(
-        self,
-        method: str,
-        url: str,
-        *,
-        json_body=None,
-        data=None,
-        headers: dict | None = None,
-        timeout: int = 30,
-        max_retries: int = 5,
-    ):
-        base_headers = {"Authorization": f"Bearer {self.token}"}
-        if headers:
-            base_headers.update(headers)
-        if "Content-Type" not in base_headers and json_body is not None:
-            base_headers["Content-Type"] = "application/json"
-
-        last = None
-        for attempt in range(max_retries):
-            try:
-                r = requests.request(
-                    method,
-                    url,
-                    headers=base_headers,
-                    json=json_body,
-                    data=data,
-                    timeout=timeout,
-                )
-                last = r
-            except Exception:
-                time.sleep(min(2 ** attempt, 20))
-                continue
-
-            err_code = None
-            retry_after = None
-            try:
-                retry_after = r.headers.get("Retry-After")
-            except Exception:
-                pass
-            try:
-                if r.status_code >= 400:
-                    j = r.json()
-                    if isinstance(j, dict) and isinstance(j.get("error"), dict):
-                        err_code = j["error"].get("code")
-            except Exception:
-                pass
-
-            throttled = r.status_code in (429, 503, 504) or err_code == "quotaLimitReached"
-            if throttled and attempt < max_retries - 1:
-                if retry_after and str(retry_after).isdigit():
-                    wait = int(retry_after)
-                else:
-                    wait = min(2 ** attempt, self._CREATE_COOLDOWN_SEC)
-                time.sleep(wait)
-                continue
-
-            return r
-
-        return last
-
-    @staticmethod
-    def _graph_json(r) -> dict:
-        try:
-            return r.json() if r is not None else {}
-        except Exception:
-            return {}
-
-    # -----------------------------
-    # OneDrive pointer file (persist workbook id across sessions)
-    # -----------------------------
-    def _pointer_content_url(self) -> str:
-        # App Folder path-based access
-        return f"{self.base}/me/drive/special/approot:/{self._POINTER_FILENAME}:/content"
-
-    def _read_pointer(self) -> dict | None:
-        r = self._graph_request("GET", self._pointer_content_url(), timeout=20, max_retries=3)
-        if r is None or r.status_code in (404, 403):
-            return None
-        if r.status_code >= 400:
-            return None
-        try:
-            return json.loads(r.text)
-        except Exception:
-            return None
-
-    def _write_pointer(self, workbook_id: str, *, source: str) -> None:
-        payload = {
-            "workbook_id": workbook_id,
-            "source": source,
-            "updated_at": datetime.utcnow().isoformat(),
-            "app": "FieldFlow",
-        }
-        data = json.dumps(payload).encode("utf-8")
-        self._graph_request(
-            "PUT",
-            self._pointer_content_url(),
-            headers={"Content-Type": "application/json"},
-            data=data,
-            timeout=30,
-            max_retries=3,
-        )
-
-    def _validate_workbook_id(self, workbook_id: str) -> bool:
-        url = f"{self.base}/me/drive/items/{workbook_id}?$select=id,name"
-        r = self._graph_request("GET", url, timeout=20, max_retries=2)
-        return bool(r is not None and r.status_code < 400)
-
-    # -----------------------------
-    # Marker sheet helpers
-    # -----------------------------
-    def _worksheet_names(self, workbook_id: str) -> list[str]:
-        url = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets?$select=name"
-        r = self._graph_request("GET", url, timeout=20, max_retries=2)
-        data = self._graph_json(r)
-        vals = data.get("value", []) if isinstance(data, dict) else []
-        return [str(v.get("name")) for v in vals if isinstance(v, dict) and v.get("name")]
-
-    def _has_marker(self, workbook_id: str) -> bool:
-        # Fast-path: check marker sheet A1
-        sheet = urllib.parse.quote(self._MARKER_SHEET)
-        url = (
-            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/{sheet}"
-            f"/range(address='A1')"
-        )
-        r = self._graph_request("GET", url, timeout=20, max_retries=2)
-        if r is None or r.status_code >= 400:
-            return False
-        data = self._graph_json(r)
-        try:
-            values = data.get("values")
-            if values and values[0] and str(values[0][0]).strip() == self._MARKER_VALUE:
-                return True
-        except Exception:
-            pass
+        meta = json.loads(self._download(files[meta_name]).decode("utf-8"))
+        baseline_df = pd.read_csv(io.StringIO(self._download(files[base_name]).decode("utf-8")))
+        crashed_df = pd.read_csv(io.StringIO(self._download(files[crash_name]).decode("utf-8")))
+        return {"run_id": run_id, "created_at": meta.get("created_at",""), "meta": meta, "baseline_df": baseline_df, "crashed_df": crashed_df}
+
+    def delete_schedule_run(self, run_id: str) -> None:
+        names = [
+            f"schedule_{run_id}_meta.json",
+            f"schedule_{run_id}_baseline.csv",
+            f"schedule_{run_id}_crashed.csv",
+        ]
+        files = {f["name"]: f["id"] for f in self._list_in_folder()}
+        for n in names:
+            if n in files:
+                self._delete(files[n])
+
+# ----------------------------
+# OneDrive backend (files)
+# ----------------------------
+def _ms_token_valid(tokens: Dict[str, Any]) -> bool:
+    if not tokens or "access_token" not in tokens:
         return False
+    exp = tokens.get("expires_at", 0)
+    return time.time() < exp - 60
 
-    def _ensure_marker(self, workbook_id: str) -> None:
-        names = self._worksheet_names(workbook_id)
-        if self._MARKER_SHEET not in names:
-            url_add = f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/add"
-            r = self._graph_request("POST", url_add, json_body={"name": self._MARKER_SHEET}, timeout=20, max_retries=3)
-            if r is None or r.status_code >= 400:
-                # If we can't create marker, just give up silently (don't break app)
-                return
+def _ms_refresh(tokens: Dict[str, Any]) -> Dict[str, Any]:
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        return tokens
+    tenant = get_secret("microsoft_oauth.tenant_id", "common")
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    data = {
+        "client_id": get_secret("microsoft_oauth.client_id"),
+        "client_secret": get_secret("microsoft_oauth.client_secret"),
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "redirect_uri": get_secret("microsoft_oauth.redirect_uri"),
+        "scope": " ".join(MS_SCOPES),
+    }
+    r = requests.post(token_url, data=data, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    tokens = {
+        "access_token": js["access_token"],
+        "refresh_token": js.get("refresh_token", refresh_token),
+        "expires_at": time.time() + int(js.get("expires_in", 3599)),
+    }
+    _ss_set("__ms_tokens__", tokens)
+    return tokens
 
-        # Write marker values
-        sheet = urllib.parse.quote(self._MARKER_SHEET)
-        url_range = (
-            f"{self.base}/me/drive/items/{workbook_id}/workbook/worksheets/{sheet}"
-            f"/range(address='A1:A3')"
-        )
-        vals = [[self._MARKER_VALUE], ["v1"], [datetime.utcnow().isoformat()]]
-        self._graph_request("PATCH", url_range, json_body={"values": vals}, timeout=20, max_retries=3)
+class OneDriveBackend(StorageBackend):
+    name = "OneDrive"
 
-    # -----------------------------
-    # Workbook discovery (3-step policy)
-    # -----------------------------
-    def _list_approot_children(self) -> list[dict]:
-        url = (
-            f"{self.base}/me/drive/special/approot/children"
-            f"?$select=id,name,lastModifiedDateTime,file&$top=200"
-        )
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._graph_json(r)
-        return data.get("value", []) if isinstance(data, dict) else []
+    def __init__(self):
+        tokens = _ss_get("__ms_tokens__")
+        if not tokens:
+            raise RuntimeError("Microsoft not authenticated.")
+        if not _ms_token_valid(tokens):
+            try:
+                tokens = _ms_refresh(tokens)
+            except Exception as e:
+                raise RuntimeError(f"Microsoft token refresh failed: {e}")
+        self.tokens = tokens
+        self.base_url = "https://graph.microsoft.com/v1.0"
+        self.folder_item = self._ensure_folder()
 
-    def _search_drive_by_name(self, query: str) -> list[dict]:
-        q = urllib.parse.quote(query)
-        url = f"{self.base}/me/drive/root/search(q='{q}')?$select=id,name,lastModifiedDateTime,file&$top=50"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._graph_json(r)
-        return data.get("value", []) if isinstance(data, dict) else []
+    def _headers(self):
+        return {"Authorization": f"Bearer {self.tokens['access_token']}"}
 
-    def _resolve_workbook_id(self, *, create_if_missing: bool) -> str | None:
-        # 1) pointer file
-        ptr = self._read_pointer()
-        if isinstance(ptr, dict):
-            wid = str(ptr.get("workbook_id") or "").strip()
-            if wid and self._validate_workbook_id(wid):
-                return wid
-
-        # 2) approot scan for marker
-        candidates = []
-        for it in self._list_approot_children():
-            name = str(it.get("name", ""))
-            if not name.lower().endswith(".xlsx"):
+    def _request(self, method: str, url: str, **kwargs):
+        # throttling-aware request
+        for attempt in range(6):
+            r = requests.request(method, url, headers=self._headers(), timeout=30, **kwargs)
+            if r.status_code in (429, 503, 504):
+                ra = r.headers.get("Retry-After")
+                sleep_s = int(ra) if ra and ra.isdigit() else min(2 ** attempt, 30)
+                time.sleep(sleep_s)
                 continue
-            if not isinstance(it.get("file"), dict):
-                continue
-            candidates.append(it)
-
-        # newest first
-        candidates.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
-        for it in candidates:
-            wid = it.get("id")
-            if wid and self._has_marker(wid):
+            if r.status_code >= 400:
                 try:
-                    self._write_pointer(str(wid), source="approot_marker")
+                    msg = r.json()
                 except Exception:
-                    pass
-                return str(wid)
+                    msg = r.text
+                raise RuntimeError(f"Graph error {r.status_code}: {msg}")
+            return r
+        raise RuntimeError("Graph throttling: too many retries.")
 
-        # 3) last resort: name search
-        name_hits = []
-        for it in self._search_drive_by_name("FieldFlow"):
-            name = str(it.get("name", ""))
-            if not name.lower().endswith(".xlsx"):
-                continue
-            if not isinstance(it.get("file"), dict):
-                continue
-            name_hits.append(it)
-        name_hits.sort(key=lambda x: str(x.get("lastModifiedDateTime", "")), reverse=True)
+    def _ensure_folder(self) -> Dict[str, Any]:
+        # list approot children and find/create FieldFlow folder
+        url = f"{self.base_url}/me/drive/special/approot/children?$select=id,name,folder"
+        r = self._request("GET", url)
+        items = r.json().get("value", [])
+        for it in items:
+            if it.get("name") == FOLDER_NAME and "folder" in it:
+                return it
+        # create
+        url = f"{self.base_url}/me/drive/special/approot/children"
+        body = {"name": FOLDER_NAME, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
+        r = self._request("POST", url, json=body)
+        return r.json()
 
-        # Prefer marker matches
-        for it in name_hits:
-            wid = it.get("id")
-            if wid and self._has_marker(wid):
-                try:
-                    self._write_pointer(str(wid), source="drive_search_marker")
-                except Exception:
-                    pass
-                return str(wid)
+    def _upload_bytes(self, filename: str, data: bytes) -> Dict[str, Any]:
+        # PUT content into approot/FieldFlow
+        url = f"{self.base_url}/me/drive/special/approot:/{FOLDER_NAME}/{filename}:/content"
+        r = self._request("PUT", url, data=data)
+        return r.json()
 
-        # If we found something named like FieldFlow but without marker, adopt newest
-        if name_hits:
-            wid = str(name_hits[0].get("id") or "").strip()
-            if wid:
-                try:
-                    self._ensure_marker(wid)
-                    self._write_pointer(wid, source="drive_search_adopted")
-                except Exception:
-                    pass
-                return wid
+    def _list(self) -> List[Dict[str, Any]]:
+        url = f"{self.base_url}/me/drive/items/{self.folder_item['id']}/children?$select=id,name,createdDateTime"
+        r = self._request("GET", url)
+        return r.json().get("value", [])
 
-        if not create_if_missing:
+    def _download(self, item_id: str) -> bytes:
+        url = f"{self.base_url}/me/drive/items/{item_id}/content"
+        r = requests.get(url, headers=self._headers(), timeout=30, allow_redirects=True)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Download failed {r.status_code}: {r.text}")
+        return r.content
+
+    def _delete(self, item_id: str):
+        url = f"{self.base_url}/me/drive/items/{item_id}"
+        self._request("DELETE", url)
+
+    def save_submittal_check(self, payload: Dict[str, Any]) -> str:
+        cid = uuid.uuid4().hex
+        payload = dict(payload)
+        payload.setdefault("created_at", _now_iso())
+        name = f"submittal_{cid}.json"
+        self._upload_bytes(name, json.dumps(payload, indent=2).encode("utf-8"))
+        return cid
+
+    def list_submittal_checks(self) -> pd.DataFrame:
+        items = [it for it in self._list() if it["name"].startswith("submittal_") and it["name"].endswith(".json")]
+        out = []
+        for it in sorted(items, key=lambda x: x.get("createdDateTime",""), reverse=True)[:50]:
+            cid = it["name"].replace("submittal_","").replace(".json","")
+            out.append({"id": cid, "created_at": it.get("createdDateTime",""), "item_id": it["id"], "name": it["name"]})
+        return pd.DataFrame(out)
+
+    def load_submittal_check(self, check_id: str) -> Optional[Dict[str, Any]]:
+        target = f"submittal_{check_id}.json"
+        items = [it for it in self._list() if it["name"] == target]
+        if not items:
+            return None
+        data = self._download(items[0]["id"])
+        try:
+            return json.loads(data.decode("utf-8"))
+        except Exception:
             return None
 
-        # 4) create
-        return self._create_workbook_and_persist()
+    def delete_submittal_check(self, check_id: str) -> None:
+        target = f"submittal_{check_id}.json"
+        items = [it for it in self._list() if it["name"] == target]
+        if items:
+            self._delete(items[0]["id"])
 
-    def _create_workbook_and_persist(self) -> str:
-        # Guard against Streamlit rerun spam
-        now = time.time()
-        next_ok = float(st.session_state.get("__ms_next_create_ok__", 0) or 0)
-        if now < next_ok:
-            raise RuntimeError(
-                "Microsoft is throttling workbook creation. Please wait a bit and try again."
-            )
+    def save_schedule_run(self, meta: Dict[str, Any], baseline_df: pd.DataFrame, crashed_df: pd.DataFrame) -> str:
+        run_id = uuid.uuid4().hex
+        meta_obj = dict(meta)
+        meta_obj.setdefault("created_at", _now_iso())
+        self._upload_bytes(f"schedule_{run_id}_meta.json", json.dumps(meta_obj, indent=2).encode("utf-8"))
+        self._upload_bytes(f"schedule_{run_id}_baseline.csv", baseline_df.to_csv(index=False).encode("utf-8"))
+        self._upload_bytes(f"schedule_{run_id}_crashed.csv", crashed_df.to_csv(index=False).encode("utf-8"))
+        return run_id
 
-        # Create minimal valid XLSX
-        content = None
-        try:
-            from openpyxl import Workbook
-            import io as _io
-            wb = Workbook()
-            buf = _io.BytesIO()
-            wb.save(buf)
-            content = buf.getvalue()
-        except Exception:
-            content = b"PK\x03\x04"  # minimal zip header fallback
+    def list_schedule_runs(self) -> pd.DataFrame:
+        items = [it for it in self._list() if it["name"].startswith("schedule_") and it["name"].endswith("_meta.json")]
+        out = []
+        for it in sorted(items, key=lambda x: x.get("createdDateTime",""), reverse=True)[:50]:
+            run_id = it["name"].replace("schedule_","").replace("_meta.json","")
+            meta = {}
+            try:
+                meta = json.loads(self._download(it["id"]).decode("utf-8"))
+            except Exception:
+                meta = {}
+            out.append({
+                "run_id": run_id,
+                "created_at": meta.get("created_at", it.get("createdDateTime","")),
+                **{k: meta.get(k) for k in ["company","client","project","scenario","kind","baseline_days","crashed_days"]},
+            })
+        return pd.DataFrame(out)
 
-        filename = f"{self.title}.xlsx"
-        url = f"{self.base}/me/drive/special/approot:/{urllib.parse.quote(filename)}:/content"
-        r = self._graph_request(
-            "PUT",
-            url,
-            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
-            data=content,
-            timeout=60,
-            max_retries=5,
-        )
-        if r is None or r.status_code >= 400:
-            data = self._graph_json(r)
-            code = None
-            msg = None
-            if isinstance(data, dict) and isinstance(data.get("error"), dict):
-                code = data["error"].get("code")
-                msg = data["error"].get("message")
-            if code == "quotaLimitReached" or (r is not None and r.status_code in (429, 503, 504)):
-                st.session_state["__ms_next_create_ok__"] = time.time() + self._CREATE_COOLDOWN_SEC
-                raise RuntimeError(
-                    "Microsoft Graph is rate limiting workbook creation (quotaLimitReached). "
-                    "Wait ~30 seconds and try again."
-                )
-            raise RuntimeError(f"Microsoft Graph error creating workbook: {code or (r.status_code if r else 'unknown')} {msg or ''}")
+    def get_schedule_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        names = {
+            "meta": f"schedule_{run_id}_meta.json",
+            "baseline": f"schedule_{run_id}_baseline.csv",
+            "crashed": f"schedule_{run_id}_crashed.csv",
+        }
+        items = {it["name"]: it for it in self._list()}
+        if names["meta"] not in items or names["baseline"] not in items or names["crashed"] not in items:
+            return None
+        meta = json.loads(self._download(items[names["meta"]]["id"]).decode("utf-8"))
+        baseline_df = pd.read_csv(io.StringIO(self._download(items[names["baseline"]]["id"]).decode("utf-8")))
+        crashed_df = pd.read_csv(io.StringIO(self._download(items[names["crashed"]]["id"]).decode("utf-8")))
+        return {"run_id": run_id, "created_at": meta.get("created_at",""), "meta": meta, "baseline_df": baseline_df, "crashed_df": crashed_df}
 
-        # Find new workbook id by listing approot
-        wid = None
-        for it in self._list_approot_children():
-            if str(it.get("name", "")).lower() == filename.lower():
-                wid = it.get("id")
-                break
-        if not wid:
-            # fallback: try search
-            hits = self._search_drive_by_name(self.title)
-            for it in hits:
-                if str(it.get("name", "")).lower() == filename.lower():
-                    wid = it.get("id")
-                    break
-        if not wid:
-            raise RuntimeError("Workbook created but could not locate it in OneDrive. Please try again.")
+    def delete_schedule_run(self, run_id: str) -> None:
+        items = {it["name"]: it for it in self._list()}
+        for n in [f"schedule_{run_id}_meta.json", f"schedule_{run_id}_baseline.csv", f"schedule_{run_id}_crashed.csv"]:
+            if n in items:
+                self._delete(items[n]["id"])
 
-        wid = str(wid)
-        try:
-            self._ensure_marker(wid)
-        except Exception:
-            pass
-        try:
-            self._write_pointer(wid, source="created")
-        except Exception:
-            pass
-        return wid
-
-    # -----------------------------
-    # Overrides that parent pages call
-    # -----------------------------
-    def _get_workbook_id(self, create_if_missing: bool = True) -> str:
-        # Session cache
-        if "__ms_workbook_id__" in st.session_state:
-            wid = str(st.session_state["__ms_workbook_id__"])
-            if wid and self._validate_workbook_id(wid):
-                return wid
-            st.session_state.pop("__ms_workbook_id__", None)
-
-        wid = self._resolve_workbook_id(create_if_missing=create_if_missing)
-        if wid:
-            st.session_state["__ms_workbook_id__"] = wid
-            return wid
-
-        raise RuntimeError(
-            "No FieldFlow workbook found yet in OneDrive. "
-            "Try saving once to create it (or use the Settings page to initialize)."
-        )
-
-    def _ensure_workbook(self):
-        # Kept for compatibility with the sidebar button
-        wid = self._resolve_workbook_id(create_if_missing=True)
-        if wid:
-            st.session_state["__ms_workbook_id__"] = wid
-            st.success("Workbook ready in OneDrive.")
-
-    def load_presets(self) -> dict:
-        """Load presets without creating the workbook as a side-effect."""
-        try:
-            wid = self._resolve_workbook_id(create_if_missing=False)
-            if not wid:
-                return {}
-            ws = "presets"
-            url = (
-                f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}"
-                f"/usedRange(valuesOnly=true)"
-            )
-            r = self._graph_request("GET", url, timeout=20, max_retries=2)
-            if r is None or r.status_code >= 400:
-                return {}
-            data = self._graph_json(r)
-            vals = data.get("values", []) if isinstance(data, dict) else []
-            out = {}
-            for row in vals[1:]:
-                if len(row) >= 2:
-                    try:
-                        out[str(row[0])] = json.loads(row[1])
-                    except Exception:
-                        pass
-            # Cache wid so later writes are fast
-            st.session_state["__ms_workbook_id__"] = wid
-            return out
-        except Exception:
-            return {}
-
-# ---- Schedule Runs (full save/browse/download)
-
-def save_schedule_run(self, meta: dict, df: pd.DataFrame) -> str:
-    run_id = meta.get("run_id") or f"sched_{int(time.time()*1000)}"
-    created_at = meta.get("created_at") or _utc_now()
-    meta = dict(meta)
-    meta["run_id"] = run_id
-    meta["created_at"] = created_at
-
-    wid = self._resolve_workbook_id(create_if_missing=True)
-    if not wid:
-        raise RuntimeError("Unable to create/find OneDrive workbook.")
-
-    ws_index = "schedule_runs"
-    headers = ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name","meta_json"]
-    self._ensure_worksheet(ws_index, headers)
-
-    sheet_name = self._sanitize_ws_name(f"sched_{run_id}")
-    self._delete_worksheet_if_exists(sheet_name)
-    self._ensure_worksheet(sheet_name, df.columns.tolist())
-    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-    self._update_range(sheet_name, "A1", values)
-
-    row = [
-        run_id, created_at,
-        meta.get("company",""), meta.get("client",""), meta.get("project",""),
-        meta.get("scenario",""), meta.get("kind",""),
-        str(meta.get("baseline_days","") or ""),
-        str(meta.get("crashed_days","") or ""),
-        sheet_name,
-        json.dumps(meta, ensure_ascii=False),
-    ]
-    self._append_rows(ws_index, [row])
-    self._write_pointer(wid)
-    st.session_state["__ms_workbook_id__"] = wid
-    return run_id
-
-def list_schedule_runs(self) -> pd.DataFrame:
-    wid = self._resolve_workbook_id(create_if_missing=False)
-    headers = ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name"]
-    if not wid:
-        return pd.DataFrame(columns=headers)
-    ws = "schedule_runs"
+# ----------------------------
+# OAuth flows
+# ----------------------------
+def _google_auth_url() -> Optional[str]:
+    cid = get_secret("google_oauth.client_id")
+    cs = get_secret("google_oauth.client_secret")
+    ru = get_secret("google_oauth.redirect_uri")
+    if not (cid and cs and ru):
+        return None
     try:
-        self._ensure_worksheet(ws, ["run_id","created_at","company","client","project","scenario","kind","baseline_days","crashed_days","sheet_name","meta_json"])
-        url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-        r = self._graph_request("GET", url, timeout=20, max_retries=3)
-        data = self._graph_json(r)
-        vals = data.get("values", []) if isinstance(data, dict) else []
-        if len(vals) <= 1:
-            return pd.DataFrame(columns=headers)
-        df = pd.DataFrame(vals[1:], columns=vals[0])
-        for c in headers:
-            if c not in df.columns:
-                df[c] = ""
-        return df[headers].sort_values("created_at", ascending=False)
+        from google_auth_oauthlib.flow import Flow
+        client_config = {
+            "web": {
+                "client_id": cid,
+                "client_secret": cs,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        }
+        flow = Flow.from_client_config(client_config, scopes=GOOGLE_SCOPES, redirect_uri=ru)
+        import secrets as _secrets
+        state = "g_" + _secrets.token_urlsafe(16)
+        _ss_set("__google_state__", state)
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+            state=state,
+        )
+        return auth_url
     except Exception:
-        return pd.DataFrame(columns=headers)
+        return None
 
-def load_schedule_run(self, run_id: str) -> tuple[dict, pd.DataFrame]:
-    wid = self._resolve_workbook_id(create_if_missing=False)
-    if not wid:
-        raise KeyError("No workbook yet.")
-    ws = "schedule_runs"
-    url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-    r = self._graph_request("GET", url, timeout=20, max_retries=3)
-    vals = self._graph_json(r).get("values", [])
-    if len(vals) <= 1:
-        raise KeyError("Schedule run not found")
-    headers = vals[0]
-    rec = None
-    for row in vals[1:]:
-        if row and str(row[0]) == str(run_id):
-            rec = dict(zip(headers, row))
+def _google_handle_callback(code: str, state: str) -> bool:
+    if not state.startswith("g_"):
+        return False
+    expected = _ss_get("__google_state__")
+    if expected and state != expected:
+        return False
+    cid = get_secret("google_oauth.client_id")
+    cs = get_secret("google_oauth.client_secret")
+    ru = get_secret("google_oauth.redirect_uri")
+    from google_auth_oauthlib.flow import Flow
+    client_config = {
+        "web": {
+            "client_id": cid,
+            "client_secret": cs,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+    flow = Flow.from_client_config(client_config, scopes=GOOGLE_SCOPES, redirect_uri=ru)
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    _ss_set("__google_tokens__", {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "expiry": (creds.expiry.isoformat() if creds.expiry else ""),
+    })
+    return True
+
+def _ms_auth_url() -> Optional[str]:
+    cid = get_secret("microsoft_oauth.client_id")
+    cs = get_secret("microsoft_oauth.client_secret")
+    ru = get_secret("microsoft_oauth.redirect_uri")
+    tenant = get_secret("microsoft_oauth.tenant_id", "common")
+    if not (cid and cs and ru and tenant):
+        return None
+    import secrets as _secrets
+    state = "m_" + _secrets.token_urlsafe(16)
+    _ss_set("__ms_state__", state)
+    params = {
+        "client_id": cid,
+        "response_type": "code",
+        "redirect_uri": ru,
+        "response_mode": "query",
+        "scope": " ".join(MS_SCOPES),
+        "state": state,
+    }
+    from urllib.parse import urlencode
+    return f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?{urlencode(params)}"
+
+def _ms_handle_callback(code: str, state: str) -> bool:
+    if not state.startswith("m_"):
+        return False
+    expected = _ss_get("__ms_state__")
+    if expected and state != expected:
+        return False
+    cid = get_secret("microsoft_oauth.client_id")
+    cs = get_secret("microsoft_oauth.client_secret")
+    ru = get_secret("microsoft_oauth.redirect_uri")
+    tenant = get_secret("microsoft_oauth.tenant_id", "common")
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    data = {
+        "client_id": cid,
+        "client_secret": cs,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": ru,
+        "scope": " ".join(MS_SCOPES),
+    }
+    r = requests.post(token_url, data=data, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    tokens = {
+        "access_token": js["access_token"],
+        "refresh_token": js.get("refresh_token", ""),
+        "expires_at": time.time() + int(js.get("expires_in", 3599)),
+    }
+    _ss_set("__ms_tokens__", tokens)
+    return True
+
+def _handle_oauth_callback_if_present():
+    # Use query params to detect code/state
+    try:
+        qp = dict(st.query_params)
+    except Exception:
+        qp = st.experimental_get_query_params()
+    code = qp.get("code")
+    state = qp.get("state")
+    if isinstance(code, list): code = code[0] if code else None
+    if isinstance(state, list): state = state[0] if state else None
+    if not code or not state:
+        return
+    ok = False
+    err = None
+    try:
+        if state.startswith("g_"):
+            ok = _google_handle_callback(code, state)
+        elif state.startswith("m_"):
+            ok = _ms_handle_callback(code, state)
+    except Exception as e:
+        err = str(e)
+    _clear_query_params()
+    if ok:
+        _rerun()
+    if err:
+        st.sidebar.error(f"OAuth callback failed: {err}")
+
+# ----------------------------
+# Backend selection (safe)
+# ----------------------------
+def get_backend() -> StorageBackend:
+    choice = _ss_get("__backend_choice__", BACKEND_SQLITE)
+    if choice == BACKEND_GDRIVE:
+        try:
+            return GoogleDriveBackend()
+        except Exception as e:
+            st.sidebar.warning(f"Google storage unavailable: {e}. Using Local instead.")
+            return SQLiteBackend()
+    if choice == BACKEND_ONEDRIVE:
+        try:
+            return OneDriveBackend()
+        except Exception as e:
+            st.sidebar.warning(f"Microsoft storage unavailable: {e}. Using Local instead.")
+            return SQLiteBackend()
+    return SQLiteBackend()
+
+# ----------------------------
+# Sidebar
+# ----------------------------
+def render_sidebar(active_page: str = "") -> StorageBackend:
+    _handle_oauth_callback_if_present()
+
+    # Logo at very top
+    for p in LOGO_CANDIDATES:
+        if p.exists():
+            st.sidebar.image(str(p), use_container_width=True)
             break
-    if not rec:
-        raise KeyError("Schedule run not found")
-    meta = {}
+
+    st.sidebar.markdown("### Storage")
+    choice = st.sidebar.selectbox("Save location", BACKEND_CHOICES, index=BACKEND_CHOICES.index(_ss_get("__backend_choice__", BACKEND_SQLITE)))
+    _ss_set("__backend_choice__", choice)
+
+    st.sidebar.markdown("### Sign in")
+    g_tokens = _ss_get("__google_tokens__")
+    m_tokens = _ss_get("__ms_tokens__")
+
+    c1, c2 = st.sidebar.columns(2)
+    with c1:
+        if g_tokens:
+            if st.button("Sign out Google"):
+                _ss_del("__google_tokens__")
+                _ss_del("__google_state__")
+                _rerun()
+        else:
+            url = _google_auth_url()
+            if url:
+                st.link_button("Sign in Google", url, use_container_width=True)
+            else:
+                st.caption("Google OAuth not configured.")
+    with c2:
+        if m_tokens:
+            if st.button("Sign out Microsoft"):
+                _ss_del("__ms_tokens__")
+                _ss_del("__ms_state__")
+                _rerun()
+        else:
+            url = _ms_auth_url()
+            if url:
+                st.link_button("Sign in Microsoft", url, use_container_width=True)
+            else:
+                st.caption("Microsoft OAuth not configured.")
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"Active page: {active_page}")
+    return get_backend()
+
+# ----------------------------
+# Pages
+# ----------------------------
+def submittal_checker_page() -> None:
+    backend = render_sidebar("Submittal Checker")
+    st.title("Submittal Checker (simple)")
+    st.caption("Paste spec + submittal text, run analysis, and save the run. Saved runs appear under Saved Results.")
+
+    spec = st.text_area("Paste spec text", height=200, placeholder="Paste specification clauses…")
+    sub = st.text_area("Paste submittal text", height=200, placeholder="Paste submittal content…")
+
+    if st.button("Analyze", type="primary"):
+        payload = {
+            "created_at": _now_iso(),
+            "spec_len": len(spec or ""),
+            "submittal_len": len(sub or ""),
+        }
+        cid = backend.save_submittal_check(payload)
+        st.success(f"Saved check: {cid}")
+        st.json(payload)
+
+def _load_schedule_csv(uploaded) -> pd.DataFrame:
+    return pd.read_csv(uploaded)
+
+def _compute_cpm(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    # Minimal CPM: assumes columns task_id, duration, predecessors (comma-separated ids)
+    df = df.copy()
+    df["duration"] = pd.to_numeric(df["duration"], errors="coerce").fillna(0).astype(int)
+    df["predecessors"] = df.get("predecessors", "").fillna("")
+    preds = {row["task_id"]: [p.strip() for p in str(row["predecessors"]).split(",") if p.strip()] for _, row in df.iterrows()}
+    # forward pass
+    es, ef = {}, {}
+    for _ in range(len(df)*2):
+        changed=False
+        for _, row in df.iterrows():
+            tid=row["task_id"]
+            pre=preds.get(tid,[])
+            if all(p in ef for p in pre):
+                new_es = max([ef[p] for p in pre], default=0)
+                new_ef = new_es + int(row["duration"])
+                if es.get(tid)!=new_es or ef.get(tid)!=new_ef:
+                    es[tid]=new_es; ef[tid]=new_ef; changed=True
+        if not changed:
+            break
+    project_duration = max(ef.values()) if ef else 0
+    # backward pass
+    ls, lf = {}, {}
+    succs = {t: [] for t in df["task_id"]}
+    for t, pre in preds.items():
+        for p in pre:
+            succs.setdefault(p, []).append(t)
+    for _ in range(len(df)*2):
+        changed=False
+        for _, row in df.iterrows():
+            tid=row["task_id"]
+            su=succs.get(tid,[])
+            if not su:
+                new_lf = project_duration
+            elif all(s in ls for s in su):
+                new_lf = min([ls[s] for s in su])
+            else:
+                continue
+            new_ls = new_lf - int(row["duration"])
+            if lf.get(tid)!=new_lf or ls.get(tid)!=new_ls:
+                lf[tid]=new_lf; ls[tid]=new_ls; changed=True
+        if not changed:
+            break
+    df["ES"] = df["task_id"].map(es).fillna(0).astype(int)
+    df["EF"] = df["task_id"].map(ef).fillna(df["ES"] + df["duration"]).astype(int)
+    df["LS"] = df["task_id"].map(ls).fillna(df["ES"]).astype(int)
+    df["LF"] = df["task_id"].map(lf).fillna(df["EF"]).astype(int)
+    df["float"] = (df["LS"] - df["ES"]).astype(int)
+    return df, project_duration
+
+def _crash_to_target(df: pd.DataFrame, target_days: int) -> Tuple[pd.DataFrame, int]:
+    # Simple crash: reduce durations on zero-float tasks first (by 1 day each loop)
+    df2=df.copy()
+    df2["duration"]=pd.to_numeric(df2["duration"], errors="coerce").fillna(0).astype(int)
+    for _ in range(1000):
+        cpm, dur = _compute_cpm(df2)
+        if dur <= target_days:
+            return cpm, dur
+        crit = cpm.sort_values(["float","duration"], ascending=[True, False])
+        # reduce first critical task with duration>0
+        idx = crit.index[0]
+        if df2.loc[idx,"duration"]<=0:
+            break
+        df2.loc[idx,"duration"] -= 1
+    cpm, dur = _compute_cpm(df2)
+    return cpm, dur
+
+def schedule_whatifs_page() -> None:
+    backend = render_sidebar("Schedule What-Ifs")
+    st.title("Schedule What-Ifs")
+    st.caption("Upload a simple task CSV, compute CPM, optionally crash to a target duration, then save/browse/download results.")
+
+    up = st.file_uploader("Upload tasks CSV", type=["csv"])
+    if up is not None:
+        df = _load_schedule_csv(up)
+        st.dataframe(df, use_container_width=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Compute CPM", type="primary"):
+                cpm, dur = _compute_cpm(df)
+                _ss_set("__sched_baseline__", cpm.to_json(orient="records"))
+                _ss_set("__sched_baseline_days__", int(dur))
+        with col2:
+            target = st.number_input("Target duration (days)", min_value=0, value=20)
+            if st.button("Crash to target"):
+                cpm, dur = _crash_to_target(df, int(target))
+                _ss_set("__sched_crashed__", cpm.to_json(orient="records"))
+                _ss_set("__sched_crashed_days__", int(dur))
+
+    # Display computed
+    base_df = None
+    crash_df = None
+    if _ss_get("__sched_baseline__"):
+        base_df = pd.read_json(io.StringIO(_ss_get("__sched_baseline__")), orient="records")
+        st.markdown("### Baseline CPM")
+        st.write(f"Duration: **{_ss_get('__sched_baseline_days__', 0)} days**")
+        st.dataframe(base_df, use_container_width=True)
+        st.download_button("Download baseline CSV", data=base_df.to_csv(index=False), file_name="schedule_baseline.csv", mime="text/csv", use_container_width=True)
+    if _ss_get("__sched_crashed__"):
+        crash_df = pd.read_json(io.StringIO(_ss_get("__sched_crashed__")), orient="records")
+        st.markdown("### Crashed CPM")
+        st.write(f"Duration: **{_ss_get('__sched_crashed_days__', 0)} days**")
+        st.dataframe(crash_df, use_container_width=True)
+        st.download_button("Download crashed CSV", data=crash_df.to_csv(index=False), file_name="schedule_crashed.csv", mime="text/csv", use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("## Save this schedule run")
+    company = st.text_input("Company", value="")
+    client = st.text_input("Client", value="")
+    project = st.text_input("Project", value="")
+    scenario = st.text_input("Scenario name", value="")
+
+    kind = st.selectbox("Save which version?", ["baseline", "crashed", "both"], index=2)
+    can_save = (base_df is not None) and (crash_df is not None or kind != "crashed")
+
+    if st.button("Save schedule run"):
+        if not can_save:
+            st.error("Compute CPM first (and Crash if you chose crashed/both).")
+        else:
+            meta = {
+                "company": company,
+                "client": client,
+                "project": project,
+                "scenario": scenario,
+                "kind": kind,
+                "baseline_days": int(_ss_get("__sched_baseline_days__", 0)),
+                "crashed_days": int(_ss_get("__sched_crashed_days__", 0)) if crash_df is not None else None,
+            }
+            if kind == "baseline":
+                rid = backend.save_schedule_run(meta, base_df, base_df)
+            elif kind == "crashed":
+                rid = backend.save_schedule_run(meta, crash_df, crash_df)
+            else:
+                rid = backend.save_schedule_run(meta, base_df, crash_df if crash_df is not None else base_df)
+            st.success(f"Saved schedule run: {rid}")
+
+    st.markdown("---")
+    st.markdown("## Browse saved schedule runs")
     try:
-        meta = json.loads(rec.get("meta_json","") or "{}")
-    except Exception:
-        meta = {}
-    sheet_name = rec.get("sheet_name") or f"sched_{run_id}"
-    url2 = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(sheet_name)}/usedRange(valuesOnly=true)"
-    r2 = self._graph_request("GET", url2, timeout=30, max_retries=3)
-    vals2 = self._graph_json(r2).get("values", [])
-    if len(vals2) <= 1:
-        return meta, pd.DataFrame()
-    df = pd.DataFrame(vals2[1:], columns=vals2[0])
-    return meta, df
+        runs = backend.list_schedule_runs()
+    except Exception as e:
+        st.warning(f"Could not load saved runs from this backend: {e}")
+        runs = pd.DataFrame()
 
-def delete_schedule_run(self, run_id: str) -> None:
-    wid = self._resolve_workbook_id(create_if_missing=False)
-    if not wid:
-        return
-    df = self.list_schedule_runs()
-    if df.empty:
-        return
-    row = df[df["run_id"].astype(str) == str(run_id)]
-    sheet_name = str(row.iloc[0]["sheet_name"]) if (not row.empty and "sheet_name" in row.columns) else None
-    if sheet_name:
-        self._delete_worksheet_if_exists(sheet_name)
+    if not runs.empty:
+        st.dataframe(runs, use_container_width=True)
+        sel = st.text_input("Enter a run_id to open", value="")
+        if st.button("Open run"):
+            run = backend.get_schedule_run(sel.strip())
+            if not run:
+                st.error("Run not found.")
+            else:
+                st.write(run.get("meta", {}))
+                st.download_button("Download baseline CSV (saved)", run["baseline_df"].to_csv(index=False), file_name=f"schedule_{sel}_baseline.csv", mime="text/csv", use_container_width=True)
+                st.download_button("Download crashed CSV (saved)", run["crashed_df"].to_csv(index=False), file_name=f"schedule_{sel}_crashed.csv", mime="text/csv", use_container_width=True)
 
-    ws = "schedule_runs"
-    url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{urllib.parse.quote(ws)}/usedRange(valuesOnly=true)"
-    r = self._graph_request("GET", url, timeout=20, max_retries=3)
-    vals = self._graph_json(r).get("values", [])
-    if not vals:
-        return
-    headers = vals[0]
-    kept = [headers] + [rr for rr in vals[1:] if not (rr and str(rr[0]) == str(run_id))]
-    self._update_range(ws, "A1", kept)
+def saved_results_page() -> None:
+    backend = render_sidebar("Saved Results")
+    st.title("Saved Results")
+    st.caption("Browse saved submittal checks and schedule runs. Downloads work for all backends.")
 
-def _sanitize_ws_name(self, name: str) -> str:
-    bad = ':\\/?*[]'
-    out = ''.join('_' if c in bad else c for c in str(name))
-    out = out.strip()[:31] or "sched"
-    return out
+    st.markdown("## Submittal checks")
+    try:
+        checks = backend.list_submittal_checks()
+    except Exception as e:
+        st.warning(f"Could not list submittal checks: {e}")
+        checks = pd.DataFrame()
 
-def _delete_worksheet_if_exists(self, ws_name: str) -> None:
-    wid = self._resolve_workbook_id(create_if_missing=False)
-    if not wid:
-        return
-    url_ws = f"{self.base}/me/drive/items/{wid}/workbook/worksheets?$select=id,name"
-    r = self._graph_request("GET", url_ws, timeout=20, max_retries=3)
-    data = self._graph_json(r)
-    for w in data.get("value", []) if isinstance(data, dict) else []:
-        if str(w.get("name","")) == str(ws_name):
-            wsid = w.get("id")
-            if wsid:
-                del_url = f"{self.base}/me/drive/items/{wid}/workbook/worksheets/{wsid}"
-                self._graph_request("DELETE", del_url, timeout=20, max_retries=2)
-            return
+    if checks is None or checks.empty:
+        st.info("No submittal checks found.")
+    else:
+        st.dataframe(checks, use_container_width=True)
+        cid = st.text_input("Load submittal check by id", value="")
+        if st.button("Load submittal check"):
+            payload = backend.load_submittal_check(cid.strip())
+            if payload is None:
+                st.error("Not found.")
+            else:
+                st.json(payload)
+                st.download_button("Download JSON", data=json.dumps(payload, indent=2), file_name=f"submittal_{cid}.json", mime="application/json", use_container_width=True)
 
+    st.markdown("---")
+    st.markdown("## Schedule runs")
+    try:
+        runs = backend.list_schedule_runs()
+    except Exception as e:
+        st.warning(f"Could not list schedule runs: {e}")
+        runs = pd.DataFrame()
+
+    if runs is None or runs.empty:
+        st.info("No schedule runs found.")
+    else:
+        st.dataframe(runs, use_container_width=True)
+        rid = st.text_input("Load schedule run by run_id", value="")
+        if st.button("Load schedule run"):
+            run = backend.get_schedule_run(rid.strip())
+            if not run:
+                st.error("Not found.")
+            else:
+                st.write(run.get("meta", {}))
+                st.download_button("Download baseline CSV", run["baseline_df"].to_csv(index=False), file_name=f"schedule_{rid}_baseline.csv", mime="text/csv", use_container_width=True)
+                st.download_button("Download crashed CSV", run["crashed_df"].to_csv(index=False), file_name=f"schedule_{rid}_crashed.csv", mime="text/csv", use_container_width=True)
