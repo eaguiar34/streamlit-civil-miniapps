@@ -147,3 +147,4 @@ def read_text_any(uploaded_file) -> str:
     except Exception as e:
         st.error(f"Couldn't read {getattr(uploaded_file, 'name', 'file')}: {e}")
         return ""
+
