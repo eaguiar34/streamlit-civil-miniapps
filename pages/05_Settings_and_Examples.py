@@ -42,3 +42,4 @@ st.markdown(
     "- Make sure your GitHub repo contains **fieldflow_core.py** at the repo root, and the `pages/` folder contains **05_Settings_and_Examples.py**.\n"
     "- In Streamlit Cloud, **Manage app → Reboot app** after pushing the latest commit."
 )
+
