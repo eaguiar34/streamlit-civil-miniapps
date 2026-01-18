@@ -6,13 +6,6 @@ core.render_sidebar("Home")
 
 st.title("FieldFlow")
 st.caption("Use the left navigation (pages) to open each tool.")
-st.markdown(
-    """
-**What's here**
-- Submittal Checker
-- Schedule What-Ifs
-- RFI Manager
-- Aging Dashboard
-- Settings & Examples
-"""
-)
+
+st.markdown("### What's here")
+st.markdown("- Submittal Checker\n- Schedule What-Ifs\n- RFI Manager\n- Aging Dashboard\n- Settings & Examples\n- Saved Results")
