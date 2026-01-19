@@ -1,6 +1,6 @@
 import streamlit as st
 import fieldflow_core as core
 
-st.set_page_config(page_title="Settings & Examples", page_icon="🧰", layout="wide")
+st.set_page_config(page_title="Settings & Examples", page_icon="\U0001f9f0", layout="wide")
 core.render_sidebar("Settings & Examples")
 core.settings_examples_page()
